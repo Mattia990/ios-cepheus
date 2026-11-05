@@ -4,11 +4,13 @@
 /*
  * Text console on the splash framebuffer ABL scans out. Geometry comes from
  * the display pipe at runtime (con_init); 32 bpp, little-endian a8r8g8b8.
+ * cepheus: Samsung EA8076 FHD CMD panel, 1080x2340.
+ * cont_splash_region from live FDT: <0x9c000000 0x2400000>.
  */
-#define FB_SPLASH_BASE	0x9c400000UL	/* reserved-memory cont_splash_region */
+#define FB_SPLASH_BASE	0x9c400000UL	/* FB within cont_splash_region block */
 #define FB_SPLASH_SIZE	0x02400000UL
 #define FB_W		1080
-#define FB_H		2280
+#define FB_H		2340   /* cepheus panel height */
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U

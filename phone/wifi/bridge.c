@@ -1,5 +1,5 @@
 /*
- * The kernel's Wi-Fi station over /dev/wlan (flamewlan.h; the kernel side is bsd/dev/flame_wlan.c, under en0
+ * The kernel's Wi-Fi station over /dev/wlan (cepheuswlan.h; the kernel side is bsd/dev/cepheus_wlan.c, under en0
  * and wifid's Apple80211 requests): wifid's scans and joins come here as requests, en0's frames both ways.
  * In this mode iOS does the IP side itself on en0 (configd, DHCP), so ipnet.c's utun is not made. Without the
  * device (an older kernel, or boot-arg sweetwifid=0) wland keeps its own utun.
@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include "flamewlan.h"
+#include "cepheuswlan.h"
 #include "link.h"
 #include "radio.h"
 #include "bridge.h"

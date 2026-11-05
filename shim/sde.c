@@ -1,8 +1,9 @@
 /*
- * Display (MDSS/SDE 5.0) probing on flame.
+ * Display (MDSS/SDE 5.0) probing on cepheus.
  *
- * ABL leaves the NT37280 command-mode panel running: CTL_0 -> LM_0/LM_1
- * (540 px each, source split) -> PP_0/PP_1 -> DSC_0/DSC_1 -> INTF_1 (DSI0),
+ * cepheus panel: Samsung EA8076 FHD CMD DSI panel, 1080x2340 @60 Hz,
+ * command mode (from live FDT: qcom,mdss_dsi_samsung_fhd_ea8076_cmd).
+ * CTL_0 -> LM_0/LM_1 -> PP_0/PP_1 -> DSC_0/DSC_1 -> INTF_1 (DSI0),
  * with tear check in INTF_1. Command mode only sends a frame when started,
  * so writes to the buffer do not show up by themselves. INTF_1's
  * autorefresh makes the hardware start one frame per TE pulse, which turns

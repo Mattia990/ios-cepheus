@@ -1,5 +1,5 @@
 /*
- * flame (Pixel 4, SM8150) boot shim.
+ * cepheus (Xiaomi Mi 9, SM8150) boot shim.
  *
  * ABL enters here at EL1 with the MMU and caches off and x0 = DTB. With an
  * XNU payload in the ramdisk (tools/mkpayload.py) the shim boots it;
@@ -221,7 +221,7 @@ static void save_before_jump(void)
 
 void shim_main(uintptr_t dtb)
 {
-	log_printf("FLAMESHIM probe v1 t=%lu\n", ticks_now());
+	log_printf("CEPHEUSSHIM probe v1 t=%lu\n", ticks_now());
 	log_cpu(dtb);
 	int spmi_ok = !spmi_init();
 	if (spmi_ok) {
@@ -283,7 +283,7 @@ void shim_main(uintptr_t dtb)
 	uint32_t stride = sde.pipe ? rd32(sde.pipe + 0x24) & 0xffff : 0;
 	if (!con_init(fb, stride)) {
 		con_clear(0xff203040);
-		con_str("FLAME", "shim probe v1");
+		con_str("CEPHEUS", "shim probe v1");
 	}
 	sde_autorefresh(1);
 	sde_sample("autorefresh", 16, 20);

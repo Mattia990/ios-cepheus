@@ -1,5 +1,5 @@
 /*
- * PMIC arbiter v5 access (qcom,spmi@c440000 in the flame live FDT, EE 0).
+ * PMIC arbiter v5 access (qcom,spmi@c440000 in the cepheus live FDT, EE 0).
  *
  * Reads use the observer channel, writes the read/write channel of the
  * peripheral's APID, which the arbiter only accepts when the apps EE owns

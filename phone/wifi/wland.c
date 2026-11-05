@@ -1,5 +1,5 @@
 /*
- * wland: WLAN bring-up for the Pixel 4 from userland (/dev/pmem), the way
+ * wland: WLAN bring-up for the Xiaomi Mi 9 (cepheus) from userland (/dev/pmem), the way
  * the GPU was brought up: the modem DSP hosts the WLAN firmware (icnss /
  * WCN3990 family), so: power votes, PAS-boot the modem, SMP2P, then GLINK +
  * QRTR + QMI to the WLFW service, then the WLAN copy engines for WMI.
@@ -356,7 +356,7 @@ static int qmp_send(const char *msg)
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
 
 #define PAS_MODEM	4
-#define MPSS_PA		0x8dc00000ull	/* flame modem_region */
+#define MPSS_PA		0x8dc00000ull	/* cepheus modem_region */
 #define MPSS_SIZE	0x0b400000ull
 #define FW_DIR		"/var/local/fw/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))

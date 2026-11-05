@@ -17,7 +17,7 @@ extern const uint8_t radio_mac[6];
 int radio_join(const char *ssid, const char *pass);
 int radio_join_result(void);	/* -1 while it runs, 0 joined, ENOTCONN joined then lost, else an errno */
 void radio_disconnect(void);	/* drop a joined link (tests the rejoin) */
-/* what scans heard, for wifid (flamewlan.c) */
+/* what scans heard, for wifid (cepheuswlan.c) */
 struct radio_bss {
 	uint8_t bssid[6], ssid[32], ssid_len;
 	uint16_t freq, bintval, capab, ie_len;

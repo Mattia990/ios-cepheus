@@ -6,7 +6,7 @@
  * at a fixed physical address with the ring's location (mkpayload.py puts
  * the symbol addresses in the payload), and the next shim boot, before it
  * loads anything over that memory, copies the ring's last bytes to the
- * rescue area on UFS (tools/flame-log-pull.sh rescue).
+ * rescue area on UFS (tools/cepheus-log-pull.sh rescue).
  */
 #include "log.h"
 #include "ramlog.h"

@@ -14,7 +14,7 @@
 #include "ufs.h"
 #include "util.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, flame live FDT */
+#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, cepheus live FDT */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08

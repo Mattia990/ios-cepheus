@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot on flame.
+"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot on cepheus.
 
 Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
-MMIO address comes from the flame (Pixel 4, SM8150) live FDT. The kernel's
-built-in drivers still match the Redmi names (xiaomi,sweet, qcom,kryo470,
-sweet,display), so those stay next to the flame ones.
+MMIO address comes from the cepheus (Xiaomi Mi 9, SM8150) live FDT, read from
+the phone on 2026-11-05.
 Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
@@ -12,14 +11,16 @@ import hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
+# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md).
+# cepheus memory from live FDT:
+#   bank0: <0x80000000 0x3cc00000>   (~972 MB)
+#   bank1: <0xc0000000 0x80000000>   (2 GB)
+#   bank2: <0x1_4000_0000 0xc0000000> (3 GB)
+# cont_splash_region: <0x9c000000 0x2400000> (ABL framebuffer block)
+# XNU takes RAM above the splash region and carve-outs, same as flame.
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# --highmem (phone only): above 4G. The flame live FDT memory node is
-# <0x80000000 0x3cc00000>, <0xc0000000 0x140000000>; every fixed
-# reserved-memory carve-out ends below 0xac800000 and the dynamic pools are
-# limited below 4G. ABL puts the ramdisk (our payload) at 0x84700000 or, if
-# big, 0xc0000000, so XNU takes 0x1_00000000 up (same size as on the Redmi).
+# --highmem (phone only): above 4G.
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
@@ -27,11 +28,12 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-# cont_splash_region; ABL scans it out (autorefreshed command-mode panel)
+# cont_splash_region; ABL scans it out (autorefreshed command-mode panel).
+# cepheus panel: Samsung EA8076 FHD CMD, 1080x2340 @60 Hz.
 FB, FB_SIZE = 0x9c400000, 0x2400000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2280, 1080 * 4
-# Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
+FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
+# Internal UFS host (ufshc@1d84000 "ufs_mem").
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
@@ -92,8 +94,8 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('flame-shim')),
-        ('system-firmware-version', cstr('flame-shim')),
+        ('firmware-version', cstr('cepheus-shim')),
+        ('system-firmware-version', cstr('cepheus-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -199,7 +201,7 @@ def build(seed=None, qemu=False, highmem=False):
         node('wlan', [
             ph(),
             ('device_type', cstr('wlan')),
-            ('compatible', cstr('flame,wcn3990')),
+            ('compatible', cstr('cepheus,wcn3990')),
         ]),
         node('disp0', [
             ph(),
@@ -251,7 +253,7 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('google,flame') + cstr('qcom,sm8150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('xiaomi,cepheus') + cstr('qcom,sm8150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
