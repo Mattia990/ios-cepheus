@@ -1,6 +1,7 @@
 # Build output
 work/
 build/
+xnu/out/
 
 # Boot images and kernels
 shim/out/
