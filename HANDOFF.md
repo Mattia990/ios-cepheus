@@ -5,53 +5,74 @@ Last updated **2026-11-09** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Touch driver finalized in the patch stack; rebuild next (2026-11-09)
+### SE17 FIFO is disabled in hardware; touch moved to bit-banged I2C (2026-11-09)
 
-**Where the port is.** iOS 16.7.16 (iPhone10,3, build 20H392) boots to a full-screen
-SpringBoard at 1080x2340, presented as 1125x2436 (centre crop: 22 px sides, 48 px
-top/bottom), with working hardware buttons. The last verified run is the touch-off
-image `work/boot/runs/touch-off2.img` (log `logs/runs/touch-off2/xnu.txt`):
-`SWEET FB: swap` at 49.939 s, 58.2 fps / 291 swaps by 191 s.
+**Phone run `touch-on1` (kernel built from the GENI stack).** SpringBoard booted with the
+touch-enabled kernel; touch stayed dead and the log stopped at SE17's FIFO-disable check:
 
-**This session changed patches only; no phone run yet.** `0085` now carries the real
-cepheus GENI I2C ST FTS driver (666 lines, `bsd/dev/sweet_fts.c`): SE17 at `0xc80000`,
-wrapper at `0xcc0000`, SDA 55 / SCL 56 (qup17), IRQ 122, reset 12, VDDIO 84, AVDD
-`ldoc1` at 1.8 V, panel 1080x2340. Changes on top of the earlier I2C rewrite:
+```
+[  74.630] SWEET FTS: se17 fw=0x303 proto=3 status=0 tx=0x20102964 rx=0x20104900 ios=0x3 qup=0x10030000 depth=16/16
+[  74.630] SWEET FTS: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping
+```
 
-- Read `QUPV3_HW_VER_REG` from a separate wrapper mapping (`0xcc0000`, +0x4); the SE
-  mapping is only 0x4000, so the old `se + 0x40000` read was outside it.
-- Accept the QUP >= 3.10 8-bit FIFO-depth field (256-byte FIFO); a zero depth falls
-  back to the other layout, and an unusable depth is clamped to 2 instead of aborting.
-- Drain RX before and after `DONE` (the final word can land with `DONE`).
-- DFS level 0 mismatch logs and continues instead of aborting bring-up.
+All other SE registers were valid. TWRP's debug log
+(`/sys/kernel/debug/ipc_logging/i2c-2/log`) says `i2c in GSI ONLY mode`: on cepheus
+`GENI_IF_FIFO_DISABLE_RO` (0x64) reads 0x64 and the QUP runs I2C through GPI DMA, not the
+legacy FIFO. Porting GSI rings, DMA descriptors and IOMMU/firmware work to XNU for one slow
+bus is not practical, so the FIFO path is abandoned. The GENI driver never reached the
+chip: the FIFO check stops before the first transfer.
 
-**Stack consistency.** The 2340 panel height is now propagated through
-`0095`/`0110`/`0111`/`0112`/`0119` (including the GPU `PANEL_H`). `0086`'s
-`sweet_fts.c` hunk was rebased onto the new driver (wrap2 branches `0x1e004`,
-`0x1e008`, `0x1e274`) with updated blob hashes. A targeted replay of patches
-0001-0123 over the affected files (`bsd/conf/files`, `SweetHID.cpp`,
-`SweetFramebuffer.cpp`, `sweet_gpu.c`, `sweet_fts.c`) applies cleanly; the driver
-also passes a host `clang -fsyntax-only` check with kernel stubs. No kernel has been
-built from this stack yet.
+**Decision: bit-bang the same two pins.** `0085` keeps the FTS power/reset code and
+replaces the transport with a software I2C master on GPIO 55/56 (qup17, south TLMM at
+0x03d00000); the command/event layer follows Xiaomi's cepheus `fts_521` driver (`0x86`
+event read, `0xa0/00/01` sense-on, `0xa6/00/00` system info, event `0x03`
+controller-ready), not mainline `stmfts`. Details:
 
-**Next boot (user builds the kernel).** Use the previous working command line with
-touch enabled and the watchdog still off:
+- `cepheustouch=1` starts after `cepheustouchdelay` seconds; `cepheustouchlog=1` logs every event.
+- 19.2 MHz `mach_absolute_time` ticks, 4 us setup, 2 us low / 3 us high (~150-200 kHz),
+  START/repeated START/STOP, ACK/NACK, SCL clock stretching (10 ms) and 9-clock recovery.
+- Probes SDA=55/SCL=56 first, then the swapped pair; a wrong order only NACKs and a reset
+  between attempts leaves the chip in a known state.
+- Reset GPIO 12 is **active low** (Xiaomi's cepheus driver drives it low for 10 ms, then
+  high; the live DT's flag 0 is not a polarity). Reset and IRQ 122 use the DT active state:
+  function gpio, pull-up, 8 mA. SDA/SCL use the qup17 sleep state: pull-up, 2 mA.
+- VDDIO is GPIO 84 (`touch_vddio_vreg`, active high, 4 ms), AVDD is `ldoc1` at 1.8 V.
+- IRQ is polled: read the event stack when GPIO 122 is low, plus once every 10 ms; after
+  10 consecutive read errors the bus is recovered and a release is sent for held fingers.
+
+**Patch stack.** `0085` was regenerated with the 774-line `bsd/dev/sweet_fts.c` (blob
+`8954729db921f60ff4476884435887bc2a5dad9f`); the obsolete `sweet_fts.c` GCC-halt hunk was
+removed from `0086`. Host `clang -fsyntax-only` (kernel stubs, `-Wall -Wextra`) and
+`tools/validate-repo.py` pass. No kernel has been built from this stack yet.
+
+**Next boot (user builds the kernel).** Use the exact `touch-on1` command line:
 
 ```
 debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 \
-ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 \
+ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin \
 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2 \
-cepheuswdt=0 cepheusreboot=300 cepheustouch=1 cepheustouchdelay=30 cepheustouchlog=1
+cepheusreboot=300 cepheuswdt=0 cepheustouch=1 cepheustouchdelay=30 cepheustouchlog=1
 ```
 
-Check the XNU log for `SWEET FTS: se17 fw=... proto=3 ... qup=... depth=...`,
-`info err=0 chip=3639`, `system reset err=0`, `sleep out err=0`, `sense on err=0`,
-then touch events. Coordinates should cover the full 1080x2340 panel; the CPU path
-inverts the centre crop as `nx=(x+22)/1125`, `ny=(y+48)/2436`.
+Expect `SWEET FTS: ready try 1 sda=55 scl=56 idle=1/1 err=0` (the controller-ready event
+`0x03` proves address and ACK), `bus sda=55 scl=56`, then
+`sysinfo fw=0060 chip0=... chip1=...` and `sense on err=0; polling every 5 ms`, then
+`enter`/`motion`/`leave` events. If `sig` is not `a5/01`, check the `0xa6/00/00`
+framebuffer command/address order and the SDA/SCL order; the ready event already proves
+the address. If events appear but coordinates are wrong, compare the logged raw 8-byte
+events with `event[1]` (id/type) and x/y in `event[2..4]`.
 
-**Open.** No touch data yet with the new driver. GPU present is still unavailable
-(`research/gpu/fw` is empty, so `cepheus-run.sh -G` cannot be used). After touch is
-verified, restore `wdt_arm(30)` in `shim/shim.c` and drop `cepheuswdt=0`.
+**Open.** No kernel has been built from this stack, so neither the bit-banged transport
+nor the `fts_521` protocol has run on the phone. If the chip never ACKs, check the idle
+levels printed before START (`idle=1/1`), the SDA/SCL order, and whether GPIO 84 really
+powers `touch_vddio_vreg`. After touch works, restore `wdt_arm(30)` in `shim/shim.c` and
+drop `cepheuswdt=0`.
+
+### Superseded: GENI I2C driver (2026-11-09)
+
+The earlier 666-line GENI driver (SE17 at 0xc80000, wrapper 0xcc0000) is kept in patch
+history only. Its SE register reads were valid, but `touch-on1` shows the FIFO interface
+is hardware-disabled; the wrapper/FIFO-depth work is moot for the current transport.
 
 ### Hardware read from live phone (DONE 2026-11-05)
 

@@ -102,6 +102,11 @@ $PLAT/adb shell dmesg | grep -i -E "panel|touch|watchdog|mdss|ufshc|dwc3|wdt"
 
 Boot: Android 11 RKQ1.200826.002, verified boot state orange (unlocked).
 
+**Touch bus quirk (2026-11-09).** SE17's FIFO interface is disabled in hardware:
+`GENI_IF_FIFO_DISABLE_RO` (0x64) reads 0x64 and TWRP's i2c-geni log says
+`i2c in GSI ONLY mode`. Android drives the bus through GPI DMA, so XNU bit-bangs
+GPIO 55/56 (qup17) as a software I2C master instead.
+
 ## Porting methodology (from https://hackiosx.dev/how-it-works and /porting)
 
 The four problems every port solves: starting Apple's kernel, driving the hardware,
@@ -163,8 +168,10 @@ Of the ~81 original ios-sweet kernel patches:
   keys (GPIO 6=vol_up, GPIO 97=ai_key - disabled by default via sweetkeys=0),
   touch (I2C 0xc80000 addr 0x49 - disabled by default via cepheustouch=0), display keys
 - 0084 early FB device memory: same as flame (confirmed FB block 0x9c000000)
-- 0085 FTS touch: real GENI I2C SE17 driver at 0xc80000 (wrapper 0xcc0000), ST FTS addr 0x49,
-  AVDD ldoc1 at 1.8 V, panel 1080x2340; disabled by default via cepheustouch=0
+- 0085 FTS touch: bit-banged I2C on GPIO 55/56 (SE17 FIFO is hardware-disabled; GSI-only
+  mode), ST FTS addr 0x49, cepheus `fts_521` protocol (`0x86` events, `0xa0/00/01`
+  sense-on, `0xa6/00/00` system info), reset 12 active low, IRQ 122, AVDD ldoc1 at 1.8 V,
+  panel 1080x2340; disabled by default via cepheustouch=0
 - 0086 cpufreq: same GCC offsets as flame (SM8150)
 - 0087 vsync/fps: same as flame
 - 0088 USB: same DWC3 @0xa600000, PHY @0x88e2000 as flame
@@ -185,7 +192,9 @@ Keys and touch TBD items from the initial port plan are now resolved:
 - Confirmed from live FDT: ST FTS on I2C bus 0xc80000, I2C addr 0x49, IRQ 122, reset fts_rst
 - Panel resolution 1080x2340 matches fts,x-max=1080, fts,y-max=2340
 - Touch disabled by default via `cepheustouch=0` (patch 0085)
-- Patch 0085 now has the real GENI I2C SE17 driver (2026-11-09); enable with `cepheustouch=1`
+- Patch 0085 now bit-bangs SDA/SCL as GPIO (2026-11-09): SE17's FIFO is hardware-disabled,
+  so the GENI driver was replaced; enable with `cepheustouch=1`. The command/event layer
+  follows Xiaomi's `fts_521` driver, not mainline `stmfts`.
 
 **Remaining TBD items:**
 - GPIO register addresses for reading keys (need TLMM/GPIO controller layout)

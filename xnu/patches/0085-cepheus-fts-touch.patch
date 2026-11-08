@@ -12,24 +12,37 @@ index 663013104..fe43a3be4 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
 new file mode 100644
-index 000000000..78b8ef220
+index 000000000..8954729db921f60ff4476884435887bc2a5dad9f
 --- /dev/null
 +++ b/bsd/dev/sweet_fts.c
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,774 @@
 +/*
-+ * cepheus touch: ST FTS on the GENI I2C SE17 controller at 0xc80000, slave
-+ * address 0x49. Live FDT: /soc/i2c@0xc80000/fts@49 (compatible "st,fts"),
-+ * panel 1080x2340. Pins: SDA 55, SCL 56 (qup17, south tile), IRQ 122
-+ * (south tile), reset 12 and VDDIO enable 84 (north tile). VDDIO is
-+ * touch_vddio_vreg (fixed regulator on GPIO 84), AVDD is pm8150l-l1
-+ * (RPMh ldoc1, 1.8 V). The chip carries its own firmware: the aboot/TWRP
-+ * driver reports FW VER 0060 without an update, so only a system reset and
++ * cepheus touch: ST FTS on I2C, slave address 0x49, panel 1080x2340.
++ * Live FDT: /soc/i2c@0xc80000/fts@49 (compatible "st,fts"). The bus is
++ * qup17 on GPIO 55 (SDA) / 56 (SCL), south TLMM; IRQ 122 (south TLMM),
++ * reset 12 and VDDIO enable 84 (north TLMM). VDDIO is touch_vddio_vreg
++ * (fixed regulator on GPIO 84), AVDD is pm8150l-l1 (RPMh ldoc1, 1.8 V).
++ *
++ * SE17's FIFO interface is hardware-disabled: GENI_IF_DISABLE_RO (0x64)
++ * reads 0x64 and TWRP's i2c-geni log says "i2c in GSI ONLY mode". Android
++ * drives this bus through GPI DMA; porting the GSI/DMA engine to XNU for
++ * one slow I2C bus is not practical, so this driver bit-bangs the same two
++ * open-drain pins as GPIO. Commands and events follow Xiaomi's cepheus
++ * fts_521 driver (the newer ST FTS API), not the mainline stmfts command
++ * set: 0x86 reads an event, 0xa0/00/01 enables active scanning, 0xa6/00/00
++ * reads the automatically loaded system-info frame, and event 0x03 means
++ * controller ready after a reset. Reset is active low as in that driver
++ * (low 10 ms, then high), and both reset and IRQ use the DT active
++ * pull-up/8 mA state.
++ *
++ * The chip carries its own firmware (aboot/TWRP report FW VER 0060 without
++ * an update), so only a hardware reset, the controller-ready event and
 + * sense-on are needed. Call once after the scheduler is running; all work
 + * runs on one thread.
 + *
 + * Boot-args: cepheustouch=0 off, cepheustouchdelay=N start after N s,
 + * cepheustouchlog=1 log every event.
-+ * Disabled by default until the I2C transport is verified on hardware.
++ * Disabled by default until the bit-banged transport is verified.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -40,6 +53,7 @@ index 000000000..78b8ef220
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <mach/mach_time.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -47,16 +61,8 @@ index 000000000..78b8ef220
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_fts_init(void);
 +
-+#define FTS_SE_PA        0x00c80000u    /* QUPv3 wrapper 2, SE17 */
-+#define FTS_WRAPPER_PA   0x00cc0000u    /* QUPv3 wrapper 2 registers */
-+#define FTS_GCC_PA       0x00100000u
-+#define FTS_TLMM_SOUTH_PA 0x03d00000u   /* SDA 55/SCL 56, IRQ 122 */
++#define FTS_TLMM_SOUTH_PA 0x03d00000u   /* SDA 55 / SCL 56 / IRQ 122 */
 +#define FTS_TLMM_NORTH_PA 0x03900000u   /* reset 12, VDDIO enable 84 */
-+#define FTS_GCC_VOTE     0x52014u       /* APCS_CLOCK_BRANCH_ENA_VOTE_2 */
-+/* wrapper 2: s_ahb (1), m_ahb (2), s1 branch (5): gcc-sm8150.c */
-+#define FTS_GCC_BITS     ((1u << 1) | (1u << 2) | (1u << 5))
-+#define FTS_RCG          0x1e278u       /* gcc_qupv3_wrap2_s1_clk_src */
-+#define FTS_RCG_HALT     0x1e274u       /* gcc_qupv3_wrap2_s1_clk halt */
 +#define FTS_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
 +#define FTS_GPIO_IO(n)   (FTS_GPIO_CFG(n) + 4u)
 +#define FTS_PIN_SDA      55
@@ -66,67 +72,53 @@ index 000000000..78b8ef220
 +#define FTS_PIN_VDDIO    84
 +#define FTS_MAX          10u
 +#define FTS_ADDR         0x49u
++#define FTS_RX_MAX       FTS_DATA_MAX
 +
-+#define SE_STATUS        0x040u
-+#define SE_MCLK          0x048u
-+#define SE_FW            0x068u
-+#define SE_CLK_SEL       0x07cu
-+#define SE_DMA           0x258u
-+#define SE_TX_LEN        0x26cu
-+#define SE_RX_LEN        0x270u
-+#define SE_SCL           0x278u
-+#define SE_CMD           0x600u
-+#define SE_CTRL          0x604u
-+#define SE_IRQ           0x610u
-+#define SE_IRQ_EN        0x614u
-+#define SE_IRQ_CLR       0x618u
-+#define SE_TX            0x700u
-+#define SE_RX            0x780u
-+#define SE_TX_COUNT      0x800u
-+#define SE_RX_COUNT      0x804u
-+#define SE_HW_TX         0xe24u
-+#define SE_HW_RX         0xe28u
-+#define SE_DONE          (1u << 0)
-+#define SE_NACK          (1u << 10)
-+#define SE_ERRORS        (0x0eu | (1u << 9) | (1u << 10) | (1u << 12) | \
-+                          (1u << 13) | (3u << 24) | (3u << 28))
-+#define SE_EVENTS        (SE_DONE | SE_ERRORS | (1u << 5) | (1u << 26) | \
-+                          (1u << 27) | (1u << 30))
-+#define SE_TX_WM_IRQ     (1u << 30)
-+#define SE_RX_WM_IRQ     (1u << 26)
-+#define SE_RX_LAST       (1u << 27)
++/*
++ * mach_absolute_time() ticks at 19.2 MHz on SM8150 (UFS and USB divide by
++ * 19200 for milliseconds). 19 ticks is 0.99 us; the uncached GPIO writes
++ * in each edge add to the period, so the bus stays far below the chip's
++ * 400 kHz limit even if the timebase were different.
++ */
++#define FTS_TICKS_PER_US 19u
++#define FTS_SETUP_US     4u
++#define FTS_LOW_US       2u
++#define FTS_HIGH_US      3u
 +
-+/* ST FTS commands (stmfts.c) */
-+#define FTS_CMD_READ_INFO    0x80u
-+#define FTS_CMD_READ_ALL     0x86u
-+#define FTS_CMD_SLEEP_OUT    0x91u
-+#define FTS_CMD_SENSE_ON     0x93u
-+#define FTS_CMD_SYSTEM_RESET 0xa0u
-+#define FTS_CMD_CLEAR_STACK  0xa1u
-+#define FTS_CMD_FORCE_CAL    0xa2u
++/* ST FTS commands, as used by Xiaomi's cepheus fts_521 driver. */
++#define FTS_CMD_FIFO_READ    0x86u  /* one event; byte 7 = remaining count */
++#define FTS_CMD_SCAN_MODE    0xa0u
++#define FTS_CMD_FRAMEBUFFER  0xa6u
++#define FTS_SCAN_ACTIVE      0x00u
++#define FTS_SENSE_ON         0x01u
++#define FTS_SYSINFO_SIZE     208u
++#define FTS_SYSINFO_SIG      0xa5u
++#define FTS_SYSINFO_LOAD_ID  0x01u
 +
-+/* ST FTS events: low nibble is the type, high nibble the touch id. */
-+#define FTS_EVT_NONE         0x00u
-+#define FTS_EVT_ENTER        0x03u
-+#define FTS_EVT_LEAVE        0x04u
-+#define FTS_EVT_MOTION       0x05u
-+#define FTS_EVT_ERROR        0x0fu
-+#define FTS_EVT_READY        0x10u
-+#define FTS_EVT_SLEEP_READY  0x11u
-+#define FTS_EVT_STATUS       0x16u
++/*
++ * ST FTS events (ftsSoftware.h): event[0] is the event id, event[1] holds
++ * the touch id in the high nibble and the type in the low nibble.
++ */
++#define FTS_EVT_READY        0x03u  /* controller ready after a reset */
++#define FTS_EVT_ENTER        0x13u
++#define FTS_EVT_MOTION       0x23u
++#define FTS_EVT_LEAVE        0x33u
++#define FTS_EVT_STATUS       0x43u
++#define FTS_EVT_ERROR        0xf3u
++#define FTS_TOUCH_FINGER     0x01u
++#define FTS_TOUCH_GLOVE      0x02u
++#define FTS_TOUCH_STYLUS     0x03u
++#define FTS_TOUCH_PALM       0x04u
++#define FTS_TOUCH_HOVER      0x05u
 +#define FTS_EVENT_SIZE       8u
 +#define FTS_STACK_DEPTH      32u
 +#define FTS_DATA_MAX         (FTS_EVENT_SIZE * FTS_STACK_DEPTH)
 +
-+/* GENI FIFO message: TX at most 3 bytes, RX at most the 256-byte event stack. */
-+#define FTS_TX_MAX           3u
-+#define FTS_RX_MAX           FTS_DATA_MAX
-+
 +static struct {
-+	vm_offset_t se, wrapper, gcc, gpio_n, gpio_s;
++	vm_offset_t gpio_n, gpio_s;
 +	bool started, dead;
 +	int log;
-+	unsigned fifo_words;
++	unsigned sda, scl;
 +	uint32_t active;
 +	int x[FTS_MAX], y[FTS_MAX];
 +} ft;
@@ -149,24 +141,21 @@ index 000000000..78b8ef220
 +}
 +
 +static void
++fts_udelay(unsigned us)
++{
++	uint64_t deadline = mach_absolute_time() + (uint64_t)us * FTS_TICKS_PER_US;
++	while (mach_absolute_time() < deadline) {
++		__asm__ volatile("yield" ::: "memory");
++	}
++}
++
++static void
 +fts_wait(unsigned ms)
 +{
 +	uint64_t deadline;
 +	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
 +	(void)assert_wait_deadline(&fts_sleep_chan, THREAD_UNINT, deadline);
 +	thread_block(THREAD_CONTINUE_NULL);
-+}
-+
-+static bool
-+fts_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
-+{
-+	for (unsigned i = 0; i < 5000; ++i) {
-+		if (!(fts_rd(base, off) & mask)) {
-+			return true;
-+		}
-+		delay(1);
-+	}
-+	return false;
 +}
 +
 +/* TLMM: [1:0] pull, [5:2] function, [8:6] drive (mA/2 - 1), [9] output. */
@@ -185,259 +174,358 @@ index 000000000..78b8ef220
 +	fts_wr(base, off, cfg);
 +}
 +
-+static bool
-+fts_clocks(void)
++/*
++ * The bus is open-drain: a line is driven low by enabling the output with a
++ * zero latch, and released by switching back to input (the board pull-ups
++ * and the internal pull-up then take it high). SDA is never driven high.
++ */
++static void
++fts_sda_low(void)
 +{
-+	fts_wr(ft.gcc, FTS_GCC_VOTE, fts_rd(ft.gcc, FTS_GCC_VOTE) | FTS_GCC_BITS);
-+	uint32_t cmd = fts_rd(ft.gcc, FTS_RCG), cfg = fts_rd(ft.gcc, FTS_RCG + 4u);
-+	uint32_t dfs = fts_rd(ft.gcc, FTS_RCG + 0x14u);
-+	printf("SWEET FTS: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
-+	    fts_rd(ft.gcc, FTS_GCC_VOTE), cmd, cfg, dfs);
-+	if (dfs & 1u) {
-+		/* SE CLK_SEL 0 selects DFS level 0; it must be XO (19.2 MHz) / 1. */
-+		cfg = fts_rd(ft.gcc, FTS_RCG + 0x1cu);
-+		printf("SWEET FTS: DFS level0 cfg=%#x\n", cfg);
-+		if ((cfg & 0x371fu) != 1u) {
-+			printf("SWEET FTS: DFS level 0 is %#x, not XO/1; trying anyway\n", cfg);
++	fts_gpio(ft.gpio_s, ft.sda, 0, 3, 0, true, false);
++}
++
++static void
++fts_sda_release(void)
++{
++	fts_gpio(ft.gpio_s, ft.sda, 0, 3, 0, false, false);
++}
++
++static void
++fts_scl_low(void)
++{
++	fts_gpio(ft.gpio_s, ft.scl, 0, 3, 0, true, false);
++}
++
++static bool
++fts_sda_read(void)
++{
++	return (fts_rd(ft.gpio_s, FTS_GPIO_IO(ft.sda)) & 1u) != 0;
++}
++
++static bool
++fts_scl_read(void)
++{
++	return (fts_rd(ft.gpio_s, FTS_GPIO_IO(ft.scl)) & 1u) != 0;
++}
++
++/* Release SCL and wait through any slave clock stretching (10 ms max). */
++static bool
++fts_scl_raise(void)
++{
++	fts_gpio(ft.gpio_s, ft.scl, 0, 3, 0, false, false);
++	for (unsigned i = 0; i < 10000; ++i) {
++		if (fts_scl_read()) {
++			return true;
 +		}
-+	} else {
-+		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
-+		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
-+		fts_wr(ft.gcc, FTS_RCG + 4u, cfg);
-+		fts_wr(ft.gcc, FTS_RCG, fts_rd(ft.gcc, FTS_RCG) | 1u);
-+		if (!fts_wait_clear(ft.gcc, FTS_RCG, 1u)) {
-+			printf("SWEET FTS: RCG update timeout\n");
-+			return false;
-+		}
++		fts_udelay(1);
 +	}
-+	const uint32_t branches[] = {0x1e004, 0x1e008, FTS_RCG_HALT};
-+	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
-+		if (!fts_wait_clear(ft.gcc, branches[i], 1u << 31)) {
-+			printf("SWEET FTS: GCC branch %#x halted (%#x)\n", branches[i],
-+			    fts_rd(ft.gcc, branches[i]));
-+			return false;
-+		}
++	return false;
++}
++
++/* START, or repeated START when both lines were left released. */
++static bool
++fts_bb_start(void)
++{
++	fts_sda_release();
++	fts_udelay(1);
++	if (!fts_scl_raise()) {
++		return false;
 +	}
++	fts_udelay(FTS_SETUP_US);
++	fts_sda_low();
++	fts_udelay(FTS_SETUP_US);
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
 +	return true;
 +}
 +
-+/* Drain all complete 32-bit words now in the RX FIFO. */
-+static int
-+fts_drain(uint8_t *rx, unsigned nr, unsigned *got)
++/* STOP; the caller leaves SCL low after every byte, so SDA may go low first. */
++static bool
++fts_bb_stop(void)
 +{
-+	unsigned words = 0;
-+	for (;;) {
-+		uint32_t count = fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu;
-+		if (!count) {
-+			return 0;
-+		}
-+		if (count > 64 || words + count > FTS_RX_MAX / 4u + 8u) {
-+			return EIO;
-+		}
-+		words += count;
-+		while (count--) {
-+			uint32_t word = fts_rd(ft.se, SE_RX);
-+			for (unsigned j = 0; j < 4 && *got < nr; ++j) {
-+				rx[(*got)++] = (uint8_t)(word >> (8u * j));
-+			}
-+		}
-+	}
++	fts_sda_low();
++	fts_udelay(FTS_LOW_US);
++	bool ok = fts_scl_raise();
++	fts_udelay(FTS_SETUP_US);
++	fts_sda_release();
++	fts_udelay(FTS_SETUP_US);
++	return ok;
 +}
 +
-+/* Called only for a transfer started by this driver, including a stretched TX. */
-+static void
-+fts_abort(void)
++static bool
++fts_bb_write_bit(bool one)
 +{
-+	fts_wr(ft.se, SE_CTRL, 2); /* abort M command, release held bus */
-+	bool done = false;
-+	for (unsigned i = 0; i < 5000; ++i) {
-+		if (fts_rd(ft.se, SE_IRQ) & (1u << 5)) {
-+			done = true;
-+			break;
++	if (one) {
++		fts_sda_release();
++	} else {
++		fts_sda_low();
++	}
++	fts_udelay(1);
++	if (!fts_scl_raise()) {
++		return false;
++	}
++	fts_udelay(FTS_HIGH_US);
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
++	return true;
++}
++
++static bool
++fts_bb_read_bit(bool *one)
++{
++	fts_sda_release();
++	fts_udelay(1);
++	if (!fts_scl_raise()) {
++		return false;
++	}
++	fts_udelay(FTS_HIGH_US);
++	*one = fts_sda_read();
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
++	return true;
++}
++
++/* Write one byte and the ninth (ACK) clock: 0 = ACK, ENXIO = NACK. */
++static int
++fts_bb_write_byte(uint8_t byte)
++{
++	for (unsigned i = 0; i < 8; ++i) {
++		if (!fts_bb_write_bit((byte & 0x80u) != 0)) {
++			return EIO;
 +		}
-+		delay(1);
++		byte <<= 1;
 +	}
-+	if (!done || !fts_wait_clear(ft.se, SE_STATUS, 1u)) {
-+		ft.dead = true;
-+		printf("SWEET FTS: abort failed status=%#x irq=%#x; stopping\n",
-+		    fts_rd(ft.se, SE_STATUS), fts_rd(ft.se, SE_IRQ));
++	fts_sda_release();
++	fts_udelay(1);
++	if (!fts_scl_raise()) {
++		return EIO;
 +	}
-+	/* Bound drain even if the hardware reports an impossible FIFO count. */
-+	for (unsigned i = 0; i < 128 && (fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
-+		(void)fts_rd(ft.se, SE_RX);
++	fts_udelay(FTS_HIGH_US);
++	bool ack = !fts_sda_read();
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
++	return ack ? 0 : ENXIO;
++}
++
++/* Read one byte and drive ACK (or NACK on the last byte). */
++static int
++fts_bb_read_byte(uint8_t *out, bool last)
++{
++	uint8_t byte = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		bool one;
++		if (!fts_bb_read_bit(&one)) {
++			return EIO;
++		}
++		byte = (uint8_t)((byte << 1) | (one ? 1u : 0u));
 +	}
-+	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
-+	if (fts_rd(ft.se, SE_TX_COUNT) & 0xfffffffu) {
-+		ft.dead = true;
-+		printf("SWEET FTS: TX FIFO not empty after abort; stopping\n");
++	if (last) {
++		fts_sda_release(); /* NACK: let go before the STOP. */
++	} else {
++		fts_sda_low();     /* ACK. */
 +	}
++	fts_udelay(1);
++	if (!fts_scl_raise()) {
++		return EIO;
++	}
++	fts_udelay(FTS_HIGH_US);
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
++	fts_sda_release();
++	*out = byte;
++	return 0;
 +}
 +
 +/*
-+ * One Linux-style FIFO message. STOP_STRETCH on the command write retains
-+ * the bus for the repeated START that reads the answer.
++ * Clock a slave that was interrupted mid-byte out of the way, then send a
++ * STOP. A reset pulse normally frees the bus first; this also covers a
++ * previous kernel or ABL leaving the SE mid-transaction.
 + */
-+static int
-+fts_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
-+    unsigned nr, bool stretch)
++static bool
++fts_bb_recover(void)
 +{
-+	if (ft.dead || nt > FTS_TX_MAX || nr > FTS_RX_MAX || (nt && nr) || (!nt && !nr)) {
-+		return EIO;
++	fts_sda_release();
++	fts_udelay(10);
++	if (!fts_scl_raise()) {
++		return false;
 +	}
-+	if (!fts_wait_clear(ft.se, SE_STATUS, 1u)) {
-+		ft.dead = true; /* no other SE17 owner is supported */
-+		return EBUSY;
++	for (unsigned i = 0; i < 9 && !fts_sda_read(); ++i) {
++		fts_scl_low();
++		fts_udelay(FTS_LOW_US);
++		if (!fts_scl_raise()) {
++			return false;
++		}
++		fts_udelay(FTS_HIGH_US);
 +	}
-+	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
-+	fts_wr(ft.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
-+	fts_wr(ft.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
-+	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
-+	unsigned sent = 0, got = 0;
-+	int err = ETIMEDOUT;
-+	for (unsigned i = 0; i < 20000; ++i) {
-+		uint32_t irq = fts_rd(ft.se, SE_IRQ);
-+		if (irq & SE_ERRORS) {
-+			err = (irq & SE_NACK) ? ENXIO : EIO;
-+			/* A completed NACK is normal while probing; wait for DONE and
-+			 * leave a clean idle engine for the next message. */
-+			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
-+				delay(1);
-+				irq = fts_rd(ft.se, SE_IRQ);
-+			}
-+			if ((irq & SE_DONE) && !(fts_rd(ft.se, SE_STATUS) & 1u) &&
-+			    !(fts_rd(ft.se, SE_TX_COUNT) & 0xfffffffu) &&
-+			    !(fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu)) {
-+				fts_wr(ft.se, SE_IRQ_CLR, irq);
-+				return err;
-+			}
-+			break;
-+		}
-+		if (nt && !sent && (irq & SE_TX_WM_IRQ)) {
-+			uint32_t word = 0;
-+			for (unsigned j = 0; j < nt; ++j) {
-+				word |= (uint32_t)tx[j] << (8u * j);
-+			}
-+			fts_wr(ft.se, SE_TX, word);
-+			sent = nt;
-+		}
-+		int derr = fts_drain(rx, nr, &got);
-+		if (derr) {
-+			err = derr;
-+			break;
-+		}
-+		/* Re-read: DONE and the last RX word can land after the drain. */
-+		irq = fts_rd(ft.se, SE_IRQ);
-+		if (irq & SE_DONE) {
-+			/* The final word becomes visible with DONE; drain once more. */
-+			derr = fts_drain(rx, nr, &got);
-+			if (derr) {
-+				err = derr;
-+				break;
-+			}
-+			fts_wr(ft.se, SE_IRQ_CLR, irq);
-+			if (got == nr && sent == nt) {
-+				return 0;
-+			}
-+			err = EIO;
-+			break;
-+		}
-+		/* Preserve DONE/errors if they arrive during this iteration. */
-+		fts_wr(ft.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
-+		delay(1);
++	fts_scl_low();
++	fts_udelay(FTS_LOW_US);
++	fts_sda_low();
++	fts_udelay(FTS_SETUP_US);
++	bool ok = fts_scl_raise();
++	fts_udelay(FTS_SETUP_US);
++	fts_sda_release();
++	fts_udelay(FTS_SETUP_US);
++	return ok;
++}
++
++/* Write n command bytes, then STOP (one i2c_msg). */
++static int
++fts_i2c_write_buf(const uint8_t *buf, unsigned len)
++{
++	if (len == 0) {
++		return EINVAL;
 +	}
-+	fts_abort();
++	if (!fts_bb_start()) {
++		return ETIMEDOUT;
++	}
++	int err = fts_bb_write_byte((uint8_t)(FTS_ADDR << 1));
++	for (unsigned i = 0; !err && i < len; ++i) {
++		err = fts_bb_write_byte(buf[i]);
++	}
++	if (!fts_bb_stop() && !err) {
++		err = EIO;
++	}
++	return err;
++}
++
++/* Write n command bytes, then repeated START and read (two i2c_msg). */
++static int
++fts_i2c_read_buf(const uint8_t *cmd, unsigned cmdlen, uint8_t *buf,
++    unsigned len)
++{
++	if (cmdlen == 0 || len > FTS_RX_MAX) {
++		return EINVAL;
++	}
++	if (!fts_bb_start()) {
++		return ETIMEDOUT;
++	}
++	int err = fts_bb_write_byte((uint8_t)(FTS_ADDR << 1));
++	for (unsigned i = 0; !err && i < cmdlen; ++i) {
++		err = fts_bb_write_byte(cmd[i]);
++	}
++	if (!err && !fts_bb_start()) {
++		err = ETIMEDOUT;
++	}
++	if (!err) {
++		err = fts_bb_write_byte((uint8_t)((FTS_ADDR << 1) | 1u));
++	}
++	for (unsigned i = 0; !err && i < len; ++i) {
++		err = fts_bb_read_byte(&buf[i], i + 1u == len);
++	}
++	if (!fts_bb_stop() && !err) {
++		err = EIO;
++	}
 +	return err;
 +}
 +
 +static int
-+fts_read(uint8_t cmd, uint8_t *buf, unsigned len)
++fts_fifo_read(uint8_t *buf, unsigned len)
 +{
-+	int err = fts_msg(FTS_ADDR, &cmd, 1, NULL, 0, true);
++	uint8_t cmd = FTS_CMD_FIFO_READ;
++	return fts_i2c_read_buf(&cmd, 1, buf, len);
++}
++
++/*
++ * Read one FIFO event plus, if byte 7 of the first event reports more
++ * pending events, the rest of the stack in one transfer (fts_event_handler
++ * in the cepheus driver does the same). Returns the number of events.
++ */
++static int
++fts_read_events(uint8_t *buf, unsigned *count)
++{
++	int err = fts_fifo_read(buf, FTS_EVENT_SIZE);
 +	if (err) {
 +		return err;
 +	}
-+	return fts_msg(FTS_ADDR, NULL, 0, buf, len, false);
++	unsigned more = buf[7] & 0x1fu;
++	if (more > FTS_STACK_DEPTH - 1u) {
++		more = FTS_STACK_DEPTH - 1u;
++	}
++	if (more) {
++		err = fts_fifo_read(buf + FTS_EVENT_SIZE,
++		    more * FTS_EVENT_SIZE);
++		if (err) {
++			return err;
++		}
++	}
++	*count = more + 1u;
++	return 0;
 +}
 +
++/* 0xa0/00/01: active scan mode, MT sensing on. */
 +static int
-+fts_write(uint8_t cmd)
++fts_sense_on(void)
 +{
-+	return fts_msg(FTS_ADDR, &cmd, 1, NULL, 0, false);
++	const uint8_t cmd[3] = { FTS_CMD_SCAN_MODE, FTS_SCAN_ACTIVE, FTS_SENSE_ON };
++	return fts_i2c_write_buf(cmd, sizeof(cmd));
 +}
 +
++/* 0xa6/00/00 loads the system-info frame into the framebuffer. */
 +static int
-+fts_read_events(uint8_t *buf)
++fts_read_sysinfo(uint8_t *buf)
 +{
-+	return fts_read(FTS_CMD_READ_ALL, buf, FTS_DATA_MAX);
++	const uint8_t cmd[3] = { FTS_CMD_FRAMEBUFFER, 0x00, 0x00 };
++	return fts_i2c_read_buf(cmd, sizeof(cmd), buf, FTS_SYSINFO_SIZE);
 +}
 +
-+static bool
-+fts_se_init(void)
++/*
++ * qup17 sleep state: function 0 (GPIO), pull-up, 2 mA. IRQ and reset use
++ * the live DT active state (pull-up, 8 mA): reset is active low, as in the
++ * downstream cepheus driver, and is held asserted from before power-up.
++ */
++static void
++fts_pins(void)
 +{
-+	uint32_t fw = fts_rd(ft.se, SE_FW);
-+	uint32_t tx = fts_rd(ft.se, SE_HW_TX), rx = fts_rd(ft.se, SE_HW_RX);
-+	uint32_t ver = fts_rd(ft.wrapper, 0x4); /* QUPV3_HW_VER_REG */
-+	unsigned major = (ver >> 28) & 0xfu, minor = (ver >> 16) & 0xfffu;
-+	/* QUP >= 3.10 widens the FIFO depth field from 6 to 8 bits. */
-+	bool wide = major > 3u || (major == 3u && minor >= 10u);
-+	uint32_t tx_depth = (tx >> 16) & (wide ? 0xffu : 0x3fu);
-+	uint32_t rx_depth = (rx >> 16) & (wide ? 0xffu : 0x3fu);
-+	printf("SWEET FTS: se17 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x qup=%#x depth=%u/%u\n",
-+	    fw, (fw >> 8) & 0xffu, fts_rd(ft.se, SE_STATUS), tx, rx,
-+	    fts_rd(ft.se, 0x908), ver, tx_depth, rx_depth);
-+	/* Protocol 3 = I2C; 32-bit FIFO words. */
-+	if (((fw >> 8) & 0xffu) != 3u || (fts_rd(ft.se, 0x64) & 1u) ||
-+	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u) {
-+		printf("SWEET FTS: need ABL-loaded I2C firmware and 32-bit FIFOs; stopping\n");
-+		return false;
++	fts_gpio(ft.gpio_s, ft.sda, 0, 3, 0, false, false);
++	fts_gpio(ft.gpio_s, ft.scl, 0, 3, 0, false, false);
++	fts_gpio(ft.gpio_s, FTS_PIN_IRQ, 0, 3, 3, false, false);
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, false);
++}
++
++static void
++fts_reset(void)
++{
++	/*
++	 * fts_system_reset in Xiaomi's cepheus driver drives reset low
++	 * (asserted) for 10 ms, then high and waits for the controller-ready
++	 * event. The DT flag is not a polarity: the driver uses raw GPIO
++	 * values, so 0 = low = reset and 1 = high = run.
++	 */
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, false);
++	fts_wait(10);
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, true);
++	fts_wait(50);
++}
++
++static int fts_wait_ready(unsigned ms);
++static void fts_release_all(void);
++
++/*
++ * Hardware reset, then wait for the controller-ready event. A wrong SDA/SCL
++ * order leaves the chip without a valid address, so every transfer NACKs; a
++ * reset between attempts leaves the chip in a known state.
++ */
++static int
++fts_probe(void)
++{
++	int err = ETIMEDOUT;
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		fts_reset();
++		if (!fts_bb_recover()) {
++			printf("SWEET FTS: SCL stuck low after reset\n");
++			fts_wait(50);
++			continue;
++		}
++		err = fts_wait_ready(500);
++		printf("SWEET FTS: ready try %u sda=%u scl=%u idle=%u/%u err=%d\n",
++		    attempt + 1u, ft.sda, ft.scl, fts_sda_read(), fts_scl_read(), err);
++		if (!err) {
++			return 0;
++		}
++		fts_wait(20);
 +	}
-+	/* The version may be unreadable; a zero depth then means the other layout. */
-+	if (!tx_depth) {
-+		tx_depth = (tx >> 16) & 0xffu;
-+	}
-+	if (!rx_depth) {
-+		rx_depth = (rx >> 16) & 0xffu;
-+	}
-+	if (tx_depth < 2u || rx_depth < 2u) {
-+		printf("SWEET FTS: FIFO depth %u/%u unusable; assuming 2\n", tx_depth, rx_depth);
-+		tx_depth = tx_depth < 2u ? 2u : tx_depth;
-+		rx_depth = rx_depth < 2u ? 2u : rx_depth;
-+	}
-+	if (fts_rd(ft.se, SE_STATUS) & 0x1001u) {
-+		printf("SWEET FTS: SE17 already busy; stopping\n");
-+		return false;
-+	}
-+	ft.fifo_words = tx_depth < rx_depth ? tx_depth : rx_depth;
-+	/* geni_se_init + FIFO mode, polled (no GSI, no IRQ routing). */
-+	fts_wr(ft.se, 0xe18, 0); /* no GSI events */
-+	fts_wr(ft.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
-+	fts_wr(ft.se, 0x644, 0);
-+	fts_wr(ft.se, SE_IRQ_CLR, 0xffffffffu);
-+	fts_wr(ft.se, 0x648, 0xffffffffu);
-+	fts_wr(ft.se, SE_DMA, 0);
-+	fts_wr(ft.se, 0x28, fts_rd(ft.se, 0x28) | 0x7fu);
-+	fts_wr(ft.se, 0xe30, fts_rd(ft.se, 0xe30) | 0x0fu);
-+	fts_wr(ft.se, 0x24, 0x7f);
-+	fts_wr(ft.se, 0x20, 1);
-+	fts_wr(ft.se, SE_CLK_SEL, 0);
-+	fts_wr(ft.se, SE_MCLK, (2u << 4) | 1u); /* 19.2 MHz / 2 for 400 kHz */
-+	fts_wr(ft.se, SE_SCL, (5u << 20) | (11u << 10) | 22u);
-+	/* Four 8-bit bytes per 32-bit word, LSB byte first (Linux packing). */
-+	fts_wr(ft.se, 0x254, 0);
-+	fts_wr(ft.se, 0x260, 0x0004380eu);
-+	fts_wr(ft.se, 0x264, 0x000c3e0eu);
-+	fts_wr(ft.se, 0x284, 0x0004380eu);
-+	fts_wr(ft.se, 0x288, 0x000c3e0eu);
-+	fts_wr(ft.se, 0x80c, 1);
-+	fts_wr(ft.se, 0x810, 0);
-+	fts_wr(ft.se, 0x814, ft.fifo_words - 1u);
-+	fts_wr(ft.se, SE_IRQ_EN, SE_EVENTS);
-+	if ((fts_rd(ft.se, SE_TX_COUNT) & 0xfffffffu) ||
-+	    (fts_rd(ft.se, SE_RX_COUNT) & 0x1ffffffu)) {
-+		printf("SWEET FTS: inherited FIFO data; stopping\n");
-+		return false;
-+	}
-+	return true;
++	return err;
 +}
 +
 +static void
@@ -448,69 +536,90 @@ index 000000000..78b8ef220
 +}
 +
 +/*
-+ * Read the whole 32-event stack and look for the controller-ready event a
-+ * command produces (0x10 reset, 0x11 sleep out, 0x16 status). Other events
-+ * are logged: before sense-on there should be none.
++ * Poll the FIFO for the controller-ready event (0x03 after a hardware reset;
++ * the chip also sends it if it reboots). Empty reads keep the loop going, and
++ * a NACK right after reset is normal while the chip is still booting.
 + */
 +static int
-+fts_wait_ready(unsigned ms, uint8_t want)
++fts_wait_ready(unsigned ms)
 +{
-+	uint8_t buf[FTS_DATA_MAX];
++	uint8_t ev[FTS_EVENT_SIZE];
 +	for (unsigned t = 0; t < ms; t += 5) {
-+		int err = fts_read_events(buf);
-+		if (err) {
-+			return err;
-+		}
-+		for (unsigned i = 0; i < FTS_STACK_DEPTH; ++i) {
-+			const uint8_t *ev = buf + i * FTS_EVENT_SIZE;
-+			if (ev[0] == FTS_EVT_NONE) {
-+				break;
++		int err = fts_fifo_read(ev, sizeof(ev));
++		if (!err) {
++			if (ev[0] == FTS_EVT_READY) {
++				return 0;
 +			}
-+			if (ev[0] == FTS_EVT_READY || ev[0] == FTS_EVT_SLEEP_READY ||
-+			    ev[0] == FTS_EVT_STATUS) {
-+				if (ft.log) {
-+					fts_log_event("ready", ev);
-+				}
-+				if (!want || ev[0] == want || ev[0] == FTS_EVT_STATUS) {
-+					return 0;
-+				}
-+			} else {
-+				fts_log_event("init event", ev);
++			if (ev[0] != 0x00u) {
++				fts_log_event("pre-ready", ev);
 +			}
++		} else if (ft.log || t == 0) {
++			printf("SWEET FTS: ready poll err=%d\n", err);
 +		}
 +		fts_wait(5);
 +	}
 +	return ETIMEDOUT;
 +}
 +
++/*
++ * Event layout from Xiaomi's cepheus driver: event[0] is the event id,
++ * event[1] holds the touch id (high nibble) and touch type (low nibble);
++ * for enter/motion, x is in event[2]/event[3][3:0] and y in event[3][7:4]/
++ * event[4], both 12-bit panel pixels.
++ */
 +static void
 +fts_handle(const uint8_t ev[FTS_EVENT_SIZE])
 +{
-+	unsigned type = ev[0] & 0x0fu, id = ev[0] >> 4;
-+	if (id >= FTS_MAX) {
-+		if (ft.log) {
-+			fts_log_event("bad id", ev);
-+		}
-+		return;
-+	}
-+	int x = (int)(ev[1] | ((ev[2] & 0x0fu) << 8));
-+	int y = (int)((ev[2] >> 4) | (ev[3] << 4));
-+	if (ft.log) {
-+		fts_log_event("touch", ev);
-+	}
-+	switch (type) {
++	unsigned id = ev[1] >> 4, type = ev[1] & 0x0fu;
++
++	switch (ev[0]) {
 +	case FTS_EVT_ENTER:
-+	case FTS_EVT_MOTION:
++	case FTS_EVT_MOTION: {
++		if (id >= FTS_MAX) {
++			fts_log_event("bad id", ev);
++			return;
++		}
++		if (type != FTS_TOUCH_FINGER && type != FTS_TOUCH_GLOVE &&
++		    type != FTS_TOUCH_PALM) {
++			if (ft.log) {
++				fts_log_event("skip type", ev);
++			}
++			return;
++		}
++		int x = (int)(((unsigned)ev[3] & 0x0fu) << 8) | ev[2];
++		int y = ((int)ev[4] << 4) | ((ev[3] & 0xf0u) >> 4);
++		if (x >= 1080) {
++			x = 1079;
++		}
++		if (y >= 2340) {
++			y = 2339;
++		}
++		if (ft.log) {
++			fts_log_event(ev[0] == FTS_EVT_ENTER ? "enter" : "motion",
++			    ev);
++		}
 +		ft.active |= 1u << id;
 +		ft.x[id] = x;
 +		ft.y[id] = y;
 +		sweet_hid_touch((int)id, 1, x, y);
 +		break;
++	}
 +	case FTS_EVT_LEAVE:
-+		if (ft.active & (1u << id)) {
++		if (id < FTS_MAX && (ft.active & (1u << id))) {
++			if (ft.log) {
++				fts_log_event("leave", ev);
++			}
 +			ft.active &= ~(1u << id);
 +			sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
 +		}
++		break;
++	case FTS_EVT_READY:
++		/* Unexpected reset while running: drop touches and sense on. */
++		if (ft.log) {
++			fts_log_event("ready", ev);
++		}
++		fts_release_all();
++		(void)fts_sense_on();
 +		break;
 +	case FTS_EVT_ERROR:
 +		fts_log_event("error", ev);
@@ -539,17 +648,15 @@ index 000000000..78b8ef220
 +{
 +	unsigned delay_s = 20;
 +	uint8_t buf[FTS_DATA_MAX];
++	uint8_t si[FTS_SYSINFO_SIZE];
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("cepheustouchdelay", &delay_s, sizeof(delay_s));
 +	printf("SWEET FTS: starting in %u s\n", delay_s);
 +	fts_wait(delay_s * 1000u);
-+	ft.gcc = ml_io_map(FTS_GCC_PA, 0x60000);
 +	ft.gpio_n = ml_io_map(FTS_TLMM_NORTH_PA, 0x81000);
 +	ft.gpio_s = ml_io_map(FTS_TLMM_SOUTH_PA, 0x81000);
-+	ft.se = ml_io_map(FTS_SE_PA, 0x4000);
-+	ft.wrapper = ml_io_map(FTS_WRAPPER_PA, 0x1000);
-+	if (!ft.gcc || !ft.gpio_n || !ft.gpio_s || !ft.se || !ft.wrapper) {
++	if (!ft.gpio_n || !ft.gpio_s) {
 +		printf("SWEET FTS: MMIO mapping failed\n");
 +		goto out;
 +	}
@@ -560,6 +667,10 @@ index 000000000..78b8ef220
 +	    fts_rd(ft.gpio_n, FTS_GPIO_IO(FTS_PIN_VDDIO)),
 +	    fts_rd(ft.gpio_s, FTS_GPIO_CFG(FTS_PIN_IRQ)),
 +	    fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)));
++	/* Take the qup17 pins away from the SE before the chip is reset. */
++	ft.sda = FTS_PIN_SDA;
++	ft.scl = FTS_PIN_SCL;
++	fts_pins();
 +	/* VDDIO first (fixed regulator on GPIO 84, 4 ms startup delay). */
 +	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
 +	fts_wait(4);
@@ -567,88 +678,85 @@ index 000000000..78b8ef220
 +	int perr = sweet_rpmh_vreg_enable("ldoc1", 1800);
 +	printf("SWEET FTS: vddio gpio 84 high, avdd ldoc1 err=%d\n", perr);
 +	fts_wait(20);
-+	if (!fts_clocks()) {
++	/*
++	 * Board notes say SDA=55/SCL=56; if that order is wrong the chip never
++	 * ACKs its address, so try the swapped pair once before giving up. A
++	 * reset between attempts leaves the chip in a known state.
++	 */
++	int err = ETIMEDOUT;
++	for (unsigned m = 0; m < 2; ++m) {
++		ft.sda = m ? FTS_PIN_SCL : FTS_PIN_SDA;
++		ft.scl = m ? FTS_PIN_SDA : FTS_PIN_SCL;
++		fts_pins();
++		err = fts_probe();
++		if (!err) {
++			break;
++		}
++		printf("SWEET FTS: no answer with this pin order\n");
++	}
++	if (err) {
++		printf("SWEET FTS: touch controller did not answer; stopping\n");
 +		goto out;
 +	}
-+	fts_gpio(ft.gpio_s, FTS_PIN_SDA, 1, 0, 0, false, false); /* qup17, 2 mA */
-+	fts_gpio(ft.gpio_s, FTS_PIN_SCL, 1, 0, 0, false, false);
-+	fts_gpio(ft.gpio_s, FTS_PIN_IRQ, 0, 3, 3, false, false); /* input, pull-up, 8 mA */
-+	if (!fts_se_init()) {
-+		goto out;
++	printf("SWEET FTS: bus sda=%u scl=%u\n", ft.sda, ft.scl);
++
++	/*
++	 * The chip loads its system info at reset. The header proves that the
++	 * framebuffer command and the protocol are right; touch only needs the
++	 * scan-mode command below, so a mismatch is logged, not fatal.
++	 */
++	err = fts_read_sysinfo(si);
++	if (!err && si[0] == FTS_SYSINFO_SIG && si[1] == FTS_SYSINFO_LOAD_ID) {
++		unsigned chip0 = si[10] | ((unsigned)si[11] << 8);
++		unsigned chip1 = si[14] | ((unsigned)si[15] << 8);
++		unsigned fw = si[16] | ((unsigned)si[17] << 8);
++		printf("SWEET FTS: sysinfo fw=%04x chip0=%04x chip1=%04x\n",
++		    fw, chip0, chip1);
++	} else {
++		printf("SWEET FTS: sysinfo err=%d sig=%02x id=%02x\n",
++		    err, si[0], si[1]);
 +	}
-+	/* Datasheet reset: low >= 10 ms, then 50 ms before the first command. */
-+	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 0, 0, true, false);
-+	fts_wait(20);
-+	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 0, 0, true, true);
-+	fts_wait(50);
-+	uint8_t info[8] = {0};
-+	int err = fts_read(FTS_CMD_READ_INFO, info, sizeof(info));
-+	printf("SWEET FTS: info err=%d chip=%02x%02x ver=%02x fw=%02x%02x cfg=%02x/%02x\n",
-+	    err, info[6], info[7], info[0], info[2], info[3], info[4], info[5]);
-+	if (err || ft.dead) {
-+		goto out;
-+	}
-+	err = fts_write(FTS_CMD_SYSTEM_RESET);
-+	if (!err) {
-+		err = fts_wait_ready(1000, FTS_EVT_READY);
-+	}
-+	printf("SWEET FTS: system reset err=%d\n", err);
-+	if (err || ft.dead) {
-+		goto out;
-+	}
-+	err = fts_write(FTS_CMD_SLEEP_OUT);
-+	if (!err) {
-+		err = fts_wait_ready(1000, FTS_EVT_SLEEP_READY);
-+	}
-+	printf("SWEET FTS: sleep out err=%d\n", err);
-+	if (err || ft.dead) {
-+		goto out;
-+	}
-+	(void)fts_write(FTS_CMD_CLEAR_STACK);
-+	err = fts_write(FTS_CMD_SENSE_ON);
-+	printf("SWEET FTS: sense on err=%d; polling every 10 ms\n", err);
++
++	err = fts_sense_on();
++	printf("SWEET FTS: sense on err=%d; polling every 5 ms\n", err);
 +	if (err) {
 +		goto out;
 +	}
-+	unsigned errors = 0, events = 0, ticks = 0;
++	unsigned errors = 0, ticks = 0;
 +	while (!ft.dead) {
 +		/* The IRQ line (active low) says events are pending; also read
-+		 * every ~20 ms in case the line does not work as assumed. */
++		 * every ~10 ms in case the line does not work as assumed. */
 +		bool poll = (++ticks % 2u) == 0;
 +		while ((poll || !(fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) &&
 +		    !ft.dead) {
 +			poll = false;
-+			if (fts_read_events(buf)) {
++			unsigned count = 0;
++			if (fts_read_events(buf, &count)) {
 +				if ((errors++ % 100u) == 0) {
 +					printf("SWEET FTS: read error (%u)\n", errors);
 +				}
++				if (errors == 10) {
++					fts_release_all();
++					if (!fts_bb_recover()) {
++						printf("SWEET FTS: bus stuck low; stopping\n");
++						ft.dead = true;
++					}
++				}
 +				break;
 +			}
++			errors = 0;
 +			bool any = false;
-+			for (unsigned i = 0; i < FTS_STACK_DEPTH; ++i) {
++			for (unsigned i = 0; i < count; ++i) {
 +				const uint8_t *ev = buf + i * FTS_EVENT_SIZE;
-+				if (ev[0] == FTS_EVT_NONE) {
++				if (ev[0] == 0x00u) {
 +					break;
 +				}
 +				any = true;
-+				if (ev[0] == FTS_EVT_READY || ev[0] == FTS_EVT_SLEEP_READY ||
-+				    ev[0] == FTS_EVT_STATUS) {
-+					if (ft.log) {
-+						fts_log_event("ready", ev);
-+					}
-+					continue;
-+				}
-+				if (events++ < 32 && !ft.log) {
-+					fts_log_event("first", ev);
-+				}
 +				fts_handle(ev);
 +			}
 +			if (!any) {
 +				break;
 +			}
-+		}
-+		if (errors == 10) {
-+			fts_release_all(); /* release after persistent bad reads */
 +		}
 +		fts_wait(5);
 +	}
