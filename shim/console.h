@@ -7,7 +7,7 @@
  * cepheus: Samsung EA8076 FHD CMD panel, 1080x2340.
  * cont_splash_region from live FDT: <0x9c000000 0x2400000>.
  */
-#define FB_SPLASH_BASE	0x9c400000UL	/* FB within cont_splash_region block */
+#define FB_SPLASH_BASE	0x9c000000UL	/* VIG0 source: cont_splash_region base */
 #define FB_SPLASH_SIZE	0x02400000UL
 #define FB_W		1080
 #define FB_H		2340   /* cepheus panel height */

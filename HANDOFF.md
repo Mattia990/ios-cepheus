@@ -10,7 +10,7 @@ Last updated **2026-11-05** (newest work first under "Start here"). Read this fi
 Read from the Xiaomi Mi 9 (cepheus) via adb (root). All key hardware facts are now in NOTES.md:
 
 - **Display**: Samsung EA8076 FHD CMD, 1080x2340 @60 Hz, command mode
-- **Splash FB**: cont_splash_region 0x9c000000/0x2400000, FB at 0x9c400000 (same block as flame)
+- **Splash FB**: cont_splash_region 0x9c000000/0x2400000; the VIG0 source register says the panel scans out 0x9c000000 itself (flame's FB is at 0x9c400000 — copying that number shifted the UI down 4 MB)
 - **Touch**: ST FTS on I2C 0xc80000, addr 0x49, IRQ 122, x=1080 y=2340
 - **Memory**: banks 0x80000000/0x3cc00000, 0xc0000000/0x80000000, 0x1_4000_0000/0xc0000000 (~6 GB)
 - **Most SoC addresses identical to flame** (GIC, PMIC, USB, UFS, WDT, MDP, GPU)

@@ -15,7 +15,7 @@ new file mode 100644
 index 000000000..1778d6d0f
 --- /dev/null
 +++ b/bsd/dev/sweet_fts.c
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,584 @@
 +/*
 + * cepheus touch: ST FTS on I2C bus 0xc80000, I2C address 0x49 (confirmed from
 + * live FDT: i2c@0xc80000/fts@49). Panel resolution 1080x2340 (fts,x-max=1080,

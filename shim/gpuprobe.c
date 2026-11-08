@@ -828,7 +828,7 @@ static int flush_wait(const char *what)
 }
 
 #define GVA_FB		0x20000000u
-#define FB_PA		0x9c400000UL
+#define FB_PA		0x9c000000UL
 #define FB_STRIDE	4320
 #define BAND_Y		700
 #define BAND_H		600

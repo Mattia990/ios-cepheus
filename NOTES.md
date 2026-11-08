@@ -91,7 +91,7 @@ $PLAT/adb shell dmesg | grep -i -E "panel|touch|watchdog|mdss|ufshc|dwc3|wdt"
 | PSCI | 1.1 smc | same |
 | UFS | ufshc@0x1d84000 | same |
 | Display | Samsung EA8076 FHD CMD, 1080x2340 @60 Hz | NT37280 CMD 1080x2280 |
-| Splash FB | cont_splash_region: 0x9c000000, size 0x2400000; FB at 0x9c400000 | same block |
+| Splash FB | cont_splash_region: 0x9c000000, size 0x2400000; FB at 0x9c000000 | 0x9c400000 (4 MB into the block) |
 | MDP | 0x0ae00000 | same |
 | Touch | ST FTS, I2C bus 0xc80000, I2C addr 0x49, x=1080 y=2340, IRQ=122 | ST FTS, SPI 0x890000, addr 0x5d |
 | Keys | GPIO keys: vol_up (code 115), ai_key (code 689) | PMIC PON keys + GPIO6 |
@@ -159,7 +159,7 @@ Of the ~81 original ios-sweet kernel patches:
 ## Cepheus patches
 
 - 0082 IORPC.kernelContent: Xcode 16+ iig emits it (portable, no change)
-- 0083 cepheus basics: early console on splash FB (0x9c400000, 1080x2340), watchdog (0x17c10000),
+- 0083 cepheus basics: early console on splash FB (0x9c000000, 1080x2340), watchdog (0x17c10000),
   keys (GPIO 6=vol_up, GPIO 97=ai_key - disabled by default via sweetkeys=0),
   touch (I2C 0xc80000 addr 0x49 - disabled by default via sweettouch=0), display keys
 - 0084 early FB device memory: same as flame (confirmed FB block 0x9c000000)

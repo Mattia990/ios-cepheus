@@ -30,14 +30,8 @@ index a1486081b..ff39e04be 100644
  				    k, state[k], pon, gpio);
  				sweet_hid_key(k, state[k]);
  			}
-@@ -152,21 +154,27 @@ sweet_keys_init(void)
+@@ -152,21 +154,21 @@ sweet_keys_init(void)
  		return;
- 	}
-+	int keys_enabled = 1;
-+	PE_parse_boot_argn("sweetkeys", &keys_enabled, sizeof(keys_enabled));
-+	if (!keys_enabled) {
-+	printf("SWEET KEYS: disabled (sweetkeys=0)\n");
-+		return;
  	}
  	keys_pon_apid = keys_find_apid(0x008, count);
 -	keys_gpio_apid = keys_find_apid(0x4c1, count);
@@ -68,7 +62,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index 03defe6a7..31bc961b0 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -638,7 +638,11 @@ out:
+@@ -638,7 +638,16 @@ out:
  void
  sweet_touch_init(void)
  {
@@ -99,7 +93,7 @@ diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPl
 index 0631685e9..058e04135 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -22,6 +22,60 @@ public:
+@@ -22,6 +22,61 @@ public:
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
@@ -241,18 +235,20 @@ diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
 index b99c2f49a..963e02d1c 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -50,6 +50,18 @@
+@@ -50,6 +50,21 @@
  #define SWEET_VTIMER_INTID        19
  #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
  
 +/*
 + * cepheus (Xiaomi Mi 9): splash framebuffer ABL scans out (cont_splash_region;
 + * ABL leaves the command-mode panel autorefreshing), 1080x2340 a8r8g8b8.
-+ * Confirmed from live FDT: cont_splash_region = 0x9c000000/0x2400000,
-+ * FB at 0x9c400000, stride 4320 (1080 * 4).
++ * Confirmed from live FDT and the VIG0 source register: cont_splash_region =
++ * 0x9c000000/0x2400000, FB at 0x9c000000, stride 4320 (1080 * 4). (flame's
++ * FB sits at 0x9c400000; the cepheus port had copied that and the panel
++ * showed the frame shifted down by 4 MB.)
 + * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block holding it.
 + */
-+#define SWEET_EARLY_FB_PA         0x9c400000
++#define SWEET_EARLY_FB_PA         0x9c000000
 +#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
 +#define SWEET_EARLY_FB_WIDTH      1080
 +#define SWEET_EARLY_FB_HEIGHT     2340
