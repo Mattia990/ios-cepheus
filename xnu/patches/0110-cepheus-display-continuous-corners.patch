@@ -225,7 +225,7 @@ index fde881c80..e5fcf7f35 100644
 +
  /*
   * One full-frame BGRA layer (what backboardd swaps): the GPU scales the whole
-  * iOS frame (1125x2436) to fit the panel (1053x2280 at x 13), instead of the
+  * iOS frame (1125x2436) to fit the panel (1080x2339), instead of the CPU
 @@ -440,15 +498,18 @@ AppleCLCD::presentGPU(const uint8_t *rec)
  		IOLockUnlock(fLock);
  		IOLog("SWEET FB: frames now scaled to fit by the GPU (panel stride %u)\n", fRowBytes);
@@ -282,7 +282,7 @@ index 6329d863c..eb548aaef 100644
 -extern "C" int sweet_display_fit_x, sweet_display_fit_w;     /* bsd/dev/sweet_gpu.c */
 +extern "C" int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_display_fit_h;
  
- /* Touch reports panel pixels; cepheus's panel is 1080x2280 (SWEET.h). */
+ /* Touch reports panel pixels; cepheus's panel is 1080x2340 (live FDT). */
  #define SWEET_PANEL_W 1080
 @@ -373,6 +374,7 @@ protected:
  private:

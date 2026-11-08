@@ -161,9 +161,10 @@ Of the ~81 original ios-sweet kernel patches:
 - 0082 IORPC.kernelContent: Xcode 16+ iig emits it (portable, no change)
 - 0083 cepheus basics: early console on splash FB (0x9c000000, 1080x2340), watchdog (0x17c10000),
   keys (GPIO 6=vol_up, GPIO 97=ai_key - disabled by default via sweetkeys=0),
-  touch (I2C 0xc80000 addr 0x49 - disabled by default via sweettouch=0), display keys
+  touch (I2C 0xc80000 addr 0x49 - disabled by default via cepheustouch=0), display keys
 - 0084 early FB device memory: same as flame (confirmed FB block 0x9c000000)
-- 0085 FTS touch: I2C ST FTS driver template - needs complete I2C rewrite (disabled by default)
+- 0085 FTS touch: real GENI I2C SE17 driver at 0xc80000 (wrapper 0xcc0000), ST FTS addr 0x49,
+  AVDD ldoc1 at 1.8 V, panel 1080x2340; disabled by default via cepheustouch=0
 - 0086 cpufreq: same GCC offsets as flame (SM8150)
 - 0087 vsync/fps: same as flame
 - 0088 USB: same DWC3 @0xa600000, PHY @0x88e2000 as flame
@@ -183,10 +184,9 @@ Keys and touch TBD items from the initial port plan are now resolved:
 **Touch** (patch 0083 + 0085):
 - Confirmed from live FDT: ST FTS on I2C bus 0xc80000, I2C addr 0x49, IRQ 122, reset fts_rst
 - Panel resolution 1080x2340 matches fts,x-max=1080, fts,y-max=2340
-- Touch disabled by default via `sweettouch=0` (already in patch 0083)
-- Patch 0085 is a copy of flame's SPI driver - needs complete I2C rewrite before enabling
+- Touch disabled by default via `cepheustouch=0` (patch 0085)
+- Patch 0085 now has the real GENI I2C SE17 driver (2026-11-09); enable with `cepheustouch=1`
 
 **Remaining TBD items:**
 - GPIO register addresses for reading keys (need TLMM/GPIO controller layout)
-- I2C touch driver implementation (patch 0085 needs rewrite from SPI to I2C)
 - Xiaomi ABL boot image rules (compression, text_offset, AVB footer)

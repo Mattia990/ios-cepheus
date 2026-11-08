@@ -13,7 +13,9 @@ fastboot set_active a 2>&1 | tail -1
 # ABL drops off USB for a moment after set_active; boot only once it answers.
 sleep 2
 for i in $(seq 1 30); do fastboot getvar product >/dev/null 2>&1 && break; sleep 1; done
-fastboot boot downloads/twrp/twrp-3.7.1_12-0-cepheus.img 2>&1 | tail -1
+twrp=downloads/twrp/twrp-3.7.1_12-0-cepheus.img
+[ -f "$twrp" ] || twrp=downloads/twrp/twrp-3.6.1_9-0-cepheus.img
+fastboot boot "$twrp" 2>&1 | tail -1
 for i in $(seq 1 60); do
 	adb devices | grep -q recovery && { echo "TWRP up after ${i}s"; exit 0; }
 	sleep 1

@@ -219,10 +219,50 @@ static void save_before_jump(void)
 	save_log("jumping to xnu");
 }
 
+/*
+ * XNU writes a panic header + text into the ADT "pram" node before it
+ * resets (pexpert/arm/pe_init.c check_for_panic_log). The next boot is
+ * normally a probe shim, so dump it here: the ring flush may be up to
+ * ufslogsecs behind the panic, and this is the only copy of the text.
+ * Reads physical memory with the MMU off; magic 0x46554E4B = "FUNK".
+ */
+#define PRAM_PA		0x1fd000000UL
+#define PRAM_SIZE	0x80000UL
+#define PRAM_MAGIC	0x46554E4BUL
+
+static void
+dump_pram(void)
+{
+	volatile uint32_t *h = (volatile uint32_t *)PRAM_PA;
+	if (h[0] != PRAM_MAGIC) {
+		log_printf("pram: no panic header (magic %x)\n", h[0]);
+		return;
+	}
+	uint32_t off = h[4], len = h[5];
+	log_printf("pram: panic header v%u flags %x log %x+%x\n", h[2], h[3], off, len);
+	if (off < 0x30 || off >= PRAM_SIZE || len == 0 || len > PRAM_SIZE - off) {
+		log_printf("pram: bad panic log range\n");
+		return;
+	}
+	if (len > 8192)
+		len = 8192;
+	char buf[129];
+	for (uint32_t pos = 0; pos < len; pos += 128) {
+		uint32_t n = len - pos < 128 ? len - pos : 128;
+		for (uint32_t i = 0; i < n; i++) {
+			char c = *(volatile char *)(PRAM_PA + off + pos + i);
+			buf[i] = (c == '\n' || c == '\t' || (c >= 32 && c < 127)) ? c : '.';
+		}
+		buf[n] = 0;
+		log_printf("pram: %s\n", buf);
+	}
+}
+
 void shim_main(uintptr_t dtb)
 {
 	log_printf("CEPHEUSSHIM probe v1 t=%lu\n", ticks_now());
 	log_cpu(dtb);
+	dump_pram();
 	int spmi_ok = !spmi_init();
 	if (spmi_ok) {
 		log_pmic();
@@ -303,8 +343,8 @@ void shim_main(uintptr_t dtb)
 
 	/* An XNU payload in the ramdisk means: boot it. */
 	struct loader_fb lfb = { fb, stride, FB_W, FB_H, save_before_jump };
-	if (loader_has_payload(dtb))
-		wdt_arm(30);
+	if (loader_has_payload(dtb) && 0)
+		wdt_arm(120);
 	const char *why = loader_boot(dtb, &lfb);
 	log_printf("loader: %s\n", why);
 

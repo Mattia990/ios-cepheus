@@ -109,20 +109,19 @@ index 000000000..82097a3aa
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
-index 1778d6d0f..7d77ffd33 100644
+index 78b8ef220..9b0969764 100644
 --- a/bsd/dev/sweet_fts.c
 +++ b/bsd/dev/sweet_fts.c
-@@ -182,9 +182,18 @@ fts_clocks(void)
+@@ -192,8 +192,18 @@ fts_clocks(void)
  			return false;
  		}
  	}
--	/* Branch halt bits: wrap0 m_ahb, s_ahb, s4. */
 +	/*
-+	 * Branch halt bits: wrap0 m_ahb, s_ahb, s4. A branch under hardware
++	 * Branch halt bits: wrap2 m_ahb, s_ahb, s1. A branch under hardware
 +	 * clock gating (bit 1) reads halted while idle; Linux skips the check
 +	 * then (clk_branch_check_halt), so do the same.
 +	 */
- 	const uint32_t branches[] = {0x17004, 0x17008, 0x17604};
+ 	const uint32_t branches[] = {0x1e004, 0x1e008, FTS_RCG_HALT};
  	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
 +		uint32_t cbcr = fts_rd(ft.gcc, branches[i]);
 +		printf("SWEET FTS: GCC branch %#x = %#x\n", branches[i], cbcr);

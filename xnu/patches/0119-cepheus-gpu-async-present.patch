@@ -47,7 +47,7 @@ index bc856466b..f5cbdad80 100644
 +	return 0;
 +}
  #define PANEL_W         1080
- #define PANEL_H         2280
+ #define PANEL_H         2340
  #define DISPLAY_MASK_OFF        0x500000ULL     /* 2x2 corner mattes, one per corner */
 @@ -590,21 +614,19 @@ sweet_gpu_present(int s, uintptr_t kva, uint32_t offset, uint32_t w, uint32_t h,
  	} else {

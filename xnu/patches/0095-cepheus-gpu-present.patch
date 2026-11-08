@@ -1501,7 +1501,7 @@ index 000000000..a0f873698
 +
 +#define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
 +#define PANEL_W         1080
-+#define PANEL_H         2280
++#define PANEL_H         2340
 +
 +static uint64_t stat_frames, stat_clean_abs, stat_gpu_abs;
 +
@@ -1687,10 +1687,10 @@ index 9c74318e8..e05b618b2 100644
 +
 +/*
 + * One full-frame BGRA layer (what backboardd swaps): the GPU scales the whole
-+ * iOS frame (1125x2436) to fit the panel (1053x2280 at x 13), instead of the
-+ * CPU copying its centre (cropping the status bar and home indicator). The
-+ * first time, the panel switches to the GPU's row stride and is cleared, so
-+ * the bars stay black. False: use the CPU copy.
++ * iOS frame (1125x2436) to fit the panel (1080x2339), instead of the CPU
++ * copying its centre (cropping the status bar and home indicator). The first
++ * time, the panel switches to the GPU's row stride and is cleared, so the
++ * bars stay black. False: use the CPU copy.
 + */
 +bool
 +AppleCLCD::presentGPU(const uint8_t *rec)
@@ -1792,9 +1792,9 @@ index 5d4c63758..6329d863c 100644
  #define SWEET_TOUCH_EDGE_PX 48
 +extern "C" int sweet_display_fit_x, sweet_display_fit_w;     /* bsd/dev/sweet_gpu.c */
 +
- /* Touch reports panel pixels; cepheus's panel is 1080x2280 (SWEET.h). */
+ /* Touch reports panel pixels; cepheus's panel is 1080x2340 (live FDT). */
  #define SWEET_PANEL_W 1080
- #define SWEET_PANEL_H 2280
+ #define SWEET_PANEL_H 2340
 @@ -466,9 +468,20 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
  
  	IOLockLock(fLock);

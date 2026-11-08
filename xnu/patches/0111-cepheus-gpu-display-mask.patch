@@ -49,7 +49,7 @@ index 78aeec4e8..24c0fc005 100644
 @@ -359,46 +361,118 @@ sweet_gpu_map_surface(uint64_t key, const uint64_t *pages, uint32_t npages, uint
  #define IB_OFF          A6_OFF_FREE     /* the present IB in the pool */
  #define PANEL_W         1080
- #define PANEL_H         2280
+ #define PANEL_H         2340
 +#define DISPLAY_MASK_OFF        0x500000ULL
 +#define DISPLAY_MASK_SIDE       256u
 +#define DISPLAY_MASK_DIM        (DISPLAY_MASK_SIDE * 2)
