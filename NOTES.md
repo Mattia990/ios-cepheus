@@ -187,6 +187,9 @@ Of the ~81 original ios-sweet kernel patches:
   `backlight-control=true`, iPhone X DBV/AAP properties) as a child of `AppleCLCD` and log
   `setProperties` writes (`IOMFBBrightnessLevel` / `brightness-nits`); phase 1 only logs,
   panel brightness is unchanged
+- 0128 backlight: also override `IOMobileFramebuffer::setProperties` (the real
+  `IOMFBBrightnessLevel`/`brightness-nits` write target, i.e. `AppleCLCD`) and log the raw
+  inputs of IOMFB selectors 50/51/84; still logs only, panel brightness unchanged
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

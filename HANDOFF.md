@@ -1,50 +1,64 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-09** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-10** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
 
-### Brightness: phase 1 fake `AppleARMBacklight` published (2026-11-09)
+### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 
-**Why the slider does nothing.** In `touch-on7` (`logs/runs/touch-on7/xnu.txt`) `backboardd`
-asks for a service matching `IOPropertyMatch {backlight-control: true}` at 42.438 s and gets
-`none` / `0 found`; `AppleCLCD` is already up at 37.859 s. CoreBrightness (disassembled from
-the 20H392 shared cache) does the same match, then requires
-`IOObjectConformsTo(service, "AppleARMBacklight")` and stores the service port. Its
-`_SetIOMFBBrightness` writes `IOMFBBrightnessLevel` (CFNumber, 32-bit, raw 16.16 fixed-point
-nits) with `IORegistryEntrySetCFProperty`; `_DisplaySetBLDriverProperty` writes
-`brightness-nits` the same way. No user client is involved. `IOMFBBrightnessLevel` is at
-CoreBrightness `__TEXT` + 0x5ccc813, `brightness-nits` at +0x5ccc214.
+**Phase-1 result (`brightness-on1`).** `0127` booted with `cepheuswdt=0 cepheustouchlog=1`.
+`AppleARMBacklight` published at 93.036 s, backboardd's `backlight-control` match returned
+`AppleARMBacklight` at 97.518 s and `1 found` at 133.043 s, and the display came on at
+133.093 s. There were **no `SWEET BL: setProperties` lines**, even while the slider was
+moved. The match is solved; the write target was wrong.
+
+**Why no writes were seen.** CoreBrightness's `_DisplayOpen` calls
+`IOMobileFramebufferCreateDisplayList`, then `IOMobileFramebufferOpenByName` and
+`IOMobileFramebufferGetServiceObject`; it stores that service object at display `+0x6c`.
+`_SetIOMFBBrightness` writes `IOMFBBrightnessLevel` to `+0x6c` with
+`IORegistryEntrySetCFProperty`, i.e. to the **IOMobileFramebuffer service (AppleCLCD)**,
+not to the `AppleARMBacklight` child. `brightness-nits` is written the same way by
+`_DisplaySetBLDriverProperty`.
+
+**DBV vs registry.** `_SetIOMFBBrightness` checks `+0x129`. It is set by the display
+property `DisplaySyncBrightnessTransactions` (CFString at CoreBrightness data
+`0x1d8897148`); absent or false leaves it 0, which is the registry path. `+0x12a` is set by
+`DisplayFasterEDREngaged`. With the property absent, the registry path is the one we want;
+no IOMFB user-client selector is involved.
+
+**Units.** `_SetBLDriverNitsValue(self, int millinits, bool force)` logs
+`Setting BL nits value to %f` after dividing by 1000.0, and passes the same integer to
+`_SetIOMFBBrightness`. `IOMFBBrightnessLevel` is therefore an integer in **millinits**
+(750000 = 750 nits), not 16.16 fixed-point. The iPhone X max-nit-value is 0x2ee (750).
 
 The iPhone X `backlight` ADT node supplies the properties CoreBrightness expects: `DBVMax`
 0x7ff, `DBVMin` 0x8b, `override-boot-brightness` 0x2e4, `backlight-update-policy` 0x4,
 `backlight-level-encoding` 0xb, `use-AAP` 1, `use-AAB-architecture` 1, `max-nit-value`
-0x2ee.
+0x2ee. `0127` publishes those on the `AppleARMBacklight` child of `AppleCLCD`.
 
-**`0127` (phase 1, logs only).** `SweetFramebuffer.cpp` now defines an `AppleARMBacklight :
-IOService`, attaches it to `AppleCLCD` and registers it from `AppleCLCD::start` with
-`IOClass=AppleARMBacklight`, `backlight-control=true` and the ADT values above. Its
-`setProperties(OSObject *)` override logs every incoming key/value (`SWEET BL: setProperties
-...`), stores `IOMFBBrightnessLevel`/`brightness-nits` back as properties so read-back works,
-and returns success. **It does not change the panel yet.** The DCS path is still
-`panel0-backlight` (max 0x7ff, DTB `qcom,mdss-brightness-max-level`); WLED is not the display
-backlight.
+**`0128` (phase 1b, logs only).** `SweetFramebuffer.cpp` now overrides
+`IOMobileFramebuffer::setProperties(OSObject *)` (inherited by `AppleCLCD`) with the same
+key/value logging as `AppleARMBacklight`, stores `IOMFBBrightnessLevel`/`brightness-nits`
+back as properties, and returns success. The shared helper also keeps the
+`SWEET BL: setProperties` logging. `externalMethod` now logs the raw inputs of IOMFB
+selectors 50 (`SetBrightnessCorrection`), 51 (ICC curve) and 84 (float setter) on every
+call, so we can tell if the slider uses that path too. **It does not change the panel
+yet.** The DCS path is still `panel0-backlight` (max 0x7ff, DTB
+`qcom,mdss-brightness-max-level`); WLED is not the display backlight.
 
-**Test (one phase at a time, observe with the user).** Build the kernel from `0127` and
-`fastboot boot` with the usual debug args (touch is default-on; `cepheuswdt=0` still advised).
+**Test (one phase at a time, observe with the user).** Build the kernel from `0128` and
+`fastboot boot` with the usual debug args (`cepheuswdt=0` still advised; touch is default-on).
 In the log expect:
 
-1. ~37.9 s: `SWEET BL: AppleARMBacklight published`.
-2. ~42.4 s: the `backlight-control` match by `backboardd` should find the service instead of
-   `none`; CoreBrightness should attach without `invalid backlight service`.
-3. After SpringBoard: `SWEET BL: setProperties ...` lines with the first key/value and the
-   `(brightness)` marker when the slider or auto-brightness writes.
+1. ~93 s: `SWEET BL: AppleARMBacklight published`.
+2. ~97 s: the `backlight-control` match returns `AppleARMBacklight`.
+3. After SpringBoard: `SWEET FB: setProperties IOMFBBrightnessLevel = <millinits>` lines
+   (tag `SWEET FB`, not `SWEET BL`) when the slider or auto-brightness writes.
 
-Report the first setProperties lines and whether the match succeeded. If the match still
-fails, the next check is whether `IOObjectConformsTo` sees the class (kernel `metaCast` uses
-the real metaclass name, so the class must be exactly `AppleARMBacklight`). Phase 2 will map
-the received nits to DBV and issue the runtime DCS `0x51` write through the MDSS/DSI path.
+Move the slider and report the first value and the value at both ends. `sel 50` should stay
+absent unless CoreBrightness also uses the IOMFB path. Phase 2 maps millinits to the panel
+DCS `0x51` range (DTB `bl-min` 2, `bl-max` 0x7ff) and writes it through the MDSS/DSI path.
 
 ### Touch works: the missing post-sysinfo reset was the fix (2026-11-09)
 

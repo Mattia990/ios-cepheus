@@ -1,0 +1,187 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -105,6 +105,9 @@
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
++
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+@@ -112,9 +115,10 @@
+ /*
+  * CoreBrightness matches a service with backlight-control=true that conforms
+  * to AppleARMBacklight, then writes brightness through
+- * IORegistryEntrySetCFProperty with IOMFBBrightnessLevel (16.16 fixed-point
+- * nits) or brightness-nits. phase 1 publishes the iPhone X backlight node and
+- * logs the writes; the panel is not touched yet.
++ * IORegistryEntrySetCFProperty with IOMFBBrightnessLevel or brightness-nits.
++ * The write target is the IOMobileFramebuffer service (AppleCLCD), not the
++ * backlight node, so both classes log the property dictionaries. Phase 1 only
++ * logs and stores the values; the panel is not touched yet.
+  */
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+@@ -125,63 +129,86 @@
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
++static bool
++sweet_log_properties(const char *tag, IOService *service, OSDictionary *dict)
++{
++	bool brightness = false;
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++
++	if (it == NULL) {
++		IOLog("%s: setProperties cannot iterate dictionary\n", tag);
++		return false;
++	}
++	OSObject *object;
++	while ((object = it->getNextObject()) != NULL) {
++		const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++		const OSString *keyString = OSDynamicCast(OSString, object);
++		const char *name = key != NULL ? key->getCStringNoCopy() :
++		    (keyString != NULL ? keyString->getCStringNoCopy() : "?");
++		OSObject *value = dict->getObject(name);
++		OSNumber *number;
++		OSBoolean *boolean;
++		OSString *string;
++		OSData *data;
++
++		if ((number = OSDynamicCast(OSNumber, value)) != NULL) {
++			unsigned long long n = number->unsigned64BitValue();
++			IOLog("%s: setProperties %s = %llu (0x%llx)\n", tag, name, n, n);
++		} else if ((boolean = OSDynamicCast(OSBoolean, value)) != NULL) {
++			IOLog("%s: setProperties %s = %s\n", tag, name,
++			    boolean->getValue() ? "true" : "false");
++		} else if ((string = OSDynamicCast(OSString, value)) != NULL) {
++			IOLog("%s: setProperties %s = \"%s\"\n", tag, name,
++			    string->getCStringNoCopy());
++		} else if ((data = OSDynamicCast(OSData, value)) != NULL) {
++			const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
++			unsigned int len = data->getLength();
++			if (bytes != NULL && len >= 4) {
++				IOLog("%s: setProperties %s = data[%u] %02x %02x %02x %02x\n",
++				    tag, name, len, bytes[0], bytes[1], bytes[2], bytes[3]);
++			} else {
++				IOLog("%s: setProperties %s = data[%u]\n", tag, name, len);
++			}
++		} else {
++			IOLog("%s: setProperties %s = %p\n", tag, name, value);
++		}
++		if (name != NULL && (strcmp(name, "IOMFBBrightnessLevel") == 0 ||
++		    strcmp(name, "brightness-nits") == 0)) {
++			brightness = true;
++			/* store the value too, so a later read-back succeeds */
++			if (service != NULL) {
++				service->setProperty(name, value);
++			}
++		}
++	}
++	it->release();
++	IOLog("%s: setProperties done%s\n", tag, brightness ? " (brightness)" : "");
++	return brightness;
++}
++
+ IOReturn
++IOMobileFramebuffer::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++
++	if (dict == NULL) {
++		IOLog("SWEET FB: setProperties non-dictionary %p\n", properties);
++		return kIOReturnSuccess;
++	}
++	sweet_log_properties("SWEET FB", this, dict);
++	return kIOReturnSuccess;
++}
++
++IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+-	bool brightness = false;
+ 
+ 	if (dict == NULL) {
+ 		IOLog("SWEET BL: setProperties non-dictionary %p\n", properties);
+ 		return kIOReturnSuccess;
+ 	}
+-	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+-	if (it != NULL) {
+-		OSObject *object;
+-		while ((object = it->getNextObject()) != NULL) {
+-			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
+-			const OSString *keyString = OSDynamicCast(OSString, object);
+-			const char *name = key != NULL ? key->getCStringNoCopy() :
+-			    (keyString != NULL ? keyString->getCStringNoCopy() : "?");
+-			OSObject *value = dict->getObject(name);
+-			OSNumber *number;
+-			OSBoolean *boolean;
+-			OSString *string;
+-			OSData *data;
+-
+-			if ((number = OSDynamicCast(OSNumber, value)) != NULL) {
+-				unsigned long long n = number->unsigned64BitValue();
+-				IOLog("SWEET BL: setProperties %s = %llu (0x%llx)\n", name, n, n);
+-			} else if ((boolean = OSDynamicCast(OSBoolean, value)) != NULL) {
+-				IOLog("SWEET BL: setProperties %s = %s\n", name,
+-				    boolean->getValue() ? "true" : "false");
+-			} else if ((string = OSDynamicCast(OSString, value)) != NULL) {
+-				IOLog("SWEET BL: setProperties %s = \"%s\"\n", name,
+-				    string->getCStringNoCopy());
+-			} else if ((data = OSDynamicCast(OSData, value)) != NULL) {
+-				const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
+-				unsigned int len = data->getLength();
+-				if (bytes != NULL && len >= 4) {
+-					IOLog("SWEET BL: setProperties %s = data[%u] %02x %02x %02x %02x\n",
+-					    name, len, bytes[0], bytes[1], bytes[2], bytes[3]);
+-				} else {
+-					IOLog("SWEET BL: setProperties %s = data[%u]\n", name, len);
+-				}
+-			} else {
+-				IOLog("SWEET BL: setProperties %s = %p\n", name, value);
+-			}
+-			if (name != NULL && (strcmp(name, "IOMFBBrightnessLevel") == 0 ||
+-			    strcmp(name, "brightness-nits") == 0)) {
+-				brightness = true;
+-				/* store the value too, so a later read-back succeeds */
+-				setProperty(name, value);
+-			}
+-		}
+-		it->release();
+-	} else {
+-		IOLog("SWEET BL: setProperties cannot iterate dictionary\n");
+-	}
+-	IOLog("SWEET BL: setProperties done%s\n", brightness ? " (brightness)" : "");
++	sweet_log_properties("SWEET BL", this, dict);
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -826,6 +853,24 @@
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	/* Brightness-related IOMFB selectors: log every call and its inputs. */
++	if (selector == 50 || selector == 51 || selector == 84) {
++		const uint8_t *data = (const uint8_t *)args->structureInput;
++		uint32_t dataLen = args->structureInputSize;
++		char name[32];
++
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u s0=0x%llx s1=0x%llx data=%02x%02x%02x%02x\n",
++		    name, selector, args->scalarInputCount, dataLen,
++		    args->scalarOutputCount, args->structureOutputSize,
++		    args->scalarInputCount > 0 ? (unsigned long long)args->scalarInput[0] : 0ULL,
++		    args->scalarInputCount > 1 ? (unsigned long long)args->scalarInput[1] : 0ULL,
++		    data != NULL && dataLen > 0 ? data[0] : 0,
++		    data != NULL && dataLen > 1 ? data[1] : 0,
++		    data != NULL && dataLen > 2 ? data[2] : 0,
++		    data != NULL && dataLen > 3 ? data[3] : 0);
++	}
++
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
