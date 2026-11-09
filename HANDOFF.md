@@ -40,10 +40,15 @@ again before its final `a0/00/01`; our old driver went straight from the `0xa6` 
 to sense-on. `0125` adds one reset after sysinfo (`cepheustouchreset2=1`). The earlier
 fallback knobs (`reset2=2`, `poll=0`, `sysinfo=0`) are no longer needed.
 
-**Still open.** Touch remains opt-in (`cepheustouch=0` default); enabling it by default is
-a user decision. The sysinfo line prints `res=2339x1079` (x/y swapped or a field-layout
-mistake) even though the coordinate decode is correct, so check `si[..]` before changing
-it. Separately, restore `wdt_arm(30)` and drop `cepheuswdt=0` once bring-up is finished.
+**Default changed.** `0126` enables touch by default (`cepheustouch=1`) and leaves the
+delay at its existing 20 s default, per the user's choice; `cepheustouch=0` still turns
+it off. This timing (init ~20 s after the FTS thread starts, i.e. before display-on) has
+not been booted yet. Next test: boot with no touch args and confirm `sysinfo ...
+afe=03/03/03`, `reset 2 ready err=0`, and a working first touch; if it fails, retry with
+`cepheustouchdelay=55`. The sysinfo line prints `res=2339x1079` (x/y swapped or a
+field-layout mistake) even though the coordinate decode is correct, so check `si[..]`
+before changing it. Separately, restore `wdt_arm(30)` and drop `cepheuswdt=0` once
+bring-up is finished.
 
 ### TWRP grip test is clean; XNU fails even with a clean baseline (2026-11-09)
 
@@ -156,9 +161,9 @@ controller-ready), not mainline `stmfts`. Details:
 **Patch stack.** `0085` was regenerated with the 774-line `bsd/dev/sweet_fts.c` (blob
 `8954729db921f60ff4476884435887bc2a5dad9f`); the obsolete `sweet_fts.c` GCC-halt hunk was
 removed from `0086`. Host `clang -fsyntax-only` (kernel stubs, `-Wall -Wextra`) passed for
-`0085`, and `tools/validate-repo.py` passes for 0001-0125. The stack has since been built
+`0085`, and `tools/validate-repo.py` passes for 0001-0126. The stack has since been built
 and booted on the phone (`touch-on2`..`touch-on6` above); `0125` made touch work on
-`touch-on6`.
+`touch-on6`, and `0126` makes it the default.
 
 **Boot setup used.** The successful `touch-on4` and `touch-on6` boots used the standard
 debug arguments plus:

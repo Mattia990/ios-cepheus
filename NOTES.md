@@ -181,6 +181,8 @@ Of the ~81 original ios-sweet kernel patches:
   `cepheustouchreset2=N` (default 1), `cepheustouchsysinfo=0`,
   `cepheustouchpoll=0` plus a 10 s alive heartbeat. Verified on hardware
   (`touch-on6`): AFE 03/03/03, one-finger tracking, no `43 05 30`/water
+- 0126 FTS touch: enable by default (`cepheustouch` defaults to 1, delay stays 20 s);
+  pass `cepheustouch=0` to disable
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

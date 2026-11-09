@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 4c97b59f5ae852295b73501ed6eed7117acf4ea7..93340f7e45834ed9f3598fe7c1723933b512d4a9 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -27,7 +27,8 @@
+  * after the sysinfo read (default 1; Xiaomi's probe does two),
+  * cepheustouchsysinfo=0 skip the 0xa6 frame read, cepheustouchpoll=0 read
+  * only when IRQ is low instead of also polling every 10 ms.
+- * Disabled by default until the bit-banged transport is verified.
++ * Enabled by default after the reset fix was verified on hardware; pass
++ * cepheustouch=0 to disable.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -806,7 +807,7 @@
+ void
+ sweet_fts_init(void)
+ {
+-	int enabled = 0;
++	int enabled = 1;
+ 	thread_t thread;
+ 	if (ft.started) {
+ 		return;
