@@ -5,6 +5,33 @@ Last updated **2026-11-09** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### TWRP grip test is clean; XNU fails even with a clean baseline (2026-11-09)
+
+- TWRP grip reproduction (`logs/runs/twrp-touch/events-grip.txt`,
+  `dmesg-grip.txt`): the phone was held normally with fingers wrapping the edges
+  and the centre was swiped for ~10 s. Contacts reached x=8/1061 and y=94/2274;
+  the driver logged only the normal `Mutual negative detect Force cal`, with no
+  `43 05 30`, no water mode and no lost events.
+- `touch-on5` (same kernel as touch-on4, delay 55): the phone was flat and
+  untouched at sense-on (64.64 s); the first touch at 68.30 s was a single
+  centre circle. It still produced six contacts -- x=1079 at y=176/1347/2221,
+  x=0 at y=1754, x=18 at y=176 and (305,969) -- then `43 05 30` at 68.89 s and
+  complete silence until the manual reboot at ~150 s. Baseline contamination at
+  `a0/00/01` is ruled out.
+- Difference in the vendor probe: TWRP reads sysinfo after reset #1 and then
+  performs **two more resets** before its final `a0/00/01`; our driver went
+  straight from the `0xa6` frame read to sense-on. `0125` adds
+  `cepheustouchreset2=N` (default 1) extra resets after sysinfo, logs
+  `cfg/cx/afe/proto/res/tx/rx`, and adds `cepheustouchsysinfo=0` (skip `0xa6`)
+  and `cepheustouchpoll=0` (IRQ-only) for no-rebuild comparisons.
+
+**Next build (user).** Apply `0125-cepheus-fts-touch-reset.patch` and boot
+`touch-on6` with
+`cepheuswdt=0 cepheustouch=1 cepheustouchdelay=55 cepheustouchlog=1`. Expect
+`sysinfo ... afe=03/03/03 proto=...` and `reset 2 ready err=0`. If it still
+fails, run the same kernel with `cepheustouchreset2=2`, then
+`cepheustouchpoll=0`, then `cepheustouchsysinfo=0`.
+
 ### Touch runs touch-on2..on4: chip answers, mutual sensing fails, water mode silences it (2026-11-09)
 
 The bit-bang transport and the `fts_521` command/event layer work: the chip resets, reports
@@ -92,9 +119,10 @@ controller-ready), not mainline `stmfts`. Details:
 
 **Patch stack.** `0085` was regenerated with the 774-line `bsd/dev/sweet_fts.c` (blob
 `8954729db921f60ff4476884435887bc2a5dad9f`); the obsolete `sweet_fts.c` GCC-halt hunk was
-removed from `0086`. Host `clang -fsyntax-only` (kernel stubs, `-Wall -Wextra`) and
-`tools/validate-repo.py` pass. The stack has since been built and booted on the phone
-(`touch-on2`..`touch-on4` above).
+removed from `0086`. Host `clang -fsyntax-only` (kernel stubs, `-Wall -Wextra`) passed for
+`0085`, and `tools/validate-repo.py` passes for 0001-0125. The stack has since been built
+and booted on the phone (`touch-on2`..`touch-on5` above); `0125` is not built yet, so the
+user's build is its first compile check.
 
 **Boot setup used.** `touch-on4` (the only cold-boot run so far) used the standard debug
 arguments plus:

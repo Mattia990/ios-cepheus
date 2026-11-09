@@ -176,6 +176,10 @@ Of the ~81 original ios-sweet kernel patches:
 - 0087 vsync/fps: same as flame
 - 0088 USB: same DWC3 @0xa600000, PHY @0x88e2000 as flame
 - 0089-0124: same as flame (same SoC subsystems)
+- 0125 FTS touch: reset the chip again after the `0xa6` sysinfo read (Xiaomi's probe
+  resets twice before `a0/00/01`), log AFE/config/TX/RX, and add
+  `cepheustouchreset2=N` (default 1), `cepheustouchsysinfo=0`,
+  `cepheustouchpoll=0` plus a 10 s alive heartbeat
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

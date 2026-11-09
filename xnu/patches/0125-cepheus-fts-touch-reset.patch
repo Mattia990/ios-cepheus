@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 8954729db921f60ff4476884435887bc2a5dad9f..4c97b59f5ae852295b73501ed6eed7117acf4ea7 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -23,7 +23,10 @@
+  * runs on one thread.
+  *
+  * Boot-args: cepheustouch=0 off, cepheustouchdelay=N start after N s,
+- * cepheustouchlog=1 log every event.
++ * cepheustouchlog=1 log every event, cepheustouchreset2=N extra resets
++ * after the sysinfo read (default 1; Xiaomi's probe does two),
++ * cepheustouchsysinfo=0 skip the 0xa6 frame read, cepheustouchpoll=0 read
++ * only when IRQ is low instead of also polling every 10 ms.
+  * Disabled by default until the bit-banged transport is verified.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -681,26 +684,71 @@
+ 		goto out;
+ 	}
+ 	printf("SWEET FTS: bus sda=%u scl=%u\n", ft.sda, ft.scl);
++
++	unsigned do_si = 1, extra_resets = 1, poll_enable = 1;
++	(void)PE_parse_boot_argn("cepheustouchsysinfo", &do_si, sizeof(do_si));
++	(void)PE_parse_boot_argn("cepheustouchreset2", &extra_resets,
++	    sizeof(extra_resets));
++	(void)PE_parse_boot_argn("cepheustouchpoll", &poll_enable,
++	    sizeof(poll_enable));
++	if (extra_resets > 5u) {
++		extra_resets = 5u;
++	}
+ 
+ 	/*
+ 	 * The chip loads its system info at reset. The header proves that the
+ 	 * framebuffer command and the protocol are right; touch only needs the
+-	 * scan-mode command below, so a mismatch is logged, not fatal.
++	 * scan-mode command below, so a mismatch is logged, not fatal. The AFE
++	 * and TX/RX fields must match TWRP's 03/03/03 and 1080x2340 panel.
+ 	 */
+-	err = fts_read_sysinfo(si);
+-	if (!err && si[0] == FTS_SYSINFO_SIG && si[1] == FTS_SYSINFO_LOAD_ID) {
+-		unsigned chip0 = si[10] | ((unsigned)si[11] << 8);
+-		unsigned chip1 = si[14] | ((unsigned)si[15] << 8);
+-		unsigned fw = si[16] | ((unsigned)si[17] << 8);
+-		printf("SWEET FTS: sysinfo fw=%04x chip0=%04x chip1=%04x\n",
+-		    fw, chip0, chip1);
+-	} else {
+-		printf("SWEET FTS: sysinfo err=%d sig=%02x id=%02x\n",
+-		    err, si[0], si[1]);
++	if (do_si) {
++		err = fts_read_sysinfo(si);
++		if (!err && si[0] == FTS_SYSINFO_SIG &&
++		    si[1] == FTS_SYSINFO_LOAD_ID) {
++			unsigned chip0 = si[10] | ((unsigned)si[11] << 8);
++			unsigned chip1 = si[14] | ((unsigned)si[15] << 8);
++			unsigned fw = si[16] | ((unsigned)si[17] << 8);
++			unsigned cfg = si[20] | ((unsigned)si[21] << 8);
++			unsigned cx = si[24] | ((unsigned)si[25] << 8);
++			unsigned resx = si[80] | ((unsigned)si[81] << 8);
++			unsigned resy = si[82] | ((unsigned)si[83] << 8);
++			printf("SWEET FTS: sysinfo fw=%04x chip0=%04x "
++			    "chip1=%04x cfg=%04x cx=%04x afe=%02x/%02x/%02x "
++			    "proto=%02x\n", fw, chip0, chip1, cfg, cx, si[28],
++			    si[29], si[30], si[31]);
++			printf("SWEET FTS: sysinfo res=%ux%u tx=%u rx=%u "
++			    "key=%u force=%u\n", resx, resy, si[84], si[85],
++			    si[86], si[87]);
++		} else {
++			printf("SWEET FTS: sysinfo err=%d sig=%02x id=%02x\n",
++			    err, si[0], si[1]);
++		}
+ 	}
+ 
++	/*
++	 * Xiaomi's probe reads sysinfo after its first reset and then resets
++	 * the chip again (twice, in fact) before the final a0/00/01. The last
++	 * reset clears whatever the 0xa6 frame read leaves behind; without it
++	 * the first touch produces a whole row/column of ghost contacts and
++	 * the chip reports 43 05 30 (MS invalid Mutual Strength).
++	 */
++	for (unsigned r = 0; r < extra_resets; ++r) {
++		fts_reset();
++		if (!fts_bb_recover()) {
++			printf("SWEET FTS: SCL stuck low after reset %u\n",
++			    r + 2u);
++			goto out;
++		}
++		int rerr = fts_wait_ready(500);
++		printf("SWEET FTS: reset %u ready err=%d\n", r + 2u, rerr);
++		if (rerr) {
++			goto out;
++		}
++	}
++
+ 	err = fts_sense_on();
+-	printf("SWEET FTS: sense on err=%d; polling every 5 ms\n", err);
++	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u\n",
++	    err, poll_enable, extra_resets, do_si);
+ 	if (err) {
+ 		goto out;
+ 	}
+@@ -708,7 +756,7 @@
+ 	while (!ft.dead) {
+ 		/* The IRQ line (active low) says events are pending; also read
+ 		 * every ~10 ms in case the line does not work as assumed. */
+-		bool poll = (++ticks % 2u) == 0;
++		bool poll = poll_enable && ((++ticks % 2u) == 0);
+ 		while ((poll || !(fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u)) &&
+ 		    !ft.dead) {
+ 			poll = false;
+@@ -740,6 +788,12 @@
+ 				break;
+ 			}
+ 		}
++		if ((ticks % 2000u) == 0u) {
++			printf("SWEET FTS: alive ticks=%u irq=%u errors=%u\n",
++			    ticks,
++			    fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)) & 1u,
++			    errors);
++		}
+ 		fts_wait(5);
+ 	}
+ 	fts_release_all();
