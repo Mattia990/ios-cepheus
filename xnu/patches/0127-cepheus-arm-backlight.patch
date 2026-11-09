@@ -1,0 +1,155 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bc98b5925b2f3bc69765c5196eec944cb0bf3487..90efd49b030c78100913411dd482e5979d47cca0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -61,9 +61,16 @@ extern int sweet_display_fit_x, sweet_display_fit_y, sweet_display_fit_w, sweet_
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <string.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -102,6 +109,125 @@ class IOMobileFramebuffer : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * CoreBrightness matches a service with backlight-control=true that conforms
++ * to AppleARMBacklight, then writes brightness through
++ * IORegistryEntrySetCFProperty with IOMFBBrightnessLevel (16.16 fixed-point
++ * nits) or brightness-nits. phase 1 publishes the iPhone X backlight node and
++ * logs the writes; the panel is not touched yet.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	bool brightness = false;
++
++	if (dict == NULL) {
++		IOLog("SWEET BL: setProperties non-dictionary %p\n", properties);
++		return kIOReturnSuccess;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it != NULL) {
++		OSObject *object;
++		while ((object = it->getNextObject()) != NULL) {
++			const OSSymbol *key = OSDynamicCast(OSSymbol, object);
++			const OSString *keyString = OSDynamicCast(OSString, object);
++			const char *name = key != NULL ? key->getCStringNoCopy() :
++			    (keyString != NULL ? keyString->getCStringNoCopy() : "?");
++			OSObject *value = dict->getObject(name);
++			OSNumber *number;
++			OSBoolean *boolean;
++			OSString *string;
++			OSData *data;
++
++			if ((number = OSDynamicCast(OSNumber, value)) != NULL) {
++				unsigned long long n = number->unsigned64BitValue();
++				IOLog("SWEET BL: setProperties %s = %llu (0x%llx)\n", name, n, n);
++			} else if ((boolean = OSDynamicCast(OSBoolean, value)) != NULL) {
++				IOLog("SWEET BL: setProperties %s = %s\n", name,
++				    boolean->getValue() ? "true" : "false");
++			} else if ((string = OSDynamicCast(OSString, value)) != NULL) {
++				IOLog("SWEET BL: setProperties %s = \"%s\"\n", name,
++				    string->getCStringNoCopy());
++			} else if ((data = OSDynamicCast(OSData, value)) != NULL) {
++				const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
++				unsigned int len = data->getLength();
++				if (bytes != NULL && len >= 4) {
++					IOLog("SWEET BL: setProperties %s = data[%u] %02x %02x %02x %02x\n",
++					    name, len, bytes[0], bytes[1], bytes[2], bytes[3]);
++				} else {
++					IOLog("SWEET BL: setProperties %s = data[%u]\n", name, len);
++				}
++			} else {
++				IOLog("SWEET BL: setProperties %s = %p\n", name, value);
++			}
++			if (name != NULL && (strcmp(name, "IOMFBBrightnessLevel") == 0 ||
++			    strcmp(name, "brightness-nits") == 0)) {
++				brightness = true;
++				/* store the value too, so a later read-back succeeds */
++				setProperty(name, value);
++			}
++		}
++		it->release();
++	} else {
++		IOLog("SWEET BL: setProperties cannot iterate dictionary\n");
++	}
++	IOLog("SWEET BL: setProperties done%s\n", brightness ? " (brightness)" : "");
++	return kIOReturnSuccess;
++}
++
++static void
++sweet_bl_publish(IOService *parent)
++{
++	static bool published;
++	AppleARMBacklight *backlight;
++
++	if (published) {
++		return;
++	}
++	backlight = new AppleARMBacklight;
++	if (backlight == NULL || !backlight->init()) {
++		IOLog("SWEET BL: cannot allocate AppleARMBacklight\n");
++		OSSafeReleaseNULL(backlight);
++		return;
++	}
++	backlight->setName("backlight");
++	backlight->setProperty(kIOClassKey, "AppleARMBacklight");
++	backlight->setProperty("compatible", "backlight");
++	backlight->setProperty("device_type", "backlight");
++	backlight->setProperty("backlight-control", true);
++	backlight->setProperty("backlight-id", 0xffffffffULL, 32);
++	backlight->setProperty("DBVMax", 0x7ffULL, 32);
++	backlight->setProperty("DBVMin", 0x8bULL, 32);
++	backlight->setProperty("override-boot-brightness", 0x2e4ULL, 32);
++	backlight->setProperty("backlight-update-policy", 0x4ULL, 32);
++	backlight->setProperty("backlight-level-encoding", 0xbULL, 32);
++	backlight->setProperty("use-AAP", 1ULL, 32);
++	backlight->setProperty("use-AAB-architecture", 1ULL, 32);
++	backlight->setProperty("use-new-AAP-ramp", 1ULL, 32);
++	backlight->setProperty("use-Nits2DACTable", 1ULL, 32);
++	backlight->setProperty("max-nit-value", 0x2eeULL, 32);
++	backlight->setProperty("pre-strobe-nit", 0x2a2ULL, 32);
++	if (!backlight->attach(parent)) {
++		IOLog("SWEET BL: attach failed\n");
++		OSSafeReleaseNULL(backlight);
++		return;
++	}
++	backlight->registerService();
++	published = true;
++	IOLog("SWEET BL: AppleARMBacklight published (DBV 0x%x..0x%x)\n", 0x8b, 0x7ff);
++	backlight->release();   /* attached: the registry holds the reference */
++}
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -248,6 +374,7 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	sweet_bl_publish(this);
+ 	return true;
+ }
+ 

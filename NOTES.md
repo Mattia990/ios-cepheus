@@ -183,6 +183,10 @@ Of the ~81 original ios-sweet kernel patches:
   (`touch-on6`): AFE 03/03/03, one-finger tracking, no `43 05 30`/water
 - 0126 FTS touch: enable by default (`cepheustouch` defaults to 1, delay stays 20 s);
   pass `cepheustouch=0` to disable
+- 0127 backlight: publish a fake `AppleARMBacklight` (`IOClass=AppleARMBacklight`,
+  `backlight-control=true`, iPhone X DBV/AAP properties) as a child of `AppleCLCD` and log
+  `setProperties` writes (`IOMFBBrightnessLevel` / `brightness-nits`); phase 1 only logs,
+  panel brightness is unchanged
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

@@ -5,6 +5,47 @@ Last updated **2026-11-09** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Brightness: phase 1 fake `AppleARMBacklight` published (2026-11-09)
+
+**Why the slider does nothing.** In `touch-on7` (`logs/runs/touch-on7/xnu.txt`) `backboardd`
+asks for a service matching `IOPropertyMatch {backlight-control: true}` at 42.438 s and gets
+`none` / `0 found`; `AppleCLCD` is already up at 37.859 s. CoreBrightness (disassembled from
+the 20H392 shared cache) does the same match, then requires
+`IOObjectConformsTo(service, "AppleARMBacklight")` and stores the service port. Its
+`_SetIOMFBBrightness` writes `IOMFBBrightnessLevel` (CFNumber, 32-bit, raw 16.16 fixed-point
+nits) with `IORegistryEntrySetCFProperty`; `_DisplaySetBLDriverProperty` writes
+`brightness-nits` the same way. No user client is involved. `IOMFBBrightnessLevel` is at
+CoreBrightness `__TEXT` + 0x5ccc813, `brightness-nits` at +0x5ccc214.
+
+The iPhone X `backlight` ADT node supplies the properties CoreBrightness expects: `DBVMax`
+0x7ff, `DBVMin` 0x8b, `override-boot-brightness` 0x2e4, `backlight-update-policy` 0x4,
+`backlight-level-encoding` 0xb, `use-AAP` 1, `use-AAB-architecture` 1, `max-nit-value`
+0x2ee.
+
+**`0127` (phase 1, logs only).** `SweetFramebuffer.cpp` now defines an `AppleARMBacklight :
+IOService`, attaches it to `AppleCLCD` and registers it from `AppleCLCD::start` with
+`IOClass=AppleARMBacklight`, `backlight-control=true` and the ADT values above. Its
+`setProperties(OSObject *)` override logs every incoming key/value (`SWEET BL: setProperties
+...`), stores `IOMFBBrightnessLevel`/`brightness-nits` back as properties so read-back works,
+and returns success. **It does not change the panel yet.** The DCS path is still
+`panel0-backlight` (max 0x7ff, DTB `qcom,mdss-brightness-max-level`); WLED is not the display
+backlight.
+
+**Test (one phase at a time, observe with the user).** Build the kernel from `0127` and
+`fastboot boot` with the usual debug args (touch is default-on; `cepheuswdt=0` still advised).
+In the log expect:
+
+1. ~37.9 s: `SWEET BL: AppleARMBacklight published`.
+2. ~42.4 s: the `backlight-control` match by `backboardd` should find the service instead of
+   `none`; CoreBrightness should attach without `invalid backlight service`.
+3. After SpringBoard: `SWEET BL: setProperties ...` lines with the first key/value and the
+   `(brightness)` marker when the slider or auto-brightness writes.
+
+Report the first setProperties lines and whether the match succeeded. If the match still
+fails, the next check is whether `IOObjectConformsTo` sees the class (kernel `metaCast` uses
+the real metaclass name, so the class must be exactly `AppleARMBacklight`). Phase 2 will map
+the received nits to DBV and issue the runtime DCS `0x51` write through the MDSS/DSI path.
+
 ### Touch works: the missing post-sysinfo reset was the fix (2026-11-09)
 
 `touch-on6` booted the user-built kernel (`kernel.development.sweet`, sha1
