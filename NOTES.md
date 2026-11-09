@@ -179,7 +179,8 @@ Of the ~81 original ios-sweet kernel patches:
 - 0125 FTS touch: reset the chip again after the `0xa6` sysinfo read (Xiaomi's probe
   resets twice before `a0/00/01`), log AFE/config/TX/RX, and add
   `cepheustouchreset2=N` (default 1), `cepheustouchsysinfo=0`,
-  `cepheustouchpoll=0` plus a 10 s alive heartbeat
+  `cepheustouchpoll=0` plus a 10 s alive heartbeat. Verified on hardware
+  (`touch-on6`): AFE 03/03/03, one-finger tracking, no `43 05 30`/water
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

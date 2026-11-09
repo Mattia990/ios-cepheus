@@ -5,6 +5,46 @@ Last updated **2026-11-09** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Touch works: the missing post-sysinfo reset was the fix (2026-11-09)
+
+`touch-on6` booted the user-built kernel (`kernel.development.sweet`, sha1
+`739d184dfa30c37b31e332ba85a5c9aad9981c13`, built from patch `0125`) with the standard debug
+args plus:
+
+```
+cepheuswdt=0 cepheustouch=1 cepheustouchdelay=55 cepheustouchlog=1
+```
+
+and `-s 180`. Touch init ran at 74.45 s, sysinfo reported
+`fw=0060 chip0=3639 cfg=0037 cx=ffff afe=03/03/03 proto=00`, the extra reset logged
+`reset 2 ready err=0`, and sense-on at 74.63 s succeeded. The first real touch was at
+88.58 s, i.e. after SpringBoard was up; the screen was fully usable.
+
+The whole run is clean:
+
+- 2378 enter/motion samples, all touch id 0, all type 1 (finger); 59 down events and
+  59 matching up events. One-finger tracking was smooth.
+- **No `43 05 30` (MS invalid mutual strength) and no `43 06` water enter/exit** for the
+  entire run. The pathological edge cross from `touch-on2`..`on5` is gone.
+- The only status during use was `43 05 21` at 139.83 s, which the vendor table names
+  "SS invalid Self Strength soft Force cal" (a self-cap soft recal), not water and not an
+  MS error; touch input continued immediately before and after it.
+- The HID edge flag fires: 18 samples were marked `edge`, including y=2339 (bottom clamp)
+  and y=55 (top). x stayed within 18..993, so the right edge was not exercised in this run.
+- One 4 ms `edge` tap at x=18,y=1000 at 192.69 s while the phone was otherwise idle
+  (`touch 0 down`/`up` 0.4 ms apart). It did not repeat; likely a stray/grip contact.
+  Worth watching, but it did not affect the session.
+
+**Why it works.** Xiaomi's probe reads sysinfo after reset #1 and then resets the chip
+again before its final `a0/00/01`; our old driver went straight from the `0xa6` frame read
+to sense-on. `0125` adds one reset after sysinfo (`cepheustouchreset2=1`). The earlier
+fallback knobs (`reset2=2`, `poll=0`, `sysinfo=0`) are no longer needed.
+
+**Still open.** Touch remains opt-in (`cepheustouch=0` default); enabling it by default is
+a user decision. The sysinfo line prints `res=2339x1079` (x/y swapped or a field-layout
+mistake) even though the coordinate decode is correct, so check `si[..]` before changing
+it. Separately, restore `wdt_arm(30)` and drop `cepheuswdt=0` once bring-up is finished.
+
 ### TWRP grip test is clean; XNU fails even with a clean baseline (2026-11-09)
 
 - TWRP grip reproduction (`logs/runs/twrp-touch/events-grip.txt`,
@@ -25,12 +65,8 @@ Last updated **2026-11-09** (newest work first under "Start here"). Read this fi
   `cfg/cx/afe/proto/res/tx/rx`, and adds `cepheustouchsysinfo=0` (skip `0xa6`)
   and `cepheustouchpoll=0` (IRQ-only) for no-rebuild comparisons.
 
-**Next build (user).** Apply `0125-cepheus-fts-touch-reset.patch` and boot
-`touch-on6` with
-`cepheuswdt=0 cepheustouch=1 cepheustouchdelay=55 cepheustouchlog=1`. Expect
-`sysinfo ... afe=03/03/03 proto=...` and `reset 2 ready err=0`. If it still
-fails, run the same kernel with `cepheustouchreset2=2`, then
-`cepheustouchpoll=0`, then `cepheustouchsysinfo=0`.
+**Result.** Built by the user and booted as `touch-on6`; touch works, see the section at
+the top. The extra reset after sysinfo is the fix; the fallback knobs were not needed.
 
 ### Touch runs touch-on2..on4: chip answers, mutual sensing fails, water mode silences it (2026-11-09)
 
@@ -121,11 +157,11 @@ controller-ready), not mainline `stmfts`. Details:
 `8954729db921f60ff4476884435887bc2a5dad9f`); the obsolete `sweet_fts.c` GCC-halt hunk was
 removed from `0086`. Host `clang -fsyntax-only` (kernel stubs, `-Wall -Wextra`) passed for
 `0085`, and `tools/validate-repo.py` passes for 0001-0125. The stack has since been built
-and booted on the phone (`touch-on2`..`touch-on5` above); `0125` is not built yet, so the
-user's build is its first compile check.
+and booted on the phone (`touch-on2`..`touch-on6` above); `0125` made touch work on
+`touch-on6`.
 
-**Boot setup used.** `touch-on4` (the only cold-boot run so far) used the standard debug
-arguments plus:
+**Boot setup used.** The successful `touch-on4` and `touch-on6` boots used the standard
+debug arguments plus:
 
 ```
 cepheuswdt=0 cepheustouch=1 cepheustouchdelay=55 cepheustouchlog=1
@@ -137,10 +173,10 @@ expected `enter`/`motion`/`leave` shapes. If the chip never ACKs on a future cha
 the idle levels printed before START (`idle=1/1`), the SDA/SCL order, and whether GPIO 84
 really powers `touch_vddio_vreg`.
 
-**Open.** The transport and the `fts_521` command/event layer work; the remaining fault is
-that mutual sensing reports complete rows/columns and the chip then enters water mode (see
-the section above for the ruled-out list and next test). After touch works, restore
-`wdt_arm(30)` in `shim/shim.c` and drop `cepheuswdt=0`.
+**Open.** The transport and the `fts_521` command/event layer work; the mutual-sensing
+fault was fixed by the post-sysinfo reset in `0125` and verified in `touch-on6` (see the
+top section). Still open: decide whether `cepheustouch` should default to 1, and restore
+`wdt_arm(30)` in `shim/shim.c` / drop `cepheuswdt=0` after bring-up.
 
 ### Superseded: GENI I2C driver (2026-11-09)
 
