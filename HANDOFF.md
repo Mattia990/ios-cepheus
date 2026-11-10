@@ -28,12 +28,17 @@ published no `IOMFBBrightnessLevel` registry write is expected at all; a silent
 property absent the registry path is the one we want" note is superseded: the ARM container
 sets the sync property itself.
 
-**`0129` (gating + instrumentation).** `sweetbl` selects when the fake backlight is published:
-`0` never, `1` at `AppleCLCD::start` (default, same as `0127`), `2` on the first display-on
-requested by backboardd. `sweetfb_sel_log=1` logs every IOMFB `externalMethod` call with up
-to four scalar inputs, not just the first call per selector. The panel is still not touched.
+**`0129`/`0130` (gating + instrumentation).** `sweetbl` selects what/when the fake
+backlight is published: `0` never, `1` at `AppleCLCD::start` as `AppleARMBacklight` (default,
+same as `0127`), `2` as `AppleARMBacklight` on the first display-on requested by backboardd,
+`3` at `AppleCLCD::start` as a non-conforming `SweetBacklight` (`0130`). Mode 3 still has
+`backlight-control=true`, so CoreBrightness matches it, but `IOObjectConformsTo(...,
+"AppleARMBacklight")` is false and `CBDisplayContaineriOS` should take its non-ARM path,
+leaving `DisplaySyncBrightnessTransactions` off and using the registry write.
+`sweetfb_sel_log=1` logs every IOMFB `externalMethod` call with up to four scalar inputs, not
+just the first call per selector. The panel is still not touched.
 
-**Test (one phase at a time; let the user observe each step).** Build from `0129` and
+**Test (one phase at a time; let the user observe each step).** Build from `0130` and
 `fastboot boot` with `cepheuswdt=0`:
 
 1. `sweetbl=0` control: expect `SWEET BL: disabled (sweetbl=0)`, no backlight match, and a
@@ -41,16 +46,19 @@ to four scalar inputs, not just the first call per selector. The panel is still 
    fake backlight.
 2. `sweetbl=1 sweetfb_sel_log=1`: expect publication at ~93 s, the match, and the stall. Move
    the slider and capture any `SWEET FB: setProperties`, raw `sel 50/51/84` lines, and the
-   5 s swap stats. This tells us whether any registry or selector path fires at all.
-3. `sweetbl=2`: publication waits for the first display-on. If the stall disappears but
+   5 s swap stats.
+3. `sweetbl=3 sweetfb_sel_log=1`: non-ARM service. Expect `SweetBacklight (non-ARM)
+   published`, the same `backlight-control` match, and — if the non-ARM path works — a
+   responsive UI and `SWEET FB: setProperties IOMFBBrightnessLevel = <millinits>` writes when
+   the slider moves.
+4. `sweetbl=2`: publication waits for the first display-on. If the stall disappears but
    brightness does not move, the ARM container was created too late for CoreBrightness to use
-   it; the next options are the non-ARM `CBDisplayContaineriOS` path or a direct
-   `CABrightnessControl`/IOMFB selector route.
+   it.
 
-Open: the stall itself is still unexplained. If it persists with `sweetbl=2`, delaying
-publication is not enough; the sync-notification path (or the missing `AppleARMBacklight`
-implementation) needs to be instrumented next. Phase 2 (DCS `0x51`) starts only after a
-runtime write path is confirmed.
+Open: the stall itself is still unexplained. If it persists with `sweetbl=3`, the next
+option is a direct `CABrightnessControl`/IOMFB selector route rather than the
+`AppleARMBacklight` container. Phase 2 (DCS `0x51`) starts only after a runtime write path is
+confirmed.
 
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 

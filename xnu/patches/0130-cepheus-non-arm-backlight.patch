@@ -1,0 +1,100 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -216,10 +216,39 @@
+ }
+ 
+ /*
+- * boot-arg sweetbl: when to publish the fake AppleARMBacklight.
++ * sweetbl=3 variant: match backlight-control=true without conforming to
++ * AppleARMBacklight. CBDisplayContaineriOS then takes its non-ARM path, which
++ * leaves DisplaySyncBrightnessTransactions off and uses the registry write
++ * path in _SetIOMFBBrightness. Logged exactly like the ARM node.
++ */
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++
++	if (dict == NULL) {
++		IOLog("SWEET BL: setProperties non-dictionary %p\n", properties);
++		return kIOReturnSuccess;
++	}
++	sweet_log_properties("SWEET BL", this, dict);
++	return kIOReturnSuccess;
++}
++
++/*
++ * boot-arg sweetbl: when/what to publish as the fake backlight.
+  *   0 = never (control: CoreBrightness sees no backlight service)
+- *   1 = at AppleCLCD::start (default, phase-1 behaviour)
+- *   2 = on the first display-on requested by backboardd
++ *   1 = at AppleCLCD::start, AppleARMBacklight (default, phase-1 behaviour)
++ *   2 = AppleARMBacklight on the first display-on requested by backboardd
++ *   3 = at AppleCLCD::start, non-ARM service (no AppleARMBacklight conformance)
+  */
+ static int
+ sweet_bl_mode(void)
+@@ -231,8 +260,8 @@
+ 		PE_parse_boot_argn("sweetbl", &mode, sizeof(mode));
+ 		if (mode < 0) {
+ 			mode = 0;
+-		} else if (mode > 2) {
+-			mode = 2;
++		} else if (mode > 3) {
++			mode = 3;
+ 		}
+ 	}
+ 	return mode;
+@@ -243,8 +272,9 @@
+ {
+ 	static bool published;
+ 	static bool reported;
+-	AppleARMBacklight *backlight;
++	IOService *backlight;
+ 	int mode = sweet_bl_mode();
++	bool non_arm = mode == 3;
+ 
+ 	if (published) {
+ 		return;
+@@ -257,14 +287,18 @@
+ 		}
+ 		return;
+ 	}
+-	backlight = new AppleARMBacklight;
++	if (non_arm) {
++		backlight = new SweetBacklight;
++	} else {
++		backlight = new AppleARMBacklight;
++	}
+ 	if (backlight == NULL || !backlight->init()) {
+-		IOLog("SWEET BL: cannot allocate AppleARMBacklight\n");
++		IOLog("SWEET BL: cannot allocate backlight service\n");
+ 		OSSafeReleaseNULL(backlight);
+ 		return;
+ 	}
+ 	backlight->setName("backlight");
+-	backlight->setProperty(kIOClassKey, "AppleARMBacklight");
++	backlight->setProperty(kIOClassKey, non_arm ? "SweetBacklight" : "AppleARMBacklight");
+ 	backlight->setProperty("compatible", "backlight");
+ 	backlight->setProperty("device_type", "backlight");
+ 	backlight->setProperty("backlight-control", true);
+@@ -287,7 +321,8 @@
+ 	}
+ 	backlight->registerService();
+ 	published = true;
+-	IOLog("SWEET BL: AppleARMBacklight published (DBV 0x%x..0x%x)\n", 0x8b, 0x7ff);
++	IOLog("SWEET BL: %s published (DBV 0x%x..0x%x)\n",
++	    non_arm ? "SweetBacklight (non-ARM)" : "AppleARMBacklight", 0x8b, 0x7ff);
+ 	backlight->release();   /* attached: the registry holds the reference */
+ }
+ 
