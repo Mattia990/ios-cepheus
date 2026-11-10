@@ -7,6 +7,14 @@ Last updated **2026-11-10** (newest work first under "Start here"). Read this fi
 
 ### Brightness: the fake backlight stalls the UI; `0129` gates publication and logs selectors (2026-11-10)
 
+**Next action: build and boot `0132`.** `0131` showed that nothing ever registers an IOMFB
+notification port, and that the stall is real (a swipe produced one swap in 5 s). The 5 s wait
+is therefore a MIG async completion that our `externalMethod` override never sends; `0132`
+replies with `sendAsyncResult64` and logs the first `async wake`/`async reply` per selector.
+Boot with `cepheuswdt=0 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1` and swipe: expect the
+`1 swaps (0.2 fps)` buckets to go away and `sel 50` to follow the brightness slider. Full
+reasoning and results are under "`0131` result" below.
+
 **Phase-1 stall (`brightness-on1`, `0127` only).** The user was actively swiping from
 165.689 s to 297.384 s (sessions of 11.5 s, 16.8 s and 30.3 s), and the touch driver logged
 5279 enter/motion/leave events, but the framebuffer did exactly **1 swap per 5 s (0.2 fps)**
@@ -54,12 +62,15 @@ just the first call per selector. The panel is still not touched.
 4. `sweetbl=2`: publication waits for the first display-on. If the stall disappears but
    brightness does not move, the ARM container was created too late for CoreBrightness to use
    it.
+5. `sweetbl=3 sweetfb_sel_log=1` from `0132`: same as (3), but the IOMFB user client now
+   completes MIG async calls. Expect `sel <n> async wake` / `sel <n> async reply` lines and a
+   responsive UI; move the brightness slider and note the `sel 50` values.
 
-Open: the stall is a ~5 s timeout in the frame-synchronized brightness transaction, not a
-slow frame. `0131` adds `registerNotificationPort` logging and counts dropped `notify`
-events (vsync type 5) to see whether CoreBrightness waits on an IOMFB notification port that
-the fake driver never signals. Phase 2 (DCS `0x51`) starts only after a runtime write path is
-confirmed.
+Open: `0131` ruled out the IOMFB notification port as the wait (see the `brightness-notify1`
+result below): `registerNotificationPort` is never called, so the ~5 s stall is a MIG async
+completion that our `externalMethod` override swallows. `0132` sends the completion
+(`sendAsyncResult64`) and logs the first async call/reply per selector. Phase 2 (DCS `0x51`)
+starts only after a runtime write path is confirmed.
 
 **Control result (`brightness-gate0`, 2026-11-10).** Booted from the `0129`+`0130` build with
 `cepheuswdt=0 cepheustouchlog=1 sweetbl=0`. `SWEET BL: disabled (sweetbl=0)` at 53.916 s;
@@ -106,12 +117,37 @@ that the fake IOMFB never sends; `0131` logs `registerNotificationPort` and drop
 **`0131` (notification-port instrumentation).** Logs every
 `IOMobileFramebufferUserClient::registerNotificationPort` call (client, type, port, refCon),
 the first two dropped `notify` calls per type (with the reason: no callback function or no
-port), the first successful send per type, and the client count in the 5 s stats. Build from
-`0131` and boot with `cepheuswdt=0 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`. Expected:
-a `registerNotificationPort` line around display open, and `notify type 5 dropped` lines if
-the port is registered but selector 72 never sets the callback. If the log shows no
-registration at all, the 5 s wait is not an IOMFB notification. Instrumentation only; the
-panel is still not touched.
+port), the first successful send per type, and the client count in the 5 s stats. Instrumentation
+only; the panel is still not touched.
+
+**`0131` result (`brightness-notify1`, 2026-11-10).** Booted with `cepheuswdt=0
+cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`; the user waited 1 min after SpringBoard and
+then rebooted to TWRP. `SweetBacklight (non-ARM) published` at 53.243 s; the
+`backlight-control` match returned `SweetBacklight` at 57.824 s and `1 found` at 93.339 s;
+display on at 93.388 s. There is **no `registerNotificationPort` line at all** in the run, and
+no selector 72 (`notifications`) call, so no client ever registered an IOMFB notification
+port. The only `notify` lines are `kernel_task notify type 5 dropped: func 0 port 0x0` (one
+or two per display-on), i.e. the vsync timer finds no callback; the 5 s stats report `2
+clients` (kernel_task + backboardd) but neither has a port. The stall is real and not idle:
+the user swiped up repeatedly from 183.03 s to 188.04 s (touch 0, y 1107 -> 1503) and only
+one swap happened in that whole window (184.734 s); every 5 s bucket after display on is
+`1 swaps (0.2 fps)`. `sel 84` (4 zero bytes) and `sel 50` (`0x10000, 0`) appear at display on
+(93.389 s) and `sel 55`/`sel 50` again at 103.403 s, always returning immediately with no
+`setProperties` and no `sel 51`.
+
+**Conclusion and `0132`.** Since every IOMFB call is logged on return and the 5 s gap sits
+between calls, the wait is in userland. `IOUserClient::callExternalMethod` invokes our
+`externalMethod` override directly, so XNU's async machinery never sends the MIG completion
+for `IOConnectCallAsyncScalarMethod`/`AsyncStructMethod`; the caller then waits on its wake
+port until its own 5 s timeout. `0132` adds `sweet_fb_async_reply()`: when
+`args->asyncWakePort` is non-null it calls `IOUserClient::sendAsyncResult64` with the
+`asyncReference` array XNU filled in, and logs `sel %u async wake` / `sel %u async reply`
+once per selector (`sweetfb_async_log=1` logs all). Build from `0132` and boot with
+`cepheuswdt=0 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`. Expected: one `async wake` /
+`async reply` line per async selector (the selector number identifies the transaction),
+no more 5 s spacing while swiping, and `sel 50` with other values when the brightness slider
+moves. If the UI is still 0.2 fps, the async lines will show which selector is left
+uncompleted.
 
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 

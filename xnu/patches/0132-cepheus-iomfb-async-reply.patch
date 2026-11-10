@@ -1,0 +1,92 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -105,6 +105,8 @@
+ 
+ /* boot-arg sweetfb_sel_log=1: log every externalMethod call, not just the first per selector */
+ static int sweet_fb_sel_log;
++/* boot-arg sweetfb_async_log=1: log every async call/completion, not just the first per selector */
++static int sweet_fb_async_log;
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -466,6 +468,7 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	PE_parse_boot_argn("sweetfb_sel_log", &sweet_fb_sel_log, sizeof(sweet_fb_sel_log));
++	PE_parse_boot_argn("sweetfb_async_log", &sweet_fb_async_log, sizeof(sweet_fb_async_log));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -945,6 +948,43 @@
+ }
+ 
+ static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint64_t sweet_fb_async_seen;    /* selectors whose async call was logged (< 64) */
++static uint64_t sweet_fb_async_done;    /* selectors whose async reply was logged (< 64) */
++
++/*
++ * MIG async calls (IOConnectCallAsyncScalarMethod / AsyncStructMethod) are
++ * completed by the user client itself. IOUserClient::callExternalMethod calls
++ * this override directly, so the base class never sends the completion and the
++ * caller waits on its wake port until its own timeout fires. Reply here; the
++ * reference array already carries the wake port and the kIOUCAsync64Flag.
++ */
++static void
++sweet_fb_async_reply(IOExternalMethodArguments *args, IOReturn ret, uint32_t outCount)
++{
++	uint32_t count = outCount;
++	char name[32];
++
++	if (args->asyncWakePort == MACH_PORT_NULL || args->asyncReference == NULL ||
++	    args->asyncReferenceCount == 0) {
++		return;
++	}
++	if (count > args->scalarOutputCount) {
++		count = args->scalarOutputCount;
++	}
++	if (count > kMaxAsyncArgs) {
++		count = kMaxAsyncArgs;
++	}
++	if (sweet_fb_async_log || args->selector >= 64 ||
++	    !(sweet_fb_async_done & (1ULL << args->selector))) {
++		if (args->selector < 64) {
++			sweet_fb_async_done |= 1ULL << args->selector;
++		}
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s sel %u async reply -> 0x%x (%u out)\n",
++		    name, args->selector, ret, count);
++	}
++	IOUserClient::sendAsyncResult64(args->asyncReference, ret, args->scalarOutput, count);
++}
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -955,6 +995,19 @@
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	/* Async MIG calls: log the first per selector so the caller is visible. */
++	if (args->asyncWakePort != MACH_PORT_NULL && (sweet_fb_async_log || selector >= 64 ||
++	    !(sweet_fb_async_seen & (1ULL << selector)))) {
++		char name[32];
++
++		if (selector < 64) {
++			sweet_fb_async_seen |= 1ULL << selector;
++		}
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s sel %u async wake 0x%x refs %u\n", name, selector,
++		    args->asyncWakePort, args->asyncReferenceCount);
++	}
++
+ 	/* Brightness-related IOMFB selectors: log every call and its inputs. */
+ 	if (selector == 50 || selector == 51 || selector == 84) {
+ 		const uint8_t *data = (const uint8_t *)args->structureInput;
+@@ -1074,6 +1127,7 @@
+ 			    args->scalarOutputCount, args->structureOutputSize, ret);
+ 		}
+ 	}
++	sweet_fb_async_reply(args, ret, outCount);
+ 	return ret;
+ }
+ #endif /* SWEET */

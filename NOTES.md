@@ -199,6 +199,11 @@ Of the ~81 original ios-sweet kernel patches:
 - 0131 backlight: log `IOMobileFramebufferUserClient::registerNotificationPort` (type, port,
   refCon) and the first dropped `notify` calls per type, plus the client count in the 5 s
   stats; instrumentation only, panel unchanged
+- 0132 backlight: complete MIG async calls from `IOMobileFramebufferUserClient::externalMethod`
+  (`sendAsyncResult64` on `args->asyncReference`); `IOUserClient::callExternalMethod` calls the
+  override directly, so XNU never sent the completion and CoreBrightness/backboardd waited on
+  its own 5 s timeout. Logs the first async call/reply per selector, `sweetfb_async_log=1` logs
+  all of them; no reply is sent when `asyncWakePort` is null
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
