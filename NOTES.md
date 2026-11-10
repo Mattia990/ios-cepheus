@@ -196,6 +196,9 @@ Of the ~81 original ios-sweet kernel patches:
 - 0130 backlight: `sweetbl=3` publishes a non-conforming `SweetBacklight` service
   (`backlight-control=true`, but not `AppleARMBacklight`) so CoreBrightness takes the non-ARM
   container path and keeps the registry brightness write; logging only, panel unchanged
+- 0131 backlight: log `IOMobileFramebufferUserClient::registerNotificationPort` (type, port,
+  refCon) and the first dropped `notify` calls per type, plus the client count in the 5 s
+  stats; instrumentation only, panel unchanged
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

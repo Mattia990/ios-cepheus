@@ -55,9 +55,10 @@ just the first call per selector. The panel is still not touched.
    brightness does not move, the ARM container was created too late for CoreBrightness to use
    it.
 
-Open: the stall itself is still unexplained. If it persists with `sweetbl=3`, the next
-option is a direct `CABrightnessControl`/IOMFB selector route rather than the
-`AppleARMBacklight` container. Phase 2 (DCS `0x51`) starts only after a runtime write path is
+Open: the stall is a ~5 s timeout in the frame-synchronized brightness transaction, not a
+slow frame. `0131` adds `registerNotificationPort` logging and counts dropped `notify`
+events (vsync type 5) to see whether CoreBrightness waits on an IOMFB notification port that
+the fake driver never signals. Phase 2 (DCS `0x51`) starts only after a runtime write path is
 confirmed.
 
 **Control result (`brightness-gate0`, 2026-11-10).** Booted from the `0129`+`0130` build with
@@ -80,6 +81,37 @@ the display cycled off/on at 65.3/67.9 s and 95.4/109.9 s. Brightness-related IO
 So non-ARM conformance does not avoid the stall; the trigger is having a matched backlight
 service present when the display opens. The next test is `sweetbl=2` (publish only at first
 display-on), which keeps `_DisplayOpen` from seeing a backlight service at startup.
+
+**Delayed-publication result (`brightness-gate2`, 2026-11-10).** Booted with `sweetbl=2
+sweetfb_sel_log=1`. `SWEET BL: deferred to first display-on (sweetbl=2)` at 9.479 s; the
+`backlight-control` match returned `none` at 14.072 s and `0 found` at 49.583 s;
+`AppleARMBacklight published` at 49.627 s, immediately followed by display on (off at
+50.072 s, on again at 52.817 s). The UI was responsive at first: the 5 s buckets were 38
+swaps at 57.571 s, 87 at 72.571 s, 21 at 77.571 s, then 1 at 82.571 s. The 72.571 s bucket
+covers a 15 s window (the vsync timer lost ~10 s between 57.5 and 67.5 s), so the real rate
+was ~5.8 fps, not the printed 17.4. The IOMFB call timeline shows the stall exactly:
+backboardd's last frame before the first stall is at 56.279 s and the next is at 70.587 s
+(**14.3 s**), then frames until 73.424 s, then a **5.06 s** gap to 78.483 s, after which
+frames are ~5 s apart. A 5 s frame spacing is a timeout, not a slow frame. The service was
+published after `_DisplayOpen` had already matched `0 found`, yet CoreBrightness still
+picked it up later and switched to the frame-synchronized path. Only 19 HID touch events
+were logged, all at 33.45-33.48 s (before display on); the FTS thread stayed alive
+(`alive ticks=... irq=1` every ~12.5 s) but no touches were delivered after display on. No
+`SWEET FB: setProperties` and no `sel 51` calls; `sel 84` (4 zero bytes) and `sel 50`
+(`0x10000, 0`) were called at 49.628 s, with `sel 50` again at 49.655 s. The 5 s timeout
+points at the frame-synchronized brightness transaction waiting for a display notification
+that the fake IOMFB never sends; `0131` logs `registerNotificationPort` and dropped
+`notify` calls to confirm.
+
+**`0131` (notification-port instrumentation).** Logs every
+`IOMobileFramebufferUserClient::registerNotificationPort` call (client, type, port, refCon),
+the first two dropped `notify` calls per type (with the reason: no callback function or no
+port), the first successful send per type, and the client count in the 5 s stats. Build from
+`0131` and boot with `cepheuswdt=0 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`. Expected:
+a `registerNotificationPort` line around display open, and `notify type 5 dropped` lines if
+the port is registered but selector 72 never sets the callback. If the log shows no
+registration at all, the 5 s wait is not an IOMFB notification. Instrumentation only; the
+panel is still not touched.
 
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 

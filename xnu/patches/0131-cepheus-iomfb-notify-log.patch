@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -382,6 +382,8 @@
+ 	mach_port_t         fPort;
+ 	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
+ 	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
++	uint32_t            fNotifyDrops[SWEET_FB_NOTIFY_TYPES];
++	bool                fNotifySent[SWEET_FB_NOTIFY_TYPES];
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -503,10 +505,11 @@
+ 		/* Every 5 s: frames backboardd swapped, frames copied to the panel. */
+ 		uint64_t swaps = sweet_fb_swap_count - fb->fStatSwaps, ns = 0;
+ 		absolutetime_to_nanoseconds(fb->fStatPresentAbs, &ns);
+-		if (swaps || fb->fStatPresents) {
+-			IOLog("SWEET FB: 5s: %llu swaps (%llu.%llu fps), %llu panel copies, avg copy %llu us\n",
++		if (swaps || fb->fStatPresents || fb->fClients->getCount()) {
++			IOLog("SWEET FB: 5s: %llu swaps (%llu.%llu fps), %llu panel copies, avg copy %llu us, %u clients\n",
+ 			    swaps, swaps / 5, (swaps * 2) % 10, fb->fStatPresents,
+-			    fb->fStatPresents ? ns / 1000 / fb->fStatPresents : 0);
++			    fb->fStatPresents ? ns / 1000 / fb->fStatPresents : 0,
++			    fb->fClients->getCount());
+ 		}
+ 		fb->fStatSwaps = sweet_fb_swap_count;
+ 		fb->fStatPresents = 0;
+@@ -852,6 +855,11 @@
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+ 		return false;
+ 	}
++	fPort = MACH_PORT_NULL;
++	bzero(fFunc, sizeof(fFunc));
++	bzero(fRefcon, sizeof(fRefcon));
++	bzero(fNotifyDrops, sizeof(fNotifyDrops));
++	bzero(fNotifySent, sizeof(fNotifySent));
+ 	fTask = owningTask;
+ 	return true;
+ }
+@@ -885,10 +893,15 @@
+ }
+ 
+ IOReturn
+-IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unused UInt32 type,
+-    __unused io_user_reference_t refCon)
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
++    io_user_reference_t refCon)
+ {
+ 	mach_port_t old;
++	char name[32];
++
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET FB: %s registerNotificationPort type %u port 0x%x refcon 0x%llx\n",
++	    name, type, port, (unsigned long long)refCon);
+ 	IOLockLock(fFB->fLock);
+ 	old = fPort;
+ 	fPort = port;
+@@ -905,9 +918,26 @@
+ {
+ 	OSAsyncReference64 ref;
+ 
+-	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++	if (type >= SWEET_FB_NOTIFY_TYPES) {
+ 		return;
+ 	}
++	if (fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++		if (fNotifyDrops[type]++ < 2) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET FB: %s notify type %u dropped: func %#llx port 0x%x (drop %u)\n",
++			    name, type, (unsigned long long)fFunc[type], fPort,
++			    fNotifyDrops[type]);
++		}
++		return;
++	}
++	if (!fNotifySent[type]) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		fNotifySent[type] = true;
++		IOLog("SWEET FB: %s notify type %u first send port 0x%x refcon 0x%llx\n",
++		    name, type, fPort, (unsigned long long)fRefcon[type]);
++	}
+ 	bzero(ref, sizeof(ref));
+ 	setAsyncReference64(ref, fPort, (mach_vm_address_t)fFunc[type], fRefcon[type], fTask);
+ 	sendAsyncResult64WithOptions(ref, kIOReturnSuccess, (io_user_reference_t *)values, count,
