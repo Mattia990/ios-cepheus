@@ -69,6 +69,18 @@ display on at 94.558 s. Touch worked (97 HID down/up events from 109.4 s to 181.
 This confirms the stall comes from the fake backlight publication, not from the kernel or
 touch path.
 
+**Non-ARM result (`brightness-gate3`, 2026-11-10).** Booted with `sweetbl=3
+sweetfb_sel_log=1`. `SweetBacklight (non-ARM) published` at 9.536 s, the `backlight-control`
+match returned `SweetBacklight` at 14.701 s and `1 found` at 50.238 s. Display on at 50.290 s;
+the 5 s buckets were already 0.2 fps from the first one (59.538 s), and the user reported the
+UI unusable. Only 11 HID touch events were logged (all at 33.888 s, before display on), and
+the display cycled off/on at 65.3/67.9 s and 95.4/109.9 s. Brightness-related IOMFB calls:
+`sel 84` with 4 bytes of zero at 50.292 s, `sel 50` with `0x10000, 0` at 50.292 s and again at
+60.306 s. There were **no** `SWEET FB: setProperties` and no `SWEET BL: setProperties` lines.
+So non-ARM conformance does not avoid the stall; the trigger is having a matched backlight
+service present when the display opens. The next test is `sweetbl=2` (publish only at first
+display-on), which keeps `_DisplayOpen` from seeing a backlight service at startup.
+
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 
 **Phase-1 result (`brightness-on1`).** `0127` booted with `cepheuswdt=0 cepheustouchlog=1`.
