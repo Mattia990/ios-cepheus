@@ -190,6 +190,9 @@ Of the ~81 original ios-sweet kernel patches:
 - 0128 backlight: also override `IOMobileFramebuffer::setProperties` (the real
   `IOMFBBrightnessLevel`/`brightness-nits` write target, i.e. `AppleCLCD`) and log the raw
   inputs of IOMFB selectors 50/51/84; still logs only, panel brightness unchanged
+- 0129 backlight: gate the fake `AppleARMBacklight` with `sweetbl` (`0` never, `1` at
+  `AppleCLCD::start`, `2` on first display-on) and add `sweetfb_sel_log=1` to log every IOMFB
+  `externalMethod` call with its first scalar inputs; logging only, panel unchanged
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

@@ -5,6 +5,53 @@ Last updated **2026-11-10** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Brightness: the fake backlight stalls the UI; `0129` gates publication and logs selectors (2026-11-10)
+
+**Phase-1 stall (`brightness-on1`, `0127` only).** The user was actively swiping from
+165.689 s to 297.384 s (sessions of 11.5 s, 16.8 s and 30.3 s), and the touch driver logged
+5279 enter/motion/leave events, but the framebuffer did exactly **1 swap per 5 s (0.2 fps)**
+from 143 s onward. `touch-on6` without the fake backlight ran at 8-26 fps over comparable
+interaction. The fake `AppleARMBacklight` causes a real display/UI stall, not idle
+throttling.
+
+**Why publishing it changes the path.** `_DisplayOpen` returns **nonzero on success**. Its
+success paths set `DisplayBrightnessAuto=false`; with an ARM-conforming backlight service
+present it also unconditionally sets `DisplaySyncBrightnessTransactions=true`. So display
+`+0x129` is 1, and `_SetIOMFBBrightness` takes the sync branch instead of the registry branch:
+`_SendSyncDBVNotification` → block → `display+0x10(display+0x18,
+"FrameSynchronizedBrightnessTransaction", message)` (`0x1af035f20`, stored by `_DisplayOpen`)
+→ module queue → block `0x1af037d9c` → `-[CBDisplayModuleiOS
+handleNotificationForKey:withProperty:]` and `_DisplaySetInternalDictionaryProperty` with
+`DisplayBrightness`/`DisplayNitsKey`. That chain is entirely userland, so with the ARM node
+published no `IOMFBBrightnessLevel` registry write is expected at all; a silent
+`SWEET FB: setProperties` is consistent with the current understanding. The earlier "with the
+property absent the registry path is the one we want" note is superseded: the ARM container
+sets the sync property itself.
+
+**`0129` (gating + instrumentation).** `sweetbl` selects when the fake backlight is published:
+`0` never, `1` at `AppleCLCD::start` (default, same as `0127`), `2` on the first display-on
+requested by backboardd. `sweetfb_sel_log=1` logs every IOMFB `externalMethod` call with up
+to four scalar inputs, not just the first call per selector. The panel is still not touched.
+
+**Test (one phase at a time; let the user observe each step).** Build from `0129` and
+`fastboot boot` with `cepheuswdt=0`:
+
+1. `sweetbl=0` control: expect `SWEET BL: disabled (sweetbl=0)`, no backlight match, and a
+   responsive UI while swiping (well above 0.2 fps). This proves the stall comes from the
+   fake backlight.
+2. `sweetbl=1 sweetfb_sel_log=1`: expect publication at ~93 s, the match, and the stall. Move
+   the slider and capture any `SWEET FB: setProperties`, raw `sel 50/51/84` lines, and the
+   5 s swap stats. This tells us whether any registry or selector path fires at all.
+3. `sweetbl=2`: publication waits for the first display-on. If the stall disappears but
+   brightness does not move, the ARM container was created too late for CoreBrightness to use
+   it; the next options are the non-ARM `CBDisplayContaineriOS` path or a direct
+   `CABrightnessControl`/IOMFB selector route.
+
+Open: the stall itself is still unexplained. If it persists with `sweetbl=2`, delaying
+publication is not enough; the sync-notification path (or the missing `AppleARMBacklight`
+implementation) needs to be instrumented next. Phase 2 (DCS `0x51`) starts only after a
+runtime write path is confirmed.
+
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 
 **Phase-1 result (`brightness-on1`).** `0127` booted with `cepheuswdt=0 cepheustouchlog=1`.
@@ -21,11 +68,11 @@ moved. The match is solved; the write target was wrong.
 not to the `AppleARMBacklight` child. `brightness-nits` is written the same way by
 `_DisplaySetBLDriverProperty`.
 
-**DBV vs registry.** `_SetIOMFBBrightness` checks `+0x129`. It is set by the display
+**DBV vs registry.** `_SetIOMFBBrightness` checks `+0x129`, which is set by the display
 property `DisplaySyncBrightnessTransactions` (CFString at CoreBrightness data
-`0x1d8897148`); absent or false leaves it 0, which is the registry path. `+0x12a` is set by
-`DisplayFasterEDREngaged`. With the property absent, the registry path is the one we want;
-no IOMFB user-client selector is involved.
+`0x1d8897148`); `+0x12a` is set by `DisplayFasterEDREngaged`. With `+0x129 == 0` the registry
+branch writes `IOMFBBrightnessLevel`. The ARM-backed `_DisplayOpen` success path sets it to
+1, so the sync branch runs instead (see the `0129` section above).
 
 **Units.** `_SetBLDriverNitsValue(self, int millinits, bool force)` logs
 `Setting BL nits value to %f` after dividing by 1000.0, and passes the same integer to
@@ -47,18 +94,12 @@ call, so we can tell if the slider uses that path too. **It does not change the 
 yet.** The DCS path is still `panel0-backlight` (max 0x7ff, DTB
 `qcom,mdss-brightness-max-level`); WLED is not the display backlight.
 
-**Test (one phase at a time, observe with the user).** Build the kernel from `0128` and
-`fastboot boot` with the usual debug args (`cepheuswdt=0` still advised; touch is default-on).
-In the log expect:
-
-1. ~93 s: `SWEET BL: AppleARMBacklight published`.
-2. ~97 s: the `backlight-control` match returns `AppleARMBacklight`.
-3. After SpringBoard: `SWEET FB: setProperties IOMFBBrightnessLevel = <millinits>` lines
-   (tag `SWEET FB`, not `SWEET BL`) when the slider or auto-brightness writes.
-
-Move the slider and report the first value and the value at both ends. `sel 50` should stay
-absent unless CoreBrightness also uses the IOMFB path. Phase 2 maps millinits to the panel
-DCS `0x51` range (DTB `bl-min` 2, `bl-max` 0x7ff) and writes it through the MDSS/DSI path.
+**`0128` test (superseded).** This build was never run on hardware; the `0129` test above
+covers it and adds the `sweetbl` control. If `0128` is booted anyway, expect publication at
+~93 s, the match at ~97 s, and
+`SWEET FB: setProperties IOMFBBrightnessLevel = <millinits>` only if the registry branch is
+reached. Phase 2 maps millinits to the panel DCS `0x51` range (DTB `bl-min` 2, `bl-max`
+0x7ff) and writes it through the MDSS/DSI path.
 
 ### Touch works: the missing post-sysinfo reset was the fix (2026-11-09)
 

@@ -1,0 +1,120 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -103,6 +103,9 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++/* boot-arg sweetfb_sel_log=1: log every externalMethod call, not just the first per selector */
++static int sweet_fb_sel_log;
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ 
+@@ -212,13 +215,46 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * boot-arg sweetbl: when to publish the fake AppleARMBacklight.
++ *   0 = never (control: CoreBrightness sees no backlight service)
++ *   1 = at AppleCLCD::start (default, phase-1 behaviour)
++ *   2 = on the first display-on requested by backboardd
++ */
++static int
++sweet_bl_mode(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		mode = 1;
++		PE_parse_boot_argn("sweetbl", &mode, sizeof(mode));
++		if (mode < 0) {
++			mode = 0;
++		} else if (mode > 2) {
++			mode = 2;
++		}
++	}
++	return mode;
++}
++
+ static void
+-sweet_bl_publish(IOService *parent)
++sweet_bl_publish(IOService *parent, bool display_on)
+ {
+ 	static bool published;
++	static bool reported;
+ 	AppleARMBacklight *backlight;
++	int mode = sweet_bl_mode();
+ 
+ 	if (published) {
++		return;
++	}
++	if (mode == 0 || (mode == 2 && !display_on)) {
++		if (!reported) {
++			IOLog("SWEET BL: %s (sweetbl=%d)\n",
++			    mode == 0 ? "disabled" : "deferred to first display-on", mode);
++			reported = true;
++		}
+ 		return;
+ 	}
+ 	backlight = new AppleARMBacklight;
+@@ -392,6 +428,7 @@
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	PE_parse_boot_argn("sweetfb_sel_log", &sweet_fb_sel_log, sizeof(sweet_fb_sel_log));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -401,7 +438,7 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+-	sweet_bl_publish(this);
++	sweet_bl_publish(this, false);
+ 	return true;
+ }
+ 
+@@ -933,6 +970,10 @@
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (!off) {
++				/* sweetbl=2: give CoreBrightness a backlight only once the display is up */
++				sweet_bl_publish(fFB, true);
++			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+@@ -947,15 +988,26 @@
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
++	if (sweet_fb_sel_log || selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_fb_logged |= 1ULL << selector;
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-		    args->scalarInputCount, args->structureInputSize,
+-		    args->scalarOutputCount, args->structureOutputSize, ret);
++		if (sweet_fb_sel_log && args->scalarInputCount > 0) {
++			IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u [%llu %llu %llu %llu] -> 0x%x\n",
++			    name, selector, args->scalarInputCount, args->structureInputSize,
++			    args->scalarOutputCount, args->structureOutputSize,
++			    args->scalarInput[0],
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
++			    args->scalarInputCount > 3 ? args->scalarInput[3] : 0,
++			    ret);
++		} else {
++			IOLog("SWEET FB: %s sel %u in %u/%u out %u/%u -> 0x%x\n", name, selector,
++			    args->scalarInputCount, args->structureInputSize,
++			    args->scalarOutputCount, args->structureOutputSize, ret);
++		}
+ 	}
+ 	return ret;
+ }
