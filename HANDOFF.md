@@ -60,6 +60,15 @@ option is a direct `CABrightnessControl`/IOMFB selector route rather than the
 `AppleARMBacklight` container. Phase 2 (DCS `0x51`) starts only after a runtime write path is
 confirmed.
 
+**Control result (`brightness-gate0`, 2026-11-10).** Booted from the `0129`+`0130` build with
+`cepheuswdt=0 cepheustouchlog=1 sweetbl=0`. `SWEET BL: disabled (sweetbl=0)` at 53.916 s;
+backboardd's `backlight-control` match returned `none` at 59.007 s and `0 found` at 94.522 s;
+display on at 94.558 s. Touch worked (97 HID down/up events from 109.4 s to 181.9 s) and the
+5 s swap buckets ran at **1.6-13.8 fps** throughout the interaction, versus 0.2 fps in
+`brightness-on1`. Brightness could not be changed, as expected with no backlight service.
+This confirms the stall comes from the fake backlight publication, not from the kernel or
+touch path.
+
 ### Brightness: phase 1 matched; the write goes to AppleCLCD, not the backlight node (2026-11-10)
 
 **Phase-1 result (`brightness-on1`).** `0127` booted with `cepheuswdt=0 cepheustouchlog=1`.
