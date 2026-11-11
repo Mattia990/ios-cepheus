@@ -1,19 +1,42 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-10** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-11** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
 
+### Brightness: selector 55 is the 72-byte transaction that starts the 5 s cadence (2026-11-11)
+
+**Next action: build and boot `0133`.** The userland-side 5 s wait is still unexplained, but
+`0133` now logs the one IOMFB call that precedes it. Boot with `cepheuswdt=0
+cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, wait for SpringBoard, swipe, and move the
+brightness slider. Capture the `SWEET FB: <proc> sel 55 struct:` lines and the 5 s swap stats.
+`0133` is logging only: the panel is still not touched.
+
+**Why selector 55.** In `brightness-gate3` backboardd called `sel 55` with scalar `9` and a
+72-byte structure at 60.306 s, immediately followed by `sel 50` and the first 5 s-cadence swap.
+The `IOMobileFramebuffer` wrapper at `0x1af2237d0` sends exactly that: one scalar input and
+`0x48` bytes of structure input, no outputs. The framework strings include
+`SwapSetBrightness: Brightness control is not enabled`, so this is the swap-brightness
+transaction. Our kernel currently falls through to `default:` and returns success without
+reading the structure.
+
+**What to look for in the nine words.** A brightness level (millinits, e.g. 750000), a flags or
+channel word, and possibly a completion token/port. If a token must be signalled, mirror it in
+`SweetFramebuffer`; if the structure is purely parameters, apply the brightness phase 2 on the
+millinit field (DCS `0x51`, DTB `bl-min` 2, `bl-max` 0x7ff).
+
+**`0132` is ruled out (static).** XNU's async MIG completion is not the wait: the userland
+IOMFB framework does not import `IOConnectCallAsyncScalarMethod`/`AsyncStructMethod`, so the
+5 s delay is not an unsent async completion. Do not spend another boot on `0132`.
+
 ### Brightness: the fake backlight stalls the UI; `0129` gates publication and logs selectors (2026-11-10)
 
-**Next action: build and boot `0132`.** `0131` showed that nothing ever registers an IOMFB
-notification port, and that the stall is real (a swipe produced one swap in 5 s). The 5 s wait
-is therefore a MIG async completion that our `externalMethod` override never sends; `0132`
-replies with `sendAsyncResult64` and logs the first `async wake`/`async reply` per selector.
-Boot with `cepheuswdt=0 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1` and swipe: expect the
-`1 swaps (0.2 fps)` buckets to go away and `sel 50` to follow the brightness slider. Full
-reasoning and results are under "`0131` result" below.
+**`0132` was superseded by `0133` (see the section above).** `0131` showed that nothing ever
+registers an IOMFB notification port, and that the stall is real (a swipe produced one swap in
+5 s). The async-completion hypothesis behind `0132` was later ruled out statically; the current
+suspect is the unhandled selector 55 transaction. Full reasoning and results are under
+"`0131` result" below.
 
 **Phase-1 stall (`brightness-on1`, `0127` only).** The user was actively swiping from
 165.689 s to 297.384 s (sessions of 11.5 s, 16.8 s and 30.3 s), and the touch driver logged
