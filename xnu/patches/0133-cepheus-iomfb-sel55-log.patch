@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1007,7 +1007,7 @@
+ 	}
+ 
+ 	/* Brightness-related IOMFB selectors: log every call and its inputs. */
+-	if (selector == 50 || selector == 51 || selector == 84) {
++	if (selector == 50 || selector == 51 || selector == 55 || selector == 84) {
+ 		const uint8_t *data = (const uint8_t *)args->structureInput;
+ 		uint32_t dataLen = args->structureInputSize;
+ 		char name[32];
+@@ -1022,6 +1022,19 @@
+ 		    data != NULL && dataLen > 1 ? data[1] : 0,
+ 		    data != NULL && dataLen > 2 ? data[2] : 0,
+ 		    data != NULL && dataLen > 3 ? data[3] : 0);
++		if (selector == 55 && data != NULL && dataLen > 0) {
++			uint64_t w[9] = {};
++			uint32_t n = dataLen < sizeof(w) ? dataLen : (uint32_t)sizeof(w);
++
++			memcpy(w, data, n);
++			IOLog("SWEET FB: %s sel 55 struct:"
++			    " %llx %llx %llx %llx %llx %llx %llx %llx %llx\n", name,
++			    (unsigned long long)w[0], (unsigned long long)w[1],
++			    (unsigned long long)w[2], (unsigned long long)w[3],
++			    (unsigned long long)w[4], (unsigned long long)w[5],
++			    (unsigned long long)w[6], (unsigned long long)w[7],
++			    (unsigned long long)w[8]);
++		}
+ 	}
+ 
+ 	switch (selector) {
