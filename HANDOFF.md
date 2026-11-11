@@ -26,8 +26,8 @@ record+`0x2e7` (`obj+0x2ff`) and nits as a double at record+`0x2ec` (`obj+0x304`
 `[obj+0xb39]` clear it only logs `SwapSetBrightness: Brightness control is not enabled` and
 writes nothing. `SwapSetBrightnessLimit` (`0x1af2275dc`, `+0x6f8`) uses record+`0x2e8`/
 `+0x2f4`; `+0x700` record+`0x2e9`/`+0x2fc`; `+0x708` record+`0x2ea`/`+0x304`; `+0x710`
-record+`0x2eb`/`+0x363`; `+0x718` (ambient lux) record+`0x37b`/`+0x37f`; `+0x720` record+
-`0x383`/`+0x387`.
+(ambient lux) record+`0x2eb`/`+0x363`; `+0x718` (contrast enhancer) record+`0x37b`/`+0x37f`;
+`+0x720` (user luminance) record+`0x383`/`+0x387`.
 
 **The 5 s stall.** CoreBrightness commits brightness with a swap-done callback
 (`CommitBrightness: %f with swap done callback`, block `0x1af0bd25c`); success logs
@@ -36,13 +36,16 @@ record+`0x2eb`/`+0x363`; `+0x718` (ambient lux) record+`0x37b`/`+0x37f`; `+0x720
 hypothesis is a brightness commit waiting for a display swap-done signal, not a MIG async
 completion.
 
-**Next action (logging only).** Add `0134`: at `SwapEnd`, when `sweetfb_sel_log=1`, dump the
-swap record words around `+0x2e0..+0x3a0` (flags and doubles above). Boot `cepheuswdt=0
-cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, move the slider, and confirm whether the
-record ever carries a nonzero brightness double. In parallel, trace what fires CoreBrightness's
-swap-done callback and whether the kernel can signal it (`SwapEnd`/`SwapWait`/notification).
-Only after that is understood should the nits be applied to DCS `0x51` (DTB `bl-min` 2,
-`bl-max` 0x7ff). The panel is still not touched.
+**`0134` (written, not yet booted).** With `sweetfb_sel_log=1`, `AppleCLCD::swap` now dumps
+every `SwapEnd` record: presence bytes `p` (+0x2e2) and `b` (+0x2e7..+0x2eb), the five doubles
+as raw hex, the nits double also as milli-nits, and the two floats. Boot `cepheuswdt=0
+cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, move the Control Center brightness slider, and
+look for `SWEET FB: rec p .. b .. n <x>.<yyy> raw ...`. If `b` stays `0000000000` and `n` stays
+`0.000` while the slider moves, the BC control never matched and `SwapSetBrightness` is not
+writing the record; the next step is then to make the fake backlight pass BCBrtControl
+validation (capabilities/container/max/min nits, `IODisplayParameters`). If `n` becomes
+nonzero, the record path works and what remains is mapping it to DCS `0x51` (DTB `bl-min` 2,
+`bl-max` 0x7ff) and the 5 s commit wait. The panel is still not touched.
 
 **`0132` is ruled out (static).** XNU's async MIG completion is not the wait: the userland
 IOMFB framework does not import `IOConnectCallAsyncScalarMethod`/`AsyncStructMethod`, so the

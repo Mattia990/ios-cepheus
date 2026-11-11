@@ -209,6 +209,10 @@ Of the ~81 original ios-sweet kernel patches:
   brightness call: selector 50 is `SetBrightnessCorrection`, and the real level reaches the
   kernel through `IOMobileFramebufferSwapSetBrightness` → `BCBrtControlSetNits` and the
   `SwapEnd` record (flag +0x2e7, nits double +0x2ec)
+- 0134 backlight: with `sweetfb_sel_log=1`, dump the brightness fields of every `SwapEnd`
+  record in `AppleCLCD::swap`: presence bytes +0x2e2 and +0x2e7..+0x2eb, doubles +0x2ec
+  (nits, also printed as milli-nits), +0x2f4, +0x2fc, +0x304, +0x363, and floats +0x37f /
+  +0x387; logging only, panel unchanged
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

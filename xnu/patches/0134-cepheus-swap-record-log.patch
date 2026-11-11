@@ -1,0 +1,59 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -601,6 +601,45 @@
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++
++/*
++ * Boot-arg sweetfb_sel_log=1: dump the brightness fields of the swap record.
++ * SwapSetBrightness in the userland IOMFB framework caches what CoreBrightness
++ * committed here, and SwapEnd sends the whole record (framework object + 0x18)
++ * to the kernel.  Flags: +0x2e7 brightness, +0x2e8 limit, +0x2e9 EDR,
++ * +0x2ea EDR headroom, +0x2eb ambient lux; the doubles follow at +0x2ec,
++ * +0x2f4, +0x2fc, +0x304 and +0x363.  +0x2e2 is the params-present flag,
++ * +0x37f the contrast enhancer and +0x387 the user luminance (both float).
++ * Read-only: nothing here touches the panel.
++ */
++static void
++sweet_fb_dump_swap_rec(const uint8_t *rec)
++{
++	uint64_t nits, limit, edr, hdr, lux;
++	uint32_t ce, lum;
++	double d;
++	int64_t milli;
++
++	memcpy(&nits, rec + 0x2ec, sizeof(nits));
++	memcpy(&limit, rec + 0x2f4, sizeof(limit));
++	memcpy(&edr, rec + 0x2fc, sizeof(edr));
++	memcpy(&hdr, rec + 0x304, sizeof(hdr));
++	memcpy(&lux, rec + 0x363, sizeof(lux));
++	memcpy(&ce, rec + 0x37f, sizeof(ce));
++	memcpy(&lum, rec + 0x387, sizeof(lum));
++	memcpy(&d, rec + 0x2ec, sizeof(d));
++	milli = (d > -1000000.0 && d < 1000000.0) ?
++	    (int64_t)(d * 1000.0 + (d < 0 ? -0.5 : 0.5)) : 0;
++	IOLog("SWEET FB: rec p %02x b %02x%02x%02x%02x%02x n %lld.%03lld"
++	    " raw %llx %llx %llx %llx %llx ce %08x lum %08x\n",
++	    rec[0x2e2],
++	    rec[0x2e7], rec[0x2e8], rec[0x2e9], rec[0x2ea], rec[0x2eb],
++	    (long long)(milli / 1000),
++	    (long long)(milli < 0 ? -(milli % 1000) : milli % 1000),
++	    (unsigned long long)nits, (unsigned long long)limit,
++	    (unsigned long long)edr, (unsigned long long)hdr,
++	    (unsigned long long)lux, ce, lum);
++}
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -612,6 +651,9 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	if (sweet_fb_sel_log) {
++		sweet_fb_dump_swap_rec(rec);
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
