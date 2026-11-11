@@ -204,9 +204,11 @@ Of the ~81 original ios-sweet kernel patches:
   override directly, so XNU never sent the completion and CoreBrightness/backboardd waited on
   its own 5 s timeout. Logs the first async call/reply per selector, `sweetfb_async_log=1` logs
   all of them; no reply is sent when `asyncWakePort` is null
-- 0133 backlight: log selector 55's 72-byte structure input as nine u64 words
-  (`sweetfb_sel_log=1`), the call backboardd makes immediately before the 5 s cadence; logging
-  only, panel unchanged
+- 0133 backlight: log selector 55 (`_IOMobileFramebufferSetMatrix`, scalar + 72-byte 3x3
+  matrix) as nine u64 words with `sweetfb_sel_log=1`; logging only, panel unchanged. Not the
+  brightness call: selector 50 is `SetBrightnessCorrection`, and the real level reaches the
+  kernel through `IOMobileFramebufferSwapSetBrightness` → `BCBrtControlSetNits` and the
+  `SwapEnd` record (flag +0x2e7, nits double +0x2ec)
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

@@ -5,26 +5,44 @@ Last updated **2026-11-11** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Brightness: selector 55 is the 72-byte transaction that starts the 5 s cadence (2026-11-11)
+### Brightness: selector 55 is SetMatrix; brightness rides in the SwapEnd record (2026-11-11)
 
-**Next action: build and boot `0133`.** The userland-side 5 s wait is still unexplained, but
-`0133` now logs the one IOMFB call that precedes it. Boot with `cepheuswdt=0
-cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, wait for SpringBoard, swipe, and move the
-brightness slider. Capture the `SWEET FB: <proc> sel 55 struct:` lines and the 5 s swap stats.
-`0133` is logging only: the panel is still not touched.
+**Correction to the earlier note.** Selector 55 is `_IOMobileFramebufferSetMatrix`
+(`0x1af2237d0`): one scalar input (`9` in the gate3 run) plus a 72-byte 3x3 matrix, no outputs.
+Selector 50 is `_IOMobileFramebufferSetBrightnessCorrection` (`0x1af223610`, vtable `+0x7c8`).
+Neither one carries the brightness level, so `0133` is correct logging of a different call and
+does not answer the brightness question. Do not boot just for selector 55.
 
-**Why selector 55.** In `brightness-gate3` backboardd called `sel 55` with scalar `9` and a
-72-byte structure at 60.306 s, immediately followed by `sel 50` and the first 5 s-cadence swap.
-The `IOMobileFramebuffer` wrapper at `0x1af2237d0` sends exactly that: one scalar input and
-`0x48` bytes of structure input, no outputs. The framework strings include
-`SwapSetBrightness: Brightness control is not enabled`, so this is the swap-brightness
-transaction. Our kernel currently falls through to `default:` and returns success without
-reading the structure.
+**The real brightness stack.** `IOMobileFramebuffer.framework` loads
+`BrightnessControl.framework` and resolves `BCBrtControl*` functions.
+`_IOMobileFramebufferSetBrightnessControlCallback` (`0x1af225b70`) installs the monitor
+callback `0x1af225ddc`: a BC control that is valid, has capabilities, and matches the IOMFB
+`BuiltIn`/`DFR`/`DisplayContainerID` becomes this display's control. On match it sets
+`[obj+0xb39]=1`, stores the BC object at `[obj+0xb70]`, MaxNits at `[obj+0xb48]`, MinNits at
+`[obj+0xb50]`, and calls `BCBrtControlSetDisplayService`. `_IOMobileFramebufferSwapSetBrightness`
+(`0x1af227540`, vtable `+0x6f0`) then calls `BCBrtControlSetNits` with the value and caches it
+in the `obj+0x18`/`0x46c` swap record that `SwapEnd` sends to the kernel: present flag at
+record+`0x2e7` (`obj+0x2ff`) and nits as a double at record+`0x2ec` (`obj+0x304`). With
+`[obj+0xb39]` clear it only logs `SwapSetBrightness: Brightness control is not enabled` and
+writes nothing. `SwapSetBrightnessLimit` (`0x1af2275dc`, `+0x6f8`) uses record+`0x2e8`/
+`+0x2f4`; `+0x700` record+`0x2e9`/`+0x2fc`; `+0x708` record+`0x2ea`/`+0x304`; `+0x710`
+record+`0x2eb`/`+0x363`; `+0x718` (ambient lux) record+`0x37b`/`+0x37f`; `+0x720` record+
+`0x383`/`+0x387`.
 
-**What to look for in the nine words.** A brightness level (millinits, e.g. 750000), a flags or
-channel word, and possibly a completion token/port. If a token must be signalled, mirror it in
-`SweetFramebuffer`; if the structure is purely parameters, apply the brightness phase 2 on the
-millinit field (DCS `0x51`, DTB `bl-min` 2, `bl-max` 0x7ff).
+**The 5 s stall.** CoreBrightness commits brightness with a swap-done callback
+(`CommitBrightness: %f with swap done callback`, block `0x1af0bd25c`); success logs
+`... has been swapped on the display` (`0x1af0bd2ec`) and the observed 5 s spacing matches
+`Last update has not been swapped on display in timeout %f.` (`0x1af0bd83c`). The leading
+hypothesis is a brightness commit waiting for a display swap-done signal, not a MIG async
+completion.
+
+**Next action (logging only).** Add `0134`: at `SwapEnd`, when `sweetfb_sel_log=1`, dump the
+swap record words around `+0x2e0..+0x3a0` (flags and doubles above). Boot `cepheuswdt=0
+cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, move the slider, and confirm whether the
+record ever carries a nonzero brightness double. In parallel, trace what fires CoreBrightness's
+swap-done callback and whether the kernel can signal it (`SwapEnd`/`SwapWait`/notification).
+Only after that is understood should the nits be applied to DCS `0x51` (DTB `bl-min` 2,
+`bl-max` 0x7ff). The panel is still not touched.
 
 **`0132` is ruled out (static).** XNU's async MIG completion is not the wait: the userland
 IOMFB framework does not import `IOConnectCallAsyncScalarMethod`/`AsyncStructMethod`, so the
@@ -32,11 +50,11 @@ IOMFB framework does not import `IOConnectCallAsyncScalarMethod`/`AsyncStructMet
 
 ### Brightness: the fake backlight stalls the UI; `0129` gates publication and logs selectors (2026-11-10)
 
-**`0132` was superseded by `0133` (see the section above).** `0131` showed that nothing ever
+**`0131` and `0132` were superseded (see the section above).** `0131` showed that nothing ever
 registers an IOMFB notification port, and that the stall is real (a swipe produced one swap in
-5 s). The async-completion hypothesis behind `0132` was later ruled out statically; the current
-suspect is the unhandled selector 55 transaction. Full reasoning and results are under
-"`0131` result" below.
+5 s). The async-completion hypothesis behind `0132` was ruled out statically; the current
+suspect is the CoreBrightness brightness commit waiting for a swap-done signal. Full reasoning
+and results are under "`0131` result" below.
 
 **Phase-1 stall (`brightness-on1`, `0127` only).** The user was actively swiping from
 165.689 s to 297.384 s (sessions of 11.5 s, 16.8 s and 30.3 s), and the touch driver logged
