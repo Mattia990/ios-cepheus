@@ -213,6 +213,14 @@ Of the ~81 original ios-sweet kernel patches:
   record in `AppleCLCD::swap`: presence bytes +0x2e2 and +0x2e7..+0x2eb, doubles +0x2ec
   (nits, also printed as milli-nits), +0x2f4, +0x2fc, +0x304, +0x363, and floats +0x37f /
   +0x387; logging only, panel unchanged
+- 0135 backlight: publish the four `IODisplayParameters` sub-dictionaries (`brightness`
+  0..0x10000 value 0x8000, `rawBrightness` 0..0x7ff, `BrightnessMicroAmps` 0..25000,
+  `BrightnessMilliNits` 0..600000 with `uncalMilliNits`) and
+  `force-brightness-control=true` on the fake `AppleARMBacklight`, matching the value set
+  the iPhone X AppleARMBacklight driver builds; `BCAppleBacklightBrtControl
+  initWithService:` returns nil without `IODisplayParameters`, so the IOMFB match never
+  sets the brightness flag (`+0xb39`) and `SwapSetBrightness` stays inert. ARM mode only
+  (`sweetbl=1`); `sweetbl=3` is unchanged, panel brightness still untouched
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

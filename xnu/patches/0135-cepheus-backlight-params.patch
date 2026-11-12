@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -270,6 +270,66 @@
+ }
+ 
+ static void
++sweet_bl_set_number(OSDictionary *dict, const char *key, uint64_t value)
++{
++	OSNumber *number = OSNumber::withNumber(value, 32);
++
++	if (number != NULL) {
++		dict->setObject(key, number);
++		number->release();
++	}
++}
++
++static void
++sweet_bl_add_params(OSDictionary *params, const char *name, unsigned int capacity,
++    uint64_t min, uint64_t max, uint64_t value)
++{
++	OSDictionary *dict = OSDictionary::withCapacity(capacity);
++
++	if (dict == NULL) {
++		return;
++	}
++	sweet_bl_set_number(dict, "min", min);
++	sweet_bl_set_number(dict, "max", max);
++	sweet_bl_set_number(dict, "value", value);
++	if (capacity > 3) {
++		sweet_bl_set_number(dict, "uncalMilliNits", 0);
++	}
++	params->setObject(name, dict);
++	dict->release();
++}
++
++/*
++ * BCAppleBacklightBrtControl::initWithService: reads IODisplayParameters from
++ * the service and returns nil when it is absent; the same dictionary supplies
++ * the user-brightness, nits and current ranges it reports.  Publish the same
++ * shape AppleARMBacklight uses on the iPhone X (the PWM/ARM driver builds it
++ * in start: brightness in 16.16, raw DBV 0..0x7ff, 0..25 mA, 0..600 nits).
++ * force-brightness-control sets BCAppleBacklightBrtControl's _override flag,
++ * without which setNits: rejects the embedded panel as NotSupported.
++ */
++static void
++sweet_bl_publish_parameters(IOService *backlight)
++{
++	OSDictionary *params = OSDictionary::withCapacity(3);
++
++	if (params == NULL) {
++		IOLog("SWEET BL: cannot allocate IODisplayParameters\n");
++		return;
++	}
++	sweet_bl_add_params(params, "brightness", 3, 0, 0x10000, 0x8000);
++	sweet_bl_add_params(params, "rawBrightness", 3, 0, 0x7ff, 0);
++	sweet_bl_add_params(params, "BrightnessMicroAmps", 3, 0, 25000, 0);
++	sweet_bl_add_params(params, "BrightnessMilliNits", 4, 0, 600000, 0);
++	backlight->setProperty("IODisplayParameters", params);
++	params->release();
++	backlight->setProperty("force-brightness-control", true);
++	IOLog("SWEET BL: IODisplayParameters published"
++	    " (brightness 0..0x10000 value 0x8000, raw 0..0x7ff,"
++	    " amps 0..25000, nits 0..600000)\n");
++}
++
++static void
+ sweet_bl_publish(IOService *parent, bool display_on)
+ {
+ 	static bool published;
+@@ -316,6 +376,9 @@
+ 	backlight->setProperty("use-Nits2DACTable", 1ULL, 32);
+ 	backlight->setProperty("max-nit-value", 0x2eeULL, 32);
+ 	backlight->setProperty("pre-strobe-nit", 0x2a2ULL, 32);
++	if (!non_arm) {
++		sweet_bl_publish_parameters(backlight);
++	}
+ 	if (!backlight->attach(parent)) {
+ 		IOLog("SWEET BL: attach failed\n");
+ 		OSSafeReleaseNULL(backlight);

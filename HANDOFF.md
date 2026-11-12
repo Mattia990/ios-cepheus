@@ -1,9 +1,62 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-11** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-12** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Brightness: the BC control never matched; `0135` publishes IODisplayParameters (2026-11-12)
+
+**`0134` result (`brightness-rec1`).** Booted from `0134` with `cepheuswdt=0
+cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. All 33 `SWEET FB: rec` lines are
+`p 00 b 0000000000 n 0.000 raw 0 0 0 0 0`; there is no `sel 51` and no `SWEET FB:
+setProperties`. The UI stayed at 0.2 fps and frames stopped at 380.334 s; the slider
+attempt at 410.398-416.177 s produced no swaps at all. `SwapSetBrightness` never took its
+cached path, i.e. `[IOMFB+0xb39]` is still 0 because the BC control never matched.
+
+**Why the match fails.** The IOMFB match callback (`0x1af225ddc`) requires
+`BCBrtControlGetIsValid` and non-nil capabilities; the embedded-panel path also requires
+`capabilities["BuiltIn"]`. `BCAppleBacklightBrtControl initWithService:` (`0x20314a660`)
+reads `IODisplayParameters` from the service and returns nil at `0x20314b80c` when the
+property is absent, so the fake service is discarded before `BuiltIn`/`MaxNits` can be
+built. The accepted shape was recovered from the iPhone X `AppleARMBacklight` in the
+`AppleARMPlatform` kext (`__PLK_TEXT_EXEC`, `0xfffffff005616b60`-`0xfffffff005616d40`):
+
+- `brightness`: `min` 0, `max` 0x10000, `value` 0x8000 (16.16 user brightness)
+- `rawBrightness`: `min` 0, `max` 0x7ff, `value` 0
+- `BrightnessMicroAmps`: `min` 0, `max` 25000, `value` 0 (BC multiplies by 1000)
+- `BrightnessMilliNits`: `min` 0, `max` 600000, `value` 0, `uncalMilliNits` 0 (BC
+  divides by 1000, so 600 nits)
+- `force-brightness-control` = true sets BCAppleBacklight's `_override` (`+0xa2`);
+  without it `setNits:error:`/`getNitsWithError:` reject the embedded panel with
+  `NotSupported`
+
+BC then reports `_minUser` 0/`_maxUser` 0x10000, `_maxNits` 600/`_minNits` 0 and builds
+`capabilities` with `BuiltIn`, `MaxNits`/`MaxNitsPanel` 600, `MinNits` 0 and `RegistryID`.
+`BuiltIn` is exactly what the embedded-panel match tests.
+
+**`0135` (written, not yet booted).** `sweet_bl_publish_parameters()` sets those four
+sub-dictionaries and `force-brightness-control=true` on the fake `AppleARMBacklight` before
+attach, only in ARM mode (`!non_arm`); `sweetbl=3` semantics are unchanged. The panel is
+still untouched.
+
+**Test.** Build from `0135` and `fastboot boot` with `cepheuswdt=0 cepheustouchlog=1
+sweetbl=1 sweetfb_sel_log=1`. Wait for SpringBoard, then move the Control Center brightness
+slider and report. Expected evidence, in order:
+
+1. `SWEET BL: IODisplayParameters published (brightness 0..0x10000 value 0x8000, raw
+   0..0x7ff, amps 0..25000, nits 0..600000)` immediately before
+   `SWEET BL: AppleARMBacklight published (DBV 0x8b..0x7ff)`.
+2. The IOMFB/BC match: `SWEET FB: rec` lines gain `p 01` and `b 01...`, and `n` becomes a
+   nonzero nit value (nonzero `raw` doubles are optional).
+3. `SWEET BL: setProperties brightness-nits = <nits*65536> (0x...)` when the slider moves
+   (`setNits` writes to the fake service; decode by dividing by 65536). `sel 51` may also
+   appear.
+
+If the record gains `b 01` and nits but the UI is still 0.2 fps, the remaining problem is
+the CoreBrightness swap-done wait, not the match. Only after the BC match and registry
+write are confirmed do we map the received nits to DCS `0x51` (DTB `bl-min` 2, `bl-max`
+0x7ff) and touch the panel.
 
 ### Brightness: selector 55 is SetMatrix; brightness rides in the SwapEnd record (2026-11-11)
 
@@ -36,7 +89,7 @@ writes nothing. `SwapSetBrightnessLimit` (`0x1af2275dc`, `+0x6f8`) uses record+`
 hypothesis is a brightness commit waiting for a display swap-done signal, not a MIG async
 completion.
 
-**`0134` (written, not yet booted).** With `sweetfb_sel_log=1`, `AppleCLCD::swap` now dumps
+**`0134` (booted as `brightness-rec1`; see the section above).** With `sweetfb_sel_log=1`, `AppleCLCD::swap` now dumps
 every `SwapEnd` record: presence bytes `p` (+0x2e2) and `b` (+0x2e7..+0x2eb), the five doubles
 as raw hex, the nits double also as milli-nits, and the two floats. Boot `cepheuswdt=0
 cepheustouchlog=1 sweetbl=3 sweetfb_sel_log=1`, move the Control Center brightness slider, and
