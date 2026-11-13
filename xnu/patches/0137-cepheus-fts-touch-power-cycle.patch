@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -26,7 +26,9 @@
+  * cepheustouchlog=1 log every event, cepheustouchreset2=N extra resets
+  * after the sysinfo read (default 1; Xiaomi's probe does two),
+  * cepheustouchsysinfo=0 skip the 0xa6 frame read, cepheustouchpoll=0 read
+- * only when IRQ is low instead of also polling every 10 ms.
++ * only when IRQ is low instead of also polling every 10 ms,
++ * cepheustouchpwr=0 keep the touch rails on at start, and
++ * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+  */
+@@ -44,6 +46,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets,
++    const uint32_t *values);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_fts_init(void);
+ 
+@@ -103,8 +107,11 @@
+ static struct {
+ 	vm_offset_t gpio_n, gpio_s;
+ 	bool started, dead;
++	bool recover, recover_enable;
+ 	int log;
+ 	unsigned sda, scl;
++	unsigned recoveries;
++	uint64_t sense_time;
+ 	uint32_t active;
+ 	int x[FTS_MAX], y[FTS_MAX];
+ } ft;
+@@ -545,6 +552,51 @@
+ 		fts_wait(5);
+ 	}
+ 	return ETIMEDOUT;
++}
++
++/*
++ * Both touch rails are dedicated to the controller: vdd-supply is
++ * touch_vddio_vreg (fixed regulator, GPIO 84) and avdd-supply is PM8150L L1
++ * (RPMh ldoc1, 1.8 V). Assert reset and remove both before powering up again.
++ */
++static void
++fts_rails_off(void)
++{
++	const uint32_t enable_off[1] = { 4 };
++	const uint32_t value_off[1] = { 0 };
++
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, false);
++	(void)sweet_rpmh_write("ldoc1", 1, enable_off, value_off);
++	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, false);
++	fts_wait(100);
++}
++
++/*
++ * A warm reboot (TWRP -> bootloader -> fastboot boot) leaves the controller's
++ * analog front end powered. A reset alone does not clear that state: the first
++ * force calibration then fails (43 05 30/31 or water mode) and the chip goes
++ * silent. Cycling both rails reproduces a cold boot.
++ */
++static int
++fts_power_cycle(void)
++{
++	fts_release_all();
++	fts_rails_off();
++	int aerr = sweet_rpmh_vreg_enable("ldoc1", 1800);
++	fts_wait(20);
++	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
++	fts_wait(4);
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, true);
++	fts_wait(50);
++	if (!fts_bb_recover()) {
++		printf("SWEET FTS: power cycle: SCL stuck low\n");
++		return EIO;
++	}
++	int err = fts_wait_ready(500);
++	if (err) {
++		printf("SWEET FTS: power cycle: ready err=%d avdd=%d\n", err, aerr);
++	}
++	return err;
+ }
+ 
+ /*
+@@ -606,7 +658,28 @@
+ 		}
+ 		fts_release_all();
+ 		(void)fts_sense_on();
++		ft.sense_time = mach_absolute_time();
+ 		break;
++	case FTS_EVT_STATUS:
++		/*
++		 * Early force-calibration failure or water mode means the chip
++		 * came up with a bad baseline (warm reboot). Recover while the
++		 * scan is still new; no real touch is possible this early.
++		 */
++		if (ft.recover_enable && ft.recoveries < 2u &&
++		    mach_absolute_time() - ft.sense_time <
++		    5ull * 1000ull * 1000ull * FTS_TICKS_PER_US) {
++			if (ev[1] == 0x05u &&
++			    (ev[2] == 0x30u || ev[2] == 0x31u)) {
++				ft.recover = true;
++			} else if (ev[1] == 0x06u && ev[2] == 0x01u) {
++				ft.recover = true;
++			}
++		}
++		if (ft.log) {
++			fts_log_event("other", ev);
++		}
++		break;
+ 	case FTS_EVT_ERROR:
+ 		fts_log_event("error", ev);
+ 		break;
+@@ -657,12 +730,25 @@
+ 	ft.sda = FTS_PIN_SDA;
+ 	ft.scl = FTS_PIN_SCL;
+ 	fts_pins();
+-	/* VDDIO first (fixed regulator on GPIO 84, 4 ms startup delay). */
++	/*
++	 * Power-cycle both dedicated touch rails before the first reset. A
++	 * warm reboot leaves the controller powered with a stale analog
++	 * baseline; reset alone then makes the first force calibration fail
++	 * (43 05 30/31 or water mode) and the chip stays silent. This is the
++	 * cold-boot sequence; cepheustouchpwr=0 keeps the old power-up.
++	 */
++	unsigned pwr = 1;
++	(void)PE_parse_boot_argn("cepheustouchpwr", &pwr, sizeof(pwr));
++	if (pwr) {
++		fts_rails_off();
++	}
++	/* AVDD is PM8150L L1 (RPMh ldoc1); VDDIO is GPIO 84 (4 ms startup). */
++	int perr = sweet_rpmh_vreg_enable("ldoc1", 1800);
++	fts_wait(20);
+ 	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
+ 	fts_wait(4);
+-	/* AVDD is PM8150L L1 (RPMh ldoc1). Keep going if the rail is already on. */
+-	int perr = sweet_rpmh_vreg_enable("ldoc1", 1800);
+-	printf("SWEET FTS: vddio gpio 84 high, avdd ldoc1 err=%d\n", perr);
++	printf("SWEET FTS: rails %s, avdd ldoc1 err=%d\n",
++	    pwr ? "cycled" : "unchanged", perr);
+ 	fts_wait(20);
+ 	/*
+ 	 * Board notes say SDA=55/SCL=56; if that order is wrong the chip never
+@@ -686,12 +772,15 @@
+ 	}
+ 	printf("SWEET FTS: bus sda=%u scl=%u\n", ft.sda, ft.scl);
+ 
+-	unsigned do_si = 1, extra_resets = 1, poll_enable = 1;
++	unsigned do_si = 1, extra_resets = 1, poll_enable = 1, recover_enable = 1;
+ 	(void)PE_parse_boot_argn("cepheustouchsysinfo", &do_si, sizeof(do_si));
+ 	(void)PE_parse_boot_argn("cepheustouchreset2", &extra_resets,
+ 	    sizeof(extra_resets));
+ 	(void)PE_parse_boot_argn("cepheustouchpoll", &poll_enable,
+ 	    sizeof(poll_enable));
++	(void)PE_parse_boot_argn("cepheustouchrecover", &recover_enable,
++	    sizeof(recover_enable));
++	ft.recover_enable = recover_enable != 0;
+ 	if (extra_resets > 5u) {
+ 		extra_resets = 5u;
+ 	}
+@@ -753,6 +842,7 @@
+ 	if (err) {
+ 		goto out;
+ 	}
++	ft.sense_time = mach_absolute_time();
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!ft.dead) {
+ 		/* The IRQ line (active low) says events are pending; also read
+@@ -789,6 +879,21 @@
+ 				break;
+ 			}
+ 		}
++		if (ft.recover && !ft.dead) {
++			ft.recover = false;
++			ft.recoveries++;
++			printf("SWEET FTS: early status failure; power cycle %u\n",
++			    ft.recoveries);
++			int rerr = fts_power_cycle();
++			if (!rerr) {
++				rerr = fts_sense_on();
++			}
++			printf("SWEET FTS: power cycle %u err=%d\n",
++			    ft.recoveries, rerr);
++			if (!rerr) {
++				ft.sense_time = mach_absolute_time();
++			}
++		}
+ 		if ((ticks % 2000u) == 0u) {
+ 			printf("SWEET FTS: alive ticks=%u irq=%u errors=%u\n",
+ 			    ticks,

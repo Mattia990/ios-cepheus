@@ -5,6 +5,42 @@ Last updated **2026-11-13** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### `0136` confirmed end-to-end; warm-boot touch fix in `0137` (2026-11-13)
+
+**`0136` brightness result (`brightness-dcs4`, cold boot).** The user cold-booted to
+fastboot and booted `work/boot/kernel-brightness/kernel.development.sweet` with
+`cepheuswdt=0 cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. Touch initialized cleanly
+(`sense on err=0`, no early `43 05 30/31`) and the Control Center slider changed the panel
+brightness.
+
+The DCS path is proven: the display-open write `brightness = 1` / `backlight-level = 0`
+sent level 2 (`DCS 0x51 level 0x002 ... int 0x00000501`), and the first slider moves sent
+`572 -> 0x013 (19)`, `857 -> 0x01c (28)`, `1428 -> 0x02e (46)`, `3856 -> 0x07a (122)`,
+`4427 -> 0x08c (140)`, `4569 -> 0x090 (144)`, `4712 -> 0x095 (149)`. These match
+`2 + value * (0x7ff - 2) / 0x10000`; `int` bit 0 (`0x501`) shows command-done, so no
+further DCS/FIFO debugging is needed. The first eight sends are logged; later slider
+values still update the panel even though they are not printed.
+
+**Warm-boot touch failure.** All three `0136` runs started from TWRP via
+`fastboot boot` failed touch: an early `43 05 31` or `43 05 30` force-cal event, a burst of
+edge contacts, then silence while the driver stayed alive. A diagnostic run
+(`touch-warm1`) delayed FTS to `cepheustouchdelay=50`, so sense-on happened at 59.7 s,
+10 s *after* `SWEET FB: display on` at 49.9 s; it still failed (`43 05 30` at 63.5 s, then
+water mode). Calibration order is therefore not the cause: the controller starts from a
+bad analog/power state on warm boots, and a reset alone does not clear it.
+
+**`0137` touch (written, not yet built).** Both touch rails are dedicated to the
+controller: VDDIO is `touch_vddio_vreg` (GPIO 84) and AVDD is PM8150L L1
+(`rpmh-regulator-ldoc1`, 1.8 V). At init the driver now asserts reset, disables AVDD through
+`sweet_rpmh_write("ldoc1", ...)`, drives VDDIO low, waits 100 ms, then powers AVDD, VDDIO
+and reset back up before the first probe. If an early `43 05 30/31` or water-mode enter
+arrives within 5 s of sense-on, it repeats the power cycle plus sense-on (at most twice).
+`cepheustouchpwr=0` keeps the old power-up and `cepheustouchrecover=0` disables the
+recovery, for A/B runs. Build `0137` and test a **warm** boot first (TWRP -> bootloader ->
+`fastboot boot`), then a cold boot; the expected new line is
+`SWEET FTS: rails cycled, avdd ldoc1 err=0`, followed by a normal `sense on` and no early
+force-cal event.
+
 ### Brightness: `0135` matched the BC control; `0136` drives DCS 0x51 (2026-11-13)
 
 **`0134` result (`brightness-rec1`).** Booted from `0134` with `cepheuswdt=0
@@ -52,7 +88,7 @@ BC then reports `_minUser` 0/`_maxUser` 0x10000, `_maxNits` 600/`_minNits` 0 and
 The panel did not change because `AppleARMBacklight::setProperties` only logged the value.
 `0136` now maps it and sends the panel command.
 
-**`0136` (written, not yet booted).** In `AppleARMBacklight::setProperties`, `brightness`
+**`0136` (booted 2026-11-13; result above).** In `AppleARMBacklight::setProperties`, `brightness`
 (or `backlight-level`) is mapped from 16.16 to the EA8076 DCS range: 0 stays 0, everything
 else is `2 + value * (0x7ff - 2) / 0x10000` (live DTB `qcom,mdss-dsi-bl-min-level` 2,
 `qcom,mdss-dsi-bl-max-level` 0x7ff). The panel takes DCS `0x51` with a two-byte big-endian
@@ -72,9 +108,9 @@ the FIFO (after four failed waits it assumes the status is not visible and takes
 back). `sweetbl_dcs=0` disables the DCS writes (default 1); `sweetbl=3` is unchanged and
 still logging-only.
 
-**Test.** Build from `0136` and `fastboot boot` with `cepheuswdt=0 cepheustouchlog=1
-sweetbl=1 sweetfb_sel_log=1`. Wait for SpringBoard, then move the Control Center
-brightness slider. Expected evidence, in order:
+**Test (passed on `brightness-dcs4`).** Boot `0136` with `cepheuswdt=0
+cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. Wait for SpringBoard, then move the
+Control Center brightness slider. Expected evidence, in order:
 
 1. On the first slider write, `SWEET BL: DSI ctrl0 hw 0x...` with `ctrl` bit 2 set
    (command engine on), plus the raw status/fifo/int/dma values.

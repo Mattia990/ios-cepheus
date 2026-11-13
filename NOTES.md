@@ -230,6 +230,12 @@ Of the ~81 original ios-sweet kernel patches:
   use, logs the first eight sends and defers/reuses the FIFO until `DSI_CMD_MODE_DMA_DONE`.
   `sweetbl_dcs=1` by default, `sweetbl_dcs=0` disables the DCS writes; ARM mode only
   (`sweetbl=3` is unchanged)
+- 0137 touch: power-cycle both dedicated touch rails before the first reset (VDDIO
+  `touch_vddio_vreg` on GPIO 84, AVDD PM8150L L1/ldoc1 at 1.8 V) so a TWRP ->
+  fastboot warm boot starts from the same analog state as a cold boot. Also recover
+  from an early `43 05 30/31` force-cal failure or water-mode enter within 5 s of
+  sense-on by repeating the power cycle and sense-on (at most twice).
+  `cepheustouchpwr=0` and `cepheustouchrecover=0` disable the two parts
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
