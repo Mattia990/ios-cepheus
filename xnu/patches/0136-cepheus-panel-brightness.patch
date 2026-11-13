@@ -1,0 +1,254 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -191,6 +191,224 @@
+ 	return brightness;
+ }
+ 
++/*
++ * Panel backlight.  The EA8076 takes DCS 0x51 with a two-byte, big-endian
++ * level (live DTB: qcom,mdss-dsi-bl-dcs-type-ss, bl-min 2, bl-max 0x7ff).
++ * The downstream driver sends it as a DCS long write, which the DSI
++ * command DMA turns into this 8-byte FIFO image (word count 3, type 0x39,
++ * payload-present and last-packet flags in the ECC byte, 0xff padding):
++ *
++ *   03 00 39 c0  51 msb lsb ff
++ *
++ * XNU does not drive the DSI controller: the ABL left it in command mode
++ * scanning the framebuffer out, so only commands go through DSI0 here.
++ * Use the command FIFO path (TPG DMA) so no IOVA/SMMU setup is needed;
++ * this is the same sequence as dsi_ctrl_hw_cmn_kickoff_fifo_command() and
++ * dsi_ctrl_hw_cmn_reset_cmd_fifo() in the downstream driver.
++ */
++#define SWEET_DSI_CTRL0_PHYS            0xae94000
++#define SWEET_DSI_CTRL0_SIZE            0x400
++
++#define SWEET_DSI_HW_VERSION            0x0000
++#define SWEET_DSI_CTRL                  0x0004
++#define SWEET_DSI_STATUS                0x0008
++#define SWEET_DSI_FIFO_STATUS           0x000c
++#define SWEET_DSI_COMMAND_MODE_DMA_CTRL 0x003c
++#define SWEET_DSI_DMA_CMD_LENGTH        0x004c
++#define SWEET_DSI_CMD_MODE_DMA_SW_TRIGGER 0x0090
++#define SWEET_DSI_INT_CTRL              0x0110
++#define SWEET_DSI_TEST_PATTERN_GEN_CTRL 0x015c
++#define SWEET_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL 0x017c
++#define SWEET_DSI_TPG_DMA_FIFO_RESET    0x01ec
++
++extern "C" uintptr_t ml_io_map(uintptr_t phys_addr, uintptr_t size);
++
++static uint32_t
++sweet_dsi_read(volatile uint32_t *regs, uint32_t offset)
++{
++	return regs[offset / 4];
++}
++
++static void
++sweet_dsi_write(volatile uint32_t *regs, uint32_t offset, uint32_t value)
++{
++	regs[offset / 4] = value;
++}
++
++/*
++ * boot-arg sweetbl_dcs: send the panel DCS 0x51 level from the fake
++ * AppleARMBacklight (default on; 0 leaves the DSI controller untouched).
++ */
++static int
++sweet_bl_dcs_mode(void)
++{
++	static int mode = -1;
++
++	if (mode < 0) {
++		mode = 1;
++		PE_parse_boot_argn("sweetbl_dcs", &mode, sizeof(mode));
++		if (mode < 0) {
++			mode = 0;
++		} else if (mode > 1) {
++			mode = 1;
++		}
++	}
++	return mode;
++}
++
++/* 16.16 user brightness (0..0x10000) -> panel DCS level (0 or 2..0x7ff). */
++static uint32_t
++sweet_bl_level(uint64_t brightness)
++{
++	if (brightness == 0) {
++		return 0;
++	}
++	if (brightness >= 0x10000) {
++		return 0x7ff;
++	}
++	return 2 + (uint32_t)(brightness * (0x7ff - 2) / 0x10000);
++}
++
++static void
++sweet_dsi_reset_cmd_fifo(volatile uint32_t *dsi)
++{
++	sweet_dsi_write(dsi, SWEET_DSI_TEST_PATTERN_GEN_CTRL, 0);
++	sweet_dsi_write(dsi, SWEET_DSI_TPG_DMA_FIFO_RESET, 1);
++	IODelay(1);
++	sweet_dsi_write(dsi, SWEET_DSI_TPG_DMA_FIFO_RESET, 0);
++}
++
++static volatile uint32_t *
++sweet_dsi_ctrl0(void)
++{
++	static volatile uint32_t *dsi;
++	static bool failed;
++
++	if (dsi == NULL && !failed) {
++		uintptr_t va = ml_io_map(SWEET_DSI_CTRL0_PHYS, SWEET_DSI_CTRL0_SIZE);
++
++		if (va == 0) {
++			IOLog("SWEET BL: cannot map DSI ctrl0\n");
++			failed = true;
++		} else {
++			dsi = (volatile uint32_t *)va;
++			IOLog("SWEET BL: DSI ctrl0 hw 0x%08x ctrl 0x%08x status 0x%08x"
++			    " fifo 0x%08x int 0x%08x dma 0x%08x\n",
++			    sweet_dsi_read(dsi, SWEET_DSI_HW_VERSION),
++			    sweet_dsi_read(dsi, SWEET_DSI_CTRL),
++			    sweet_dsi_read(dsi, SWEET_DSI_STATUS),
++			    sweet_dsi_read(dsi, SWEET_DSI_FIFO_STATUS),
++			    sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL),
++			    sweet_dsi_read(dsi, SWEET_DSI_COMMAND_MODE_DMA_CTRL));
++		}
++	}
++	return dsi;
++}
++
++static void
++sweet_bl_dcs_level(uint32_t level)
++{
++	static uint32_t last = ~0u;
++	static bool pending;
++	static unsigned int sends, drops;
++	volatile uint32_t *dsi;
++	uint32_t ctrl, ints, packet0, packet1;
++	int tries;
++
++	if (!sweet_bl_dcs_mode() || level == last) {
++		return;
++	}
++	dsi = sweet_dsi_ctrl0();
++	if (dsi == NULL) {
++		return;
++	}
++
++	/*
++	 * Do not reload the FIFO while the previous command is still being
++	 * fetched.  Normally it is long done by the next brightness write;
++	 * wait a little, then drop this update and let a later one retry
++	 * rather than resetting an in-flight command.  After four failed
++	 * waits assume the completion status is not visible and take the
++	 * FIFO back anyway.
++	 */
++	if (pending) {
++		for (tries = 0; tries < 2000; tries++) {
++			if (sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL) & 1u) {
++				break;
++			}
++			IODelay(10);    /* up to 20 ms */
++		}
++		ints = sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL);
++		if (!(ints & 1u) && ++drops < 4) {
++			if (drops == 1) {
++				IOLog("SWEET BL: DCS 0x51 still busy, deferring"
++				    " level 0x%03x\n", level);
++			}
++			return;
++		}
++		if (ints & 1u) {
++			sweet_dsi_write(dsi, SWEET_DSI_INT_CTRL,
++			    ints & ~(1u << 24));
++			drops = 0;
++		}
++		pending = false;
++	}
++
++	last = level;
++
++	/*
++	 * DCS 0x51, 3-byte long payload [0x51, msb, lsb], packed for the
++	 * command DMA FIFO (the first word is written first, byte 0 first).
++	 */
++	packet0 = 0xc0390003u;          /* 03 00 39 c0: wc=3, long write */
++	packet1 = 0xff000000u | ((level & 0xff) << 16) |
++	    (((level >> 8) & 0xff) << 8) | 0x51u;   /* 51 msb lsb ff */
++
++	/* Start from an empty FIFO, then load the packet. */
++	sweet_dsi_reset_cmd_fifo(dsi);
++	sweet_dsi_write(dsi, SWEET_DSI_TEST_PATTERN_GEN_CTRL,
++	    (1u << 1) | (1u << 2) | (0x3u << 16));
++	sweet_dsi_write(dsi, SWEET_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, packet0);
++	sweet_dsi_write(dsi, SWEET_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, packet1);
++
++	/* Embedded mode: the command bytes come from the FIFO above. */
++	ctrl = sweet_dsi_read(dsi, SWEET_DSI_COMMAND_MODE_DMA_CTRL);
++	ctrl &= ~((1u << 31) | (1u << 30) | (1u << 26));
++	ctrl |= 1u << 28;
++	sweet_dsi_write(dsi, SWEET_DSI_COMMAND_MODE_DMA_CTRL, ctrl);
++
++	/* Clear an old completion, then kick off the 8-byte command. */
++	ints = sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL);
++	if (ints & 1u) {
++		sweet_dsi_write(dsi, SWEET_DSI_INT_CTRL, ints & ~(1u << 24));
++	}
++	sweet_dsi_write(dsi, SWEET_DSI_DMA_CMD_LENGTH, 8);
++	__sync_synchronize();
++	sweet_dsi_write(dsi, SWEET_DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
++	pending = true;
++
++	/* Most commands complete before the slider's next update. */
++	for (tries = 0; tries < 100; tries++) {
++		if (sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL) & 1u) {
++			break;
++		}
++		IODelay(10);    /* up to 1 ms */
++	}
++	ints = sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL);
++	if (sends < 8) {
++		IOLog("SWEET BL: DCS 0x51 level 0x%03x (%u) packet %08x %08x"
++		    " int 0x%08x%s\n", level, level, packet0, packet1, ints,
++		    (ints & 1u) ? "" : " (pending)");
++		sends++;
++	}
++	if (ints & 1u) {
++		sweet_dsi_write(dsi, SWEET_DSI_INT_CTRL, ints & ~(1u << 24));
++		sweet_dsi_reset_cmd_fifo(dsi);
++		drops = 0;
++		pending = false;
++	}
++}
++
+ IOReturn
+ IOMobileFramebuffer::setProperties(OSObject *properties)
+ {
+@@ -208,12 +426,25 @@
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *number;
+ 
+ 	if (dict == NULL) {
+ 		IOLog("SWEET BL: setProperties non-dictionary %p\n", properties);
+ 		return kIOReturnSuccess;
+ 	}
+ 	sweet_log_properties("SWEET BL", this, dict);
++	/*
++	 * CoreBrightness's slider path writes both keys with the same 16.16
++	 * value.  brightness-nits is a different unit (and is written as 0
++	 * when the display opens), so only these two drive the panel.
++	 */
++	number = OSDynamicCast(OSNumber, dict->getObject("brightness"));
++	if (number == NULL) {
++		number = OSDynamicCast(OSNumber, dict->getObject("backlight-level"));
++	}
++	if (number != NULL) {
++		sweet_bl_dcs_level(sweet_bl_level(number->unsigned64BitValue()));
++	}
+ 	return kIOReturnSuccess;
+ }
+ 

@@ -221,6 +221,15 @@ Of the ~81 original ios-sweet kernel patches:
   initWithService:` returns nil without `IODisplayParameters`, so the IOMFB match never
   sets the brightness flag (`+0xb39`) and `SwapSetBrightness` stays inert. ARM mode only
   (`sweetbl=1`); `sweetbl=3` is unchanged, panel brightness still untouched
+- 0136 backlight: the `brightness` / `backlight-level` writes that reach the fake
+  `AppleARMBacklight` now drive the panel. Map the 16.16 value (0..0x10000) to the EA8076
+  DCS level (0, or 2..0x7ff from DTB `bl-min`/`bl-max`) and send DCS `0x51` as a MIPI long
+  write (`03 00 39 c0 51 msb lsb ff`, the panel's `qcom,mdss-dsi-bl-dcs-type-ss` byte
+  order) through the DSI0 command FIFO at `0xae94000`; no IOVA/SMMU setup, no other DSI
+  state changed. Reads `DSI_HW_VERSION`/`DSI_CTRL`/`DSI_STATUS`/`DSI_FIFO_STATUS` on first
+  use, logs the first eight sends and defers/reuses the FIFO until `DSI_CMD_MODE_DMA_DONE`.
+  `sweetbl_dcs=1` by default, `sweetbl_dcs=0` disables the DCS writes; ARM mode only
+  (`sweetbl=3` is unchanged)
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

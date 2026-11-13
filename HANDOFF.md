@@ -1,11 +1,11 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-12** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-13** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
 
-### Brightness: the BC control never matched; `0135` publishes IODisplayParameters (2026-11-12)
+### Brightness: `0135` matched the BC control; `0136` drives DCS 0x51 (2026-11-13)
 
 **`0134` result (`brightness-rec1`).** Booted from `0134` with `cepheuswdt=0
 cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. All 33 `SWEET FB: rec` lines are
@@ -35,28 +35,61 @@ BC then reports `_minUser` 0/`_maxUser` 0x10000, `_maxNits` 600/`_minNits` 0 and
 `capabilities` with `BuiltIn`, `MaxNits`/`MaxNitsPanel` 600, `MinNits` 0 and `RegistryID`.
 `BuiltIn` is exactly what the embedded-panel match tests.
 
-**`0135` (written, not yet booted).** `sweet_bl_publish_parameters()` sets those four
-sub-dictionaries and `force-brightness-control=true` on the fake `AppleARMBacklight` before
-attach, only in ARM mode (`!non_arm`); `sweetbl=3` semantics are unchanged. The panel is
-still untouched.
+**`0135` result (`brightness-params1`, booted 2026-11-13).** The match worked:
 
-**Test.** Build from `0135` and `fastboot boot` with `cepheuswdt=0 cepheustouchlog=1
-sweetbl=1 sweetfb_sel_log=1`. Wait for SpringBoard, then move the Control Center brightness
-slider and report. Expected evidence, in order:
+- `SWEET BL: IODisplayParameters published (...)` at 171.242 s, immediately before
+  `SWEET BL: AppleARMBacklight published (DBV 0x8b..0x7ff)`.
+- `BCAppleBacklightBrtControl` matched (`SWEET FB: backboardd sel 50 ... [65536 0 0 0]`),
+  and the slider no longer stalls the UI: SpringBoard ran at up to 39 fps while interacting
+  and touch stayed responsive.
+- The slider reaches the fake backlight as `SWEET BL: setProperties brightness = ...` /
+  `backlight-level = ...` in 16.16 units: for example 32197 at 245.315 s, 65536 at
+  261.491 s, 0 at 262.428 s. `brightness-nits` is only written once as 0 when the display
+  opens; it is not the slider path.
+- The `SWEET FB: rec` SwapEnd records stay `p 00 b 0000000000 n 0.000` even while the
+  slider moves. Brightness does **not** ride the SwapEnd record; ignore that path.
 
-1. `SWEET BL: IODisplayParameters published (brightness 0..0x10000 value 0x8000, raw
-   0..0x7ff, amps 0..25000, nits 0..600000)` immediately before
-   `SWEET BL: AppleARMBacklight published (DBV 0x8b..0x7ff)`.
-2. The IOMFB/BC match: `SWEET FB: rec` lines gain `p 01` and `b 01...`, and `n` becomes a
-   nonzero nit value (nonzero `raw` doubles are optional).
-3. `SWEET BL: setProperties brightness-nits = <nits*65536> (0x...)` when the slider moves
-   (`setNits` writes to the fake service; decode by dividing by 65536). `sel 51` may also
-   appear.
+The panel did not change because `AppleARMBacklight::setProperties` only logged the value.
+`0136` now maps it and sends the panel command.
 
-If the record gains `b 01` and nits but the UI is still 0.2 fps, the remaining problem is
-the CoreBrightness swap-done wait, not the match. Only after the BC match and registry
-write are confirmed do we map the received nits to DCS `0x51` (DTB `bl-min` 2, `bl-max`
-0x7ff) and touch the panel.
+**`0136` (written, not yet booted).** In `AppleARMBacklight::setProperties`, `brightness`
+(or `backlight-level`) is mapped from 16.16 to the EA8076 DCS range: 0 stays 0, everything
+else is `2 + value * (0x7ff - 2) / 0x10000` (live DTB `qcom,mdss-dsi-bl-min-level` 2,
+`qcom,mdss-dsi-bl-max-level` 0x7ff). The panel takes DCS `0x51` with a two-byte big-endian
+level (`qcom,mdss-dsi-bl-dcs-type-ss`, confirmed by the `qcom,mdss-dsi-on-command` byte
+stream, which sends `39 .. 03 51 00 00`), so the command is a DCS long write packaged as
+the 8-byte command FIFO image `03 00 39 c0 51 msb lsb ff`. It goes through the DSI0 command
+FIFO at `0xae94000` (`DSI_TEST_PATTERN_GEN_CTRL` 0x015c,
+`DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL` 0x017c, embedded bit 28 in
+`DSI_COMMAND_MODE_DMA_CTRL` 0x003c, `DSI_DMA_CMD_LENGTH` 0x004c, trigger
+`DSI_CMD_MODE_DMA_SW_TRIGGER` 0x0090). The ABL left the controller in command mode and
+XNU only adds commands, so no IOVA/SMMU or DSI mode setup is done. The first use logs
+`SWEET BL: DSI ctrl0 hw ... ctrl ... status ... fifo ... int ... dma ...`, then the first
+eight sends as `SWEET BL: DCS 0x51 level 0x... packet c0390003 ... int 0x...`.
+Completion is `DSI_INT_CTRL` bit 0 (`CMD_MODE_DMA_DONE`); a command still in flight is not
+reset: the next update waits up to 20 ms and defers the new level rather than corrupting
+the FIFO (after four failed waits it assumes the status is not visible and takes the FIFO
+back). `sweetbl_dcs=0` disables the DCS writes (default 1); `sweetbl=3` is unchanged and
+still logging-only.
+
+**Test.** Build from `0136` and `fastboot boot` with `cepheuswdt=0 cepheustouchlog=1
+sweetbl=1 sweetfb_sel_log=1`. Wait for SpringBoard, then move the Control Center
+brightness slider. Expected evidence, in order:
+
+1. On the first slider write, `SWEET BL: DSI ctrl0 hw 0x...` with `ctrl` bit 2 set
+   (command engine on), plus the raw status/fifo/int/dma values.
+2. `SWEET BL: setProperties brightness = ...` followed by
+   `SWEET BL: DCS 0x51 level 0x... packet c0390003 ...51 ...` for the first eight moves.
+   The first line may end in `(pending)`; later lines should not, which proves the
+   command-done status is visible.
+3. The panel brightness follows the slider; 0 turns it off and 0x10000 reaches
+   `level 0x7ff`.
+
+If the DCS log appears but the panel does not change, capture the register line and the
+first packet lines. The remaining variables are the packet data type/byte order and the
+DSI controller mode (`ctrl` bit 2, `status`). If every line says `(pending)`, the
+command-done status is not visible and the next step is a different completion check, not
+resetting the FIFO blindly.
 
 ### Brightness: selector 55 is SetMatrix; brightness rides in the SwapEnd record (2026-11-11)
 
