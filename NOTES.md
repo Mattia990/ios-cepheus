@@ -236,6 +236,10 @@ Of the ~81 original ios-sweet kernel patches:
   from an early `43 05 30/31` force-cal failure or water-mode enter within 5 s of
   sense-on by repeating the power cycle and sense-on (at most twice).
   `cepheustouchpwr=0` and `cepheustouchrecover=0` disable the two parts
+- 0138 touch: the 0137 warm test still failed, so the rail-off is now diagnosable:
+  `cepheustouchpwrms=N` (default 200) busy-waits with reset asserted, then releases reset
+  at 2 mA and reads the 0xa6 sysinfo frame (`controller unpowered` proves a real power
+  loss; `alive` means the rail did not drop). Power-up order restored to VDDIO then AVDD.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

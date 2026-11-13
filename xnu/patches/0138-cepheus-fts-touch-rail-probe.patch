@@ -1,0 +1,150 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -27,7 +27,8 @@
+  * after the sysinfo read (default 1; Xiaomi's probe does two),
+  * cepheustouchsysinfo=0 skip the 0xa6 frame read, cepheustouchpoll=0 read
+  * only when IRQ is low instead of also polling every 10 ms,
+- * cepheustouchpwr=0 keep the touch rails on at start, and
++ * cepheustouchpwr=0 keep the touch rails on at start,
++ * cepheustouchpwrms=N hold the rails off for N ms (default 200), and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -110,7 +111,7 @@
+ 	bool recover, recover_enable;
+ 	int log;
+ 	unsigned sda, scl;
+-	unsigned recoveries;
++	unsigned recoveries, off_ms;
+ 	uint64_t sense_time;
+ 	uint32_t active;
+ 	int x[FTS_MAX], y[FTS_MAX];
+@@ -460,6 +461,25 @@
+ {
+ 	const uint8_t cmd[3] = { FTS_CMD_FRAMEBUFFER, 0x00, 0x00 };
+ 	return fts_i2c_read_buf(cmd, sizeof(cmd), buf, FTS_SYSINFO_SIZE);
++}
++
++/*
++ * Prove whether the controller is powered. A bare address ACK is not enough:
++ * an unpowered chip clamps SDA through its ESD diode, which the bit-banged
++ * master reads as an ACK. The sysinfo frame has a fixed 0xa5/0x01 signature,
++ * so an unpowered chip returns zeros/ones instead and the probe is unambiguous.
++ */
++static bool
++fts_rail_probe(void)
++{
++	uint8_t si[FTS_SYSINFO_SIZE] = { 0 };
++	int err = fts_read_sysinfo(si);
++	bool alive = !err && si[0] == FTS_SYSINFO_SIG &&
++	    si[1] == FTS_SYSINFO_LOAD_ID;
++
++	printf("SWEET FTS: rails-off probe err=%d sig=%02x/%02x -> %s\n", err,
++	    si[0], si[1], alive ? "alive" : "unpowered");
++	return alive;
+ }
+ 
+ /*
+@@ -568,7 +588,46 @@
+ 	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, false);
+ 	(void)sweet_rpmh_write("ldoc1", 1, enable_off, value_off);
+ 	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, false);
+-	fts_wait(100);
++}
++
++/* Xiaomi's power-on order: VDDIO (bus) first, then AVDD (pwr). */
++static int
++fts_rails_on(void)
++{
++	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
++	fts_wait(4);
++	int err = sweet_rpmh_vreg_enable("ldoc1", 1800);
++	fts_wait(20);
++	return err;
++}
++
++/*
++ * Hold both rails off and prove with the sysinfo frame whether the controller
++ * actually lost power. fts_rails_off only starts the discharge: the PMIC and
++ * load-switch output capacitors decide how long the rails take to fall. Reset
++ * stays asserted and the CPU busy during the window: releasing reset or
++ * entering RPMh sleep would let a pin or the sleep vote power the chip again.
++ */
++static void
++fts_power_off(void)
++{
++	/* Positive control: this must answer while the rails are still up. */
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 0, true, true);
++	fts_udelay(150u * 1000u);
++	bool before = fts_rail_probe();
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 0, true, false);
++	printf("SWEET FTS: controller before rails-off: %s\n",
++	    before ? "alive" : "unpowered");
++
++	fts_rails_off();
++	fts_udelay(ft.off_ms * 1000u);
++	/* 2 mA drive limits phantom power through the reset ESD diode. */
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 0, true, true);
++	fts_udelay(150u * 1000u);
++	bool alive = fts_rail_probe();
++	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 0, true, false);
++	printf("SWEET FTS: rails off %u ms: controller %s\n", ft.off_ms,
++	    alive ? "alive" : "unpowered");
+ }
+ 
+ /*
+@@ -581,13 +640,9 @@
+ fts_power_cycle(void)
+ {
+ 	fts_release_all();
+-	fts_rails_off();
+-	int aerr = sweet_rpmh_vreg_enable("ldoc1", 1800);
+-	fts_wait(20);
+-	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
+-	fts_wait(4);
+-	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, true);
+-	fts_wait(50);
++	fts_power_off();
++	int aerr = fts_rails_on();
++	fts_reset();
+ 	if (!fts_bb_recover()) {
+ 		printf("SWEET FTS: power cycle: SCL stuck low\n");
+ 		return EIO;
+@@ -735,21 +790,26 @@
+ 	 * warm reboot leaves the controller powered with a stale analog
+ 	 * baseline; reset alone then makes the first force calibration fail
+ 	 * (43 05 30/31 or water mode) and the chip stays silent. This is the
+-	 * cold-boot sequence; cepheustouchpwr=0 keeps the old power-up.
++	 * cold-boot sequence; cepheustouchpwr=0 keeps the old power-up and
++	 * cepheustouchpwrms sets the rails-off window.
+ 	 */
+-	unsigned pwr = 1;
++	unsigned pwr = 1, pwr_ms = 200;
+ 	(void)PE_parse_boot_argn("cepheustouchpwr", &pwr, sizeof(pwr));
++	(void)PE_parse_boot_argn("cepheustouchpwrms", &pwr_ms, sizeof(pwr_ms));
++	if (pwr_ms < 200u) {
++		pwr_ms = 200u;
++	}
++	if (pwr_ms > 30000u) {
++		pwr_ms = 30000u;
++	}
++	ft.off_ms = pwr_ms;
+ 	if (pwr) {
+-		fts_rails_off();
++		fts_power_off();
+ 	}
+-	/* AVDD is PM8150L L1 (RPMh ldoc1); VDDIO is GPIO 84 (4 ms startup). */
+-	int perr = sweet_rpmh_vreg_enable("ldoc1", 1800);
++	int perr = fts_rails_on();
++	printf("SWEET FTS: rails %s, off %u ms, avdd ldoc1 err=%d\n",
++	    pwr ? "cycled" : "unchanged", pwr_ms, perr);
+ 	fts_wait(20);
+-	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
+-	fts_wait(4);
+-	printf("SWEET FTS: rails %s, avdd ldoc1 err=%d\n",
+-	    pwr ? "cycled" : "unchanged", perr);
+-	fts_wait(20);
+ 	/*
+ 	 * Board notes say SDA=55/SCL=56; if that order is wrong the chip never
+ 	 * ACKs its address, so try the swapped pair once before giving up. A

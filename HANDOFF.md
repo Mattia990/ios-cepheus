@@ -5,13 +5,13 @@ Last updated **2026-11-13** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### `0136` confirmed end-to-end; warm-boot touch fix in `0137` (2026-11-13)
+### Warm-boot touch: `0137` failed; `0138` probes the rail-off (2026-11-13)
 
 **`0136` brightness result (`brightness-dcs4`, cold boot).** The user cold-booted to
 fastboot and booted `work/boot/kernel-brightness/kernel.development.sweet` with
-`cepheuswdt=0 cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. Touch initialized cleanly
-(`sense on err=0`, no early `43 05 30/31`) and the Control Center slider changed the panel
-brightness.
+`cepheuswdt=0 cepheustouchlog=1 sweetbl=1 sweetfb_sel_log=1`. Touch initialized
+(`sense on err=0`; the first force-cal was later, at 177.7 s, and recovered) and the
+Control Center slider changed the panel brightness.
 
 The DCS path is proven: the display-open write `brightness = 1` / `backlight-level = 0`
 sent level 2 (`DCS 0x51 level 0x002 ... int 0x00000501`), and the first slider moves sent
@@ -21,25 +21,28 @@ sent level 2 (`DCS 0x51 level 0x002 ... int 0x00000501`), and the first slider m
 further DCS/FIFO debugging is needed. The first eight sends are logged; later slider
 values still update the panel even though they are not printed.
 
-**Warm-boot touch failure.** All three `0136` runs started from TWRP via
-`fastboot boot` failed touch: an early `43 05 31` or `43 05 30` force-cal event, a burst of
-edge contacts, then silence while the driver stayed alive. A diagnostic run
-(`touch-warm1`) delayed FTS to `cepheustouchdelay=50`, so sense-on happened at 59.7 s,
-10 s *after* `SWEET FB: display on` at 49.9 s; it still failed (`43 05 30` at 63.5 s, then
-water mode). Calibration order is therefore not the cause: the controller starts from a
-bad analog/power state on warm boots, and a reset alone does not clear it.
+**Warm-boot touch still fails with `0137` (`touch-warm2`).** The rails were released
+(`rails cycled, avdd ldoc1 err=0` at 29.713 s), but the chip still reported `43 05 31`
+at 30.469 s, then five ghost contacts at 32.273 s, `43 05 30` at 32.595 s, and stayed
+silent after recovery 2 (`power cycle 2 err=0`), with `irq=1 errors=0` to 80 s. The
+100 ms off window evidently did not produce a POR.
 
-**`0137` touch (written, not yet built).** Both touch rails are dedicated to the
-controller: VDDIO is `touch_vddio_vreg` (GPIO 84) and AVDD is PM8150L L1
-(`rpmh-regulator-ldoc1`, 1.8 V). At init the driver now asserts reset, disables AVDD through
-`sweet_rpmh_write("ldoc1", ...)`, drives VDDIO low, waits 100 ms, then powers AVDD, VDDIO
-and reset back up before the first probe. If an early `43 05 30/31` or water-mode enter
-arrives within 5 s of sense-on, it repeats the power cycle plus sense-on (at most twice).
-`cepheustouchpwr=0` keeps the old power-up and `cepheustouchrecover=0` disables the
-recovery, for A/B runs. Build `0137` and test a **warm** boot first (TWRP -> bootloader ->
-`fastboot boot`), then a cold boot; the expected new line is
-`SWEET FTS: rails cycled, avdd ldoc1 err=0`, followed by a normal `sense on` and no early
-force-cal event.
+**Cold boot also sees a force-cal, but recovers.** `brightness-dcs4` logged `43 05 31`
+at 177.708 s (12 s after display-on) and normal touches from 183.781 s. The panel
+turning on can trigger a force-cal even on a working boot; the difference is that a
+cold-started chip recovers, while a warm-started chip fails from the first second.
+
+**`0138` touch (written, not yet built).** `cepheustouchpwrms=N` (default 200, clamped
+200..30000) sets the rails-off window. The window is a busy-wait with reset asserted,
+so neither the RPMh sleep set nor phantom power through the reset ESD diode can
+re-power the chip. The driver probes the `0xa6` sysinfo frame once before the rails
+drop (positive control) and once at the end after releasing reset at 2 mA:
+`controller before rails-off: alive` validates the probe, and `rails off N ms:
+controller unpowered` then proves the rail really dropped; `alive` means it did not.
+The power-up order is back to the verified `0136` sequence (VDDIO, then AVDD). Build
+`0138` and test a **warm** boot with `cepheuswdt=0 cepheustouchlog=1 sweetbl=1
+cepheustouchpwrms=5000`; if the probe says `unpowered` but touch still fails, the chip
+is no longer the difference and the panel's warm state is next.
 
 ### Brightness: `0135` matched the BC control; `0136` drives DCS 0x51 (2026-11-13)
 
