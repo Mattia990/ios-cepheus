@@ -5,6 +5,37 @@ Last updated **2026-11-14** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### 0139 probe replayed, warm touch still fails; test the sense-on/off/on cycle (2026-11-14)
+
+**0139 warm run (`touch-0139`).** Kernel built with 0139
+(`work/boot/kernel-brightness/kernel.development.sweet`, SHA-256 `bfe8dcd0...`), booted
+warm from TWRP 3.5.2. The probe matches TWRP exactly: `lockdown sig=a5 id=70 70 cnt=1/2
+data=4838320546313200`, `crc reg err=0 val=00`, `crc reset ready=1 events=0 cfg=0 cx=0`,
+`sense on err=0 ... probe=1` at 30.443 s. Then the usual failure: ghost 8-finger burst at
+34.120-34.199 s, `early status failure` at 34.456 s (+4.0 s), clean power-cycle recovery at
+35.082 s, alive through 93.5 s, **no real touch**. Logs: `logs/runs/touch-0139/`.
+
+**Rails-on run (`touch-0139-pwr0`).** Same kernel with `cepheustouchpwr=0` (TWRP resets an
+already-powered chip and never power-cycles the rails). Sense-on at 29.922 s, no rail
+cycle. Ghost 8-9-finger burst at 33.530-33.615 s (+3.6 s) but **no `43 05 30/31`**; the
+driver does not recover (none was requested) and IRQ stays idle through 117 s. No real
+touch. Display on at 49.527 s. Logs: `logs/runs/touch-0139-pwr0/`.
+
+**Result.** Neither the lockdown/CRC probe nor the rail power-cycle is the trigger: the
+first scan calibrates badly either way. What TWRP still does that we do not is in
+`fts_init_sensing` (fts_521, `CONFIG_FTS_FOD_AREA_REPORT`): after the screen-on sense-on
+(`a0 00 01`) it immediately sends sense-off (`a0 00 00`), waits `WAIT_AFTER_SENSEOFF`
+(50 ms), and sends sense-on again. The first calibration is aborted before it completes.
+TWRP's force-cal event then carries sub-status `02`; ours carries `01` (the cold-boot
+success also logs `01`, so the byte alone proves nothing).
+
+**Next: 0140.** `xnu/patches/0140-cepheus-fts-sense-cycle.patch` adds `fts_sense_cycle()`
+(on, 2 ms, off, 50 ms, on) and uses it at init and recovery; `cepheustouchsensecycle=0`
+keeps the old single sense-on, and the sense-on line now ends `cycle=1`. Build on top of
+0139, boot warm from TWRP, swipe from ~30 s to ~65 s. If it still fails, the last TWRP
+step is the display-notifier: a system reset + sense-on right after the panel's
+`DSI_CMD_SET_ON` (TWRP 1.838-1.860 s; XNU display-on was 49.527 s in `touch-0139-pwr0`).
+
 ### Panel re-init replay: DSI path works, display stays dark, touch unchanged (2026-11-14)
 
 **Implementation.** `shim/panel.c` replays the live DTB's 34-command EA8076 f1mp on-command

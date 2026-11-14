@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -29,7 +29,8 @@
+  * only when IRQ is low instead of also polling every 10 ms,
+  * cepheustouchpwr=0 keep the touch rails on at start,
+  * cepheustouchpwrms=N hold the rails off for N ms (default 200),
+- * cepheustouchprobe=0 skip TWRP's lockdown/CRC probe steps, and
++ * cepheustouchprobe=0 skip TWRP's lockdown/CRC probe steps,
++ * cepheustouchsensecycle=0 keep the single sense-on, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -477,12 +478,43 @@
+ 
+ /* 0xa0/00/01: active scan mode, MT sensing on. */
+ static int
+-fts_sense_on(void)
++fts_sense_set(uint8_t settings)
+ {
+-	const uint8_t cmd[3] = { FTS_CMD_SCAN_MODE, FTS_SCAN_ACTIVE, FTS_SENSE_ON };
++	const uint8_t cmd[3] = { FTS_CMD_SCAN_MODE, FTS_SCAN_ACTIVE, settings };
+ 	return fts_i2c_write_buf(cmd, sizeof(cmd));
+ }
+ 
++static int
++fts_sense_on(void)
++{
++	return fts_sense_set(FTS_SENSE_ON);
++}
++
++/*
++ * TWRP's fts_init_sensing (fts_521, CONFIG_FTS_FOD_AREA_REPORT) turns the
++ * scan on, off again immediately, waits WAIT_AFTER_SENSEOFF (50 ms) and
++ * turns it back on.  The first calibration is aborted before it completes;
++ * the second one is the calibration the chip keeps.  A warm-boot chip
++ * without the toggle reports edge ghosts and 43 05 30 a few seconds after
++ * the first scan starts.
++ */
++static int
++fts_sense_cycle(void)
++{
++	int err = fts_sense_set(FTS_SENSE_ON);
++	fts_wait(2);
++	int off = fts_sense_set(0);
++	if (off && !err) {
++		err = off;
++	}
++	fts_wait(50);
++	int on = fts_sense_set(FTS_SENSE_ON);
++	if (on && !err) {
++		err = on;
++	}
++	return err;
++}
++
+ /* 0xa6/00/00 loads the system-info frame into the framebuffer. */
+ static int
+ fts_read_sysinfo(uint8_t *buf)
+@@ -1035,6 +1067,7 @@
+ 	printf("SWEET FTS: bus sda=%u scl=%u\n", ft.sda, ft.scl);
+ 
+ 	unsigned do_si = 1, extra_resets = 1, poll_enable = 1, recover_enable = 1;
++	unsigned do_cycle = 1;
+ 	(void)PE_parse_boot_argn("cepheustouchsysinfo", &do_si, sizeof(do_si));
+ 	(void)PE_parse_boot_argn("cepheustouchreset2", &extra_resets,
+ 	    sizeof(extra_resets));
+@@ -1042,6 +1075,8 @@
+ 	    sizeof(poll_enable));
+ 	(void)PE_parse_boot_argn("cepheustouchrecover", &recover_enable,
+ 	    sizeof(recover_enable));
++	(void)PE_parse_boot_argn("cepheustouchsensecycle", &do_cycle,
++	    sizeof(do_cycle));
+ 	ft.recover_enable = recover_enable != 0;
+ 	if (extra_resets > 5u) {
+ 		extra_resets = 5u;
+@@ -1115,9 +1150,10 @@
+ 		}
+ 	}
+ 
+-	err = fts_sense_on();
++	err = do_cycle ? fts_sense_cycle() : fts_sense_on();
+ 	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u "
+-	    "probe=%u\n", err, poll_enable, extra_resets, do_si, do_probe);
++	    "probe=%u cycle=%u\n", err, poll_enable, extra_resets, do_si,
++	    do_probe, do_cycle);
+ 	if (err) {
+ 		goto out;
+ 	}
+@@ -1165,7 +1201,8 @@
+ 			    ft.recoveries);
+ 			int rerr = fts_power_cycle();
+ 			if (!rerr) {
+-				rerr = fts_sense_on();
++				rerr = do_cycle ? fts_sense_cycle() :
++				    fts_sense_on();
+ 			}
+ 			printf("SWEET FTS: power cycle %u err=%d\n",
+ 			    ft.recoveries, rerr);

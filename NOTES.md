@@ -245,6 +245,10 @@ Of the ~81 original ios-sweet kernel patches:
   sequence-counter check) and read the CRC status register (`0xfb` + `0x20000078`, mask
   `0x03`), then system-reset and scan 500 ms for config/Cx checksum-error events. No dummy
   byte (fts_521's I2C branch sets the `DUMMY_*` flags to 0). `cepheustouchprobe=0` skips both.
+- 0140 touch: at init and after a recovery power cycle, send sense-on (`a0 00 01`),
+  sense-off (`a0 00 00`), wait 50 ms (`WAIT_AFTER_SENSEOFF`) and sense-on again, matching
+  TWRP's `fts_init_sensing` FOD branch; the first calibration is aborted before it
+  completes. `cepheustouchsensecycle=0` keeps the single sense-on.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
