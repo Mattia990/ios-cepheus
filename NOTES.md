@@ -240,6 +240,11 @@ Of the ~81 original ios-sweet kernel patches:
   `cepheustouchpwrms=N` (default 200) busy-waits with reset asserted, then releases reset
   at 2 mA and reads the 0xa6 sysinfo frame (`controller unpowered` proves a real power
   loss; `alive` means the rail did not drop). Power-up order restored to VDDIO then AVDD.
+- 0139 touch: replay TWRP fts_521's remaining probe steps after the sysinfo read: read the
+  lockdown record (`0xa6/00/00` header, `0xa4/06/70` request, echo poll, 28-byte read with
+  sequence-counter check) and read the CRC status register (`0xfb` + `0x20000078`, mask
+  `0x03`), then system-reset and scan 500 ms for config/Cx checksum-error events. No dummy
+  byte (fts_521's I2C branch sets the `DUMMY_*` flags to 0). `cepheustouchprobe=0` skips both.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

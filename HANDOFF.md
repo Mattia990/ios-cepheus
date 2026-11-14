@@ -1,9 +1,330 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-13** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-14** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Panel re-init replay: DSI path works, display stays dark, touch unchanged (2026-11-14)
+
+**Implementation.** `shim/panel.c` replays the live DTB's 34-command EA8076 f1mp on-command
+sequence through the DSI0 command FIFO at shim entry (`SHIM_PANEL_INIT`): panel reset GPIO 6
+low 1 ms / high 10 ms, then every command from `timing@0` in LP mode, with the FIFO image
+format from downstream `dsi_cmd_dma_add()` (`03 00 39 c0` for long writes, `80` last-packet
+short writes). `send_image()` mirrors `dsi_ctrl_hw_cmn_reset_cmd_fifo()` +
+`kickoff_fifo_command()` (TPG FIFO, embedded mode, SW trigger, poll `CMD_MODE_DMA_DONE`),
+resets the FIFO after each command, and restores `COMMAND_MODE_DMA_CTRL` to its entry
+value. `sde_restart()` (disptest phase G: autorefresh off, `CTL_FLUSH 0x3|1<<17`, kick,
+40 ms, autorefresh on) restarts scanout afterwards.
+
+**Probe-only run.** `work/boot/runs/panel-init-probe/panel-init-probe.img` (no XNU
+payload): all 34 commands complete with 0 errors, DSI entry
+`hw 20030000 ctrl 1f5 status 5 fifo 1010 int 500 dma 14000000`, exit
+`status 0 fifo 11111010` (`logs/runs/panel-init-probe/shim.txt`). The command path is
+correct.
+
+**XNU run 1 (`touch-panelinit`).** All 34 commands complete, backlight `0x7ff` sent, DMA
+restored. Screen stays dark. FTS: sense-on 30.664 s, `43 05 01` at 30.666 s, then
+`43 05 31` at 31.248 s (+0.58 s); recovery power cycle clean at 31.881 s; ghost
+six-finger burst at 32.965-33.025 s and `43 05 30` at 33.237 s; second recovery at
+33.872 s. No real touch. Logs: `logs/runs/touch-panelinit/`.
+
+**XNU run 2 (`touch-panelinit2`, `sde_restart` + LP backlight).** All 34 commands complete;
+tear count advances after the restart (`sde after panel: 30c17/924 df8/5ca ...`), so the
+MDP is sending frames again. Screen still dark. FTS: sense-on 30.898 s, `43 05 01`
+30.901 s, `43 05 31` 31.514 s (+0.62 s), recovery 32.149 s, ghost burst 33.087-33.174 s,
+no real touch. Logs: `logs/runs/touch-panelinit2/`.
+
+**Result.** The shim can talk to DSI0 and restart scanout, but a panel reset + DCS replay is
+not enough to bring the EA8076 back: the display stays dark and the FTS failure is unchanged
+(same `43 05 31` 0.6 s after sense-on). Panel command state is not the variable the
+warm-boot failure depends on (or this partial replay does not reproduce TWRP's full
+DSI/PHY/controller init). Do not spend more boots on this path; TWRP's remaining unexplored
+difference is its FTS probe sequence (lockdown echo read + CRC register read + system reset
++ checksum-error event poll) and the display-notifier reset/sense-on after panel init.
+
+### Next test: replay TWRP's FTS probe steps (`0139`, 2026-11-14)
+
+**Patch.** `xnu/patches/0139-cepheus-fts-twrp-probe.patch` adds TWRP's two missing probe
+steps to `bsd/dev/sweet_fts.c`, on top of 0138. The reference is TWRP's actual driver,
+ST fts_521 (`work/fts/cepheus_ftsCore.c`, `cepheus_ftsIO.c`), which is what the TWRP dmesg
+logs (`fts_crc_check`, `fts_get_lockdown_info`) match:
+
+- `fts_get_lockdown_info()`: read the 4-byte header with `0xa6/00/00`, request the record
+  with `0xa4/06/70`, wait 10 ms, poll for the echo (`0x43 0x01 a4 06 70`), then read the
+  28-byte record and require its sequence counter to advance. No dummy byte: fts_521 sets
+  `DUMMY_CONFIG=0` for I2C (the st-fts driver's dummy comment does not apply).
+- `fts_crc_check()`: read HW register `0x20000078` with `0xfb` + 32-bit address (one byte,
+  no dummy on I2C), mask `0x03`; if clean, GPIO system reset and a 500 ms event scan for
+  config (`0x20/0x21`) or Cx (`0xa0/0xa1/0xa5/0xa6`) checksum errors.
+- Both run after the sysinfo read and before the existing extra reset/sense-on, matching
+  TWRP's `fts_init` -> lockdown -> fw-update/CRC -> `fts_init_afterProbe` order.
+  `cepheustouchprobe=0` skips them; the sense-on line now logs `probe=1`.
+- Expected log lines: `SWEET FTS: lockdown sig=a5 id=70 70 cnt=1/2 data=4838320546313200`,
+  `SWEET FTS: crc reg err=0 val=00`, `SWEET FTS: crc reset ready=1 events=0 cfg=0 cx=0`,
+  then `sense on ... probe=1`.
+
+**Test.** Build the kernel with 0139, boot warm from TWRP (`fastboot boot`), and swipe at
+~30 s. Success means no `43 05 30/31` and real touch events. If it still fails, the only
+remaining TWRP difference is the display-notifier system reset + second sense-on after the
+panel is initialized (TWRP: display blank/unblank at 1.586/1.838 s, FTS reset 1.838-1.860 s,
+second sense-on 1.8604 s); the shim's panel replay could not reproduce that state.
+
+### Warm-boot touch: reset count and panel state ruled out; TWRP recovers the chip (2026-11-13/14)
+
+**Panel held in reset still fails.** `work/boot/runs/panel-off/touch-paneloff.img` (0138
+payload + shim built with `SHIM_PANEL_OFF`) drives panel reset GPIO 6 low and holds it
+across the jump to XNU, so the display stays dark while FTS initializes. The failure is
+unchanged: ghost six-finger enters at 34.03 s and `43 05 30` at 34.311 s
+(`logs/runs/panel-off/xnu.txt`). The display panel's state is not the trigger.
+
+**Three resets do not fix it.** `work/boot/runs/touch-reset3/touch-reset3.img` is the 0138
+payload with the cmdline patched in place (`cepheustouchreset2=2 cepheusreboot=120`, no
+kernel rebuild), booted warm from TWRP at 23:55:11. The log shows `reset 2 ready` and
+`reset 3 ready`, sense-on at 30.407 s, then the identical signature: ghost six-finger
+enters at 33.918 s, `43 05 30` at 34.173 s, the driver's power-cycle recovery at 34.708 s
+restores `43 05 01` at 34.808 s, and **no real touch is ever reported afterwards** (the
+user's swipe at ~40-60 s produced none; alive ticks continue to 155.9 s). Springboard
+booted normally. Logs: `logs/runs/touch-reset3/shim.txt`, `xnu.txt`. Reset count is not
+the variable.
+
+**TWRP recovers the chip after the failed XNU run.** With TWRP 3.5.2 booted afterwards, a
+swipe produced 805 `ABS_MT_POSITION_X` samples / 31 `BTN_TOUCH` events
+(`logs/runs/twrp-after-xnu/events.txt`). TWRP's init therefore undoes whatever our failed
+run leaves behind; the chip is not latched.
+
+**What the failure looks like.** Init and sense-on succeed; ~3.5 s later the chip reports a
+burst of ghost multi-finger contacts at the edges and then `43 05 30` (MS invalid mutual
+strength). It is a baseline/calibration failure during scanning, not a reset or handshake
+failure, and the driver's own power cycle does not recover it. That points at an
+environment difference at scan time, not at reset count.
+
+**Init timing is ruled out.** `work/boot/runs/touch-early/touch-early.img` (0138 payload,
+cmdline patched to `cepheustouchdelay=1`) starts FTS at 10.645 s, right after XNU's display
+init at 9.592 s. It still fails, and sooner: `43 05 31` (MS invalid *self* strength) at
+13.299 s, only 1.9 s after sense-on; the recovery power cycle restores `43 05 01` at
+13.934 s but no touch is ever reported. So the failure is not boot-time-dependent: it is
+relative to the start of scanning, and starting earlier just moves it earlier. Logs:
+`logs/runs/touch-early/shim.txt`, `xnu.txt`.
+
+**Panel VCI and AMOLED rails are identical too.** `panel-probe2` (payload-less image
+`work/boot/runs/panel-probe2/panel-probe2.img`) adds `disp_vci_vreg` GPIO 21 (east TLMM)
+and the PM8150L AMOLED blocks (SID 5: IBB `0xdc00`, AB `0xde00`, OLEDB `0xe000`) to the
+shim-entry probe. Warm run `logs/runs/panel-probe2-warm/shim.txt`, cold run
+`logs/runs/panel-probe2-cold/shim.txt` (phone fully powered off, Vol- + Power to fastboot).
+The whole panel/touch/AMOLED section is identical line for line: VCI is `cfg 3c3` (pull-up,
+16 mA, output) `io 3`, and the three AMOLED blocks read the same on both boots. So no
+AP-visible rail or pin state at XNU entry explains the warm failure; the remaining
+differences are what the driver does after power-on (TWRP's extra resets/probe commands) or
+the display panel's internal DDIC state, which the shim cannot see.
+
+**Done: both cmdline tests failed, and the panel-init replay is now ruled out.** `cepheustouchsysinfo=0`
+and `cepheustouchreset2=3` both still fail with `43 05 30/31` and no touch; the shim's
+34-command panel re-init (with and without `sde_restart`) leaves the display dark and the
+FTS failure unchanged. See the two newest sections above. The next differentiator is TWRP's
+FTS probe sequence (lockdown echo read, CRC register read, system reset, checksum-error
+event poll), not the panel.
+
+### Panel/touch pin state at shim entry is identical cold and warm (`panel-probe`, 2026-11-13)
+
+**Probe.** Payload-less image `work/boot/runs/panel-probe/panel-probe.img` (SHA-256
+`cbc4b9f026f0a411...`) logs, at shim entry: the five touch pins, panel reset GPIO 6, TE
+GPIO 8, PM8150 LDO13/LDO14 (`0x4c00`/`0x4d00`), and the PM8150L LCDB block (`0xec00`).
+Warm run: `logs/runs/panel-probe-warm/shim.txt`. Cold run (phone fully powered off, Vol- +
+Power to fastboot, then `fastboot boot`): `logs/runs/panel-probe-cold/shim.txt`.
+
+**Result: identical, line for line.** Touch SDA 55 / SCL 56 / IRQ 122 / reset 12 / VDDIO 84
+are all `cfg 1` (pull-down, mux 0, input) and `io 0` on both boots. Panel reset GPIO 6 is
+`cfg 2c3` (pull-up, mux 0, 8 mA, output) with `io 3` (high); TE GPIO 8 is `cfg 4` (mux 1 TE,
+input) `io 0`. PON and both PM8150L LDO1/LDO2 dumps match byte for byte, including
+`a0=80`. **ABL leaves the panel and touch pins in the same state on cold and warm boots, so
+"ABL skips panel init on warm" is not supported by the observable state.**
+
+**Two probes are dead ends.** LDO13/LDO14 reads fail on both boots (every register `!`):
+their APIDs are not in the apps-EE SPMI map because RPMh/AOP owns them, so the shim cannot
+read them. LCDB `0xec00` reads succeed but return zero on both boots; cepheus is an OLED
+panel, and the live DTB's OLED rail node is `qcom,amoled` (AB `0xde00`, IBB `0xdc00`, OLEDB
+`0xe000`, `status = "disabled"` in the base DTB), not LCDB. The panel VCI switch is
+`disp_vci_vreg` (TLMM GPIO 21), not LDO13. Do not spend more boots on LDO13/14 or LCDB from
+the shim.
+
+**TWRP 3.5.2 needs its AVB footer stripped.** `twrp-3.5.2_9-0-cepheus.img` is 66,965,504
+bytes of Android image plus a 512-byte vbmeta and a 64-byte footer at 67,108,800
+(`avbtool info_image`: `Algorithm: NONE`, `Partition Name: recovery`). ABL rejects the
+whole file with `Failed to load/authenticate boot image: Load Error`; `avbtool erase_footer`
+truncates it back to 66,965,504 bytes and it boots in ~12 s. The bootable copy is
+`downloads/twrp/twrp-3.5.2-nofooter.img`; `tools/cepheus-twrp.sh` now creates it
+automatically and prefers 3.5.2. The 3.6.1 image also carries a footer and is only a
+fallback.
+
+**Warm-booted TWRP touch works.** From a TWRP session, `adb reboot bootloader` (warm reset)
+then `fastboot boot downloads/twrp/twrp-3.5.2-nofooter.img`. TWRP came up in 11 s, and a
+one-finger swipe produced 682 `ABS_MT_POSITION_X` samples / 27 `BTN_TOUCH` events with clean
+enter/leave (`logs/runs/twrp-warm-touch/events.txt`, `dmesg2.txt`). TWRP's dmesg shows only
+the normal `Mutual negative detect Force cal = 01 00 00 00 00 02` and no `43 05 30` during
+the swipes. **The FTS chip and panel are usable after a warm reset under Linux; the failure
+is specific to what our XNU driver does (or does not do), not a permanently latched chip
+state.** Note TWRP re-initializes the display panel from scratch, which XNU never does; the
+next test holds the panel in reset across the XNU jump to isolate that difference.
+
+**Follow-up: the panel is not involved.** `work/boot/runs/panel-off/touch-paneloff.img`
+holds panel reset GPIO 6 low across the XNU jump and FTS still fails with the same
+`43 05 30`; see the newest section above.
+
+### Touch warm-boot: PMIC pull-down, reset type and TWRP's init path are ruled out (2026-11-13)
+
+**AVDD pull-down is `0xa0` bit 7, and it is already enabled.** Downstream and mainline
+`qcom_spmi-regulator.c` map the PM8150L LDO subtype read from register `0x05` (`0x71`,
+`LDO_510`) to the `hfsmps` ops, whose output pull-down is `0xa0` bit 7. `0x48` is the
+common LDO pull-down and is not wired for this subtype. `touch-pmic-cold`/`touch-pmic-warm`
+dumped LDO1, LDO2 and PON byte-for-byte identically, with `a0=80` in all four LDO dumps, so
+the AVDD rail already has its discharge path on both boots. Residual rail charge is ruled
+out (also independently by `touch-warm-railsoff`). The image
+`work/boot/runs/touch-avdd/touch-avdd.img` was built on the wrong premise and **must not be
+booted**; its shim code has been removed.
+
+**Reset type is ruled out.** The failing warm runs already took the PS_HOLD hard-reset path
+(`ctl 7 -> 7, ctl2 80 -> 80`), so "PSCI soft reset vs PMIC hard reset" is not the variable.
+
+**TWRP v5.2.4 proves the panel-init-command hypothesis wrong.** Fresh TWRP dmesg
+(`logs/runs/twrp-fts512/dmesg-fts.txt`, 126 lines): probe at 1.135 s, `System resetting...`,
+sysinfo `FW 0060 / CONFIG 0037 / CX FFFF / AFE 03-03-03`, then **"No Config CRC Error", "No
+Cx CRC Error", "No Panel CRC Error"**, so `fts_chip_initialization` chose `NO_INIT` and no
+`A4 00 02/03` panel init was sent. The only `A2 03` writes in the OSS driver are the gesture
+command `{0xA2,0x03,0x20,0x00,0x00,0x01}`; `production_test_initialization` is
+`{0xA4,0x00,type}` and runs only after a CRC error. TWRP then does the same mode-handler
+"Screen ON" + interrupt-enable sequence as our driver and gets a normal `43 05 01 ... 02`.
+No kernel rebuild for `cepheustouchnative`.
+
+**State note.** TWRP's FTS driver is currently unbound. Rebind fails
+(`fts_gpio_setup: Failed to get gpio 122 (code: -16)`, `Probe Failed!`); reboot TWRP to
+restore touch.
+
+**Next (in progress).** Compare panel-side state at shim entry cold vs warm: panel reset
+GPIO 6 and TE GPIO 8 on TLMM, PM8150 LDO13/LDO14 (VCI/VDDIO), and PM8150L LCDB
+(`0xec00`: enable/status/LDO/NCP). If ABL skips a panel reset on warm boots, pulse GPIO 6
+from the shim (active low; the screen stays dark because XNU has no panel-init path) and
+check whether FTS calibration recovers.
+
+### Full rail power-down before a warm reboot still fails (`touch-warm-railsoff`, 2026-11-13)
+
+**Setup.** In TWRP: panel powered down with a synthetic KEY_POWER (already off, so a second
+press confirmed `pm8150_l13/l14` disabled), then `echo 2-0049 >
+/sys/bus/i2c/drivers/fts/unbind`, which runs `fts_remove` -> `fts_enable_reg(info, false)` and
+drops both touch rails. Readback confirmed `pm8150l_l1` (AVDD) and `disp_vddio_vreg` (VDDIO)
+**disabled, users=0**, and both panel rails disabled, before `adb reboot bootloader` ->
+`fastboot boot` of the same `0138` image. No physical power cycle.
+
+**Result.** Controller unpowered at XNU entry (30.604 s), rails cycled 200 ms (30.968 s),
+sysinfo matched cold, `sense on err=0` (31.168 s), normal `43 05 01` (31.170 s). This time
+there was **no `43 05 30` status event at all**. Instead, a ghost-touch burst at
+34.674-34.708 s (four contacts, no user input), then only `alive ticks` (irq=1, errors=0)
+through 93.564 s and silence. Display on at 50.607 s; the user confirmed no touch.
+**Residual chip/panel power is ruled out.** A genuine full power-down of both supplies and
+the panel rails before the warm reset does not restore touch; it only changes the failure
+from an explicit `0x30` early-failure status to a ghost-touch burst followed by silence.
+Whatever survives the warm SoC reset is not on the touch/panel rails: the remaining
+candidate is PMIC/always-on (AOP/RPMH) state or another non-AP domain.
+
+### Warm boot with touch init delayed to 90 s: still fails (`touch-warm-delay90`, 2026-11-13)
+
+**Setup.** Same `0138` kernel (SHA-256 `c36667c5...`), repacked as
+`work/boot/runs/touch-warm-delay90.img` with `cepheustouchdelay=90 cepheusreboot=240
+cepheuswdt=0 cepheustouchlog=1 sweetbl=1`, booted from TWRP via bootloader.
+
+**Result.** The driver started at 9.532 s, then powered the chip at 99.699-100.088 s
+(already unpowered at XNU entry; rails cycled 200 ms; `avdd ldoc1 err=0`). Sysinfo matched
+cold (`fw=0060 cfg=0037 res=2339x1079`), `sense on err=0` at 100.259 s, the normal force-cal
+`43 05 01` at 100.267 s, garbage contacts at 103.889-103.971 s, `43 05 30` at 104.040 s,
+recovery power cycle 1, clean `43 05 01` at 104.672 s, then no more FTS events. The user
+confirmed no touch, waited, and rebooted to TWRP; the log ends at 104.672 s. SpringBoard's
+display-on was at 49.435 s, 50 s before the chip was powered, so init timing relative to
+display-on is ruled out.
+
+**Consequence.** The chip fails ~3.6 s after sense-on on every warm boot, regardless of
+when it is powered or what the panel is showing. Both follow-ups are now done and are
+recorded above: `touch-cold-0138` works, `touch-ablwarm-0138` fails without TWRP.
+
+### ABL-only warm reboot also breaks touch (`touch-ablwarm-0138`, 2026-11-13)
+
+Phone powered off, cold fastboot, then `fastboot reboot-bootloader` followed by `fastboot
+boot` of the same `0138` image. **No TWRP and no prior XNU touch driver ran before this
+boot.** The controller was unpowered at XNU entry (35.435 s), rails were cycled 200 ms
+(35.800 s), sysinfo matched, `sense on err=0` at 35.999 s, and the normal `43 05 01` came at
+36.001 s. Then, 3.615 s later, `43 05 30` (39.616 s), the early-failure recovery power cycle
+(40.243 s), a clean `43 05 01` (40.251 s), and no further status events; display on at
+55.568 s. The user confirmed touch did not work. **TWRP is ruled out.** Cold and warm reach
+XNU with the same unpowered chip and run the same init, so the trigger is the SoC warm reset
+/ the second ABL pass, not any driver state left by TWRP or XNU.
+
+### Cold boot with the current 0138 kernel: touch works (`touch-cold-0138`, 2026-11-13)
+
+The only earlier cold success (`brightness-dcs4`) used `0136`, before the 0137/0138 rail
+cycling, so this closed that gap. Phone powered off, Vol- + Power to fastboot, then
+`fastboot boot` of the same `touch-warm-paneloff.img`. The controller was unpowered at XNU
+entry (31.489 s), rails were cycled 200 ms (31.880 s), sysinfo matched, `sense on err=0` at
+32.052 s, and the only status event was the normal `43 05 01` (32.055 s) - no `0x30` or
+`0x31`. Touch worked; `SWEET FB: display on` at 51.515 s. **No 0137/0138 regression.** The
+warm failure therefore depends on the boot history, not the driver version or init sequence.
+
+### Warm boot with dimming off: touch still fails, and the DSI state was cold-like (`touch-warm-dimmingoff`, 2026-11-13)
+
+**Pre-warm state.** TWRP's panel was awake (`brightness=1200`, `panel_info` populated), woken with
+a synthetic KEY_POWER if needed. Raw DCS through the writable sysfs node
+`/sys/devices/platform/soc/ae00000.qcom,mdss_mdp/drm/card0/card0-DSI-1/mipi_reg`
+(`/proc/mipi_reg` is read-only): dim `0x51 0x0100`, restore `0x51 0x04b0`, then the panel's own
+`dimmingoff` (`0x53 0x20`, packet `390100000100025320`). All three writes returned 0 with no
+`panel not ready`; a DCS 0x53 readback is `0x00` both before and after, so the panel does not
+expose dimming state to a read. Booted `work/boot/runs/touch-warm-paneloff.img` (0138,
+`cepheuswdt=0 cepheustouchlog=1 sweetbl=1`, 200 ms rail-off, `cepheusreboot=300`) with
+`fastboot boot`.
+
+**Result.** Identical to `touch-warm-paneloff`: chip unpowered at XNU entry (29.665 s), rails
+cycled (30.030 s), sysinfo normal, `sense on err=0` (30.229 s), `43 05 31` (30.864 s), ghost
+contacts (33.9 s), `43 05 30` (34.194 s), recovery 2, then only `alive ticks`/`irq=1
+errors=0`. The user confirmed SpringBoard booted with no touch. Dimming is ruled out.
+
+**New observation that changes the next test.** The first DCS at 49.850 s read `status
+0x00000000 fifo 0x11111010` — the cold-boot DSI signature, not the `status 0x5 fifo 0x1010`
+warm signature seen in `touch-warm-paneloff`. So a warm boot can reach the cold DSI state and
+touch still fails; the DSI controller state is not the differentiator at the time of the first
+DCS. The failure is already decided earlier: the chip reports `43 05 31` 0.6 s after sense-on
+(30.229 s), while cold reports the same event only at 177.7 s and then keeps working.
+
+**Timeline clue (unconfirmed).** The only XNU "display on" is `SWEET FB: display on`, which
+patch 0079 shows is backboardd's `RequestPowerChange` state, not a DSI/panel power command,
+and it arrives at 49.8 s — ~20 s after touch init. The panel is on from ABL in both cases, so
+the difference is the panel content/refresh state when the chip first calibrates (boot logo /
+TWRP leftovers at 30 s versus a settled fastboot screen at 145 s on cold). Follow-up (done,
+failed): `cepheustouchdelay=90` ran with the same 0138 kernel; see `touch-warm-delay90` at
+the top. The chip was powered 50 s after display-on and still failed identically, so display
+state/timing at init is ruled out.
+
+### Warm boot with the TWRP panel powered off: touch still fails (`touch-warm-paneloff`, 2026-11-13)
+
+**Pre-warm state.** TWRP's screen timeout blanked the panel (`dsi_panel_disable:
+DSI_CMD_SET_OFF` at 247.12 s); `pm8150_l13`/`l14`, `disp_vci_vreg`, `lcdb_ldo` and
+`lcdb_ncp` were disabled before the reboot (`disp_vddio_vreg` stayed enabled for touch).
+Booted the `0138` kernel (SHA-256 `c36667c5...`, `cepheuswdt=0 cepheustouchlog=1 sweetbl=1`,
+default 200 ms rail-off) with `cepheusreboot=300`.
+
+**Result.** The chip was already unpowered at XNU entry (`controller before rails-off:
+unpowered` at 29.742 s). The driver cycled the rails (`rails cycled, off 200 ms, avdd ldoc1
+err=0` at 30.100 s), sysinfo was normal, `sense on err=0` at 30.272 s, and then the same
+warm failure: `43 05 31` at 30.864 s, ghost contacts at 32.87 s, `43 05 30` at 33.221 s,
+recovery 2, then only `alive ticks` with `irq=1 errors=0`. No touch. The first DCS write at
+50.248 s still saw the warm DSI signature (`status 0x00000005 fifo 0x00001010`, `int
+0x00000500` pending), i.e. powering the panel off in TWRP did not give ABL/XNU a cold DSI
+state. This rules out a simple "panel rail still on in TWRP" explanation, but not the panel
+register state itself.
+
+**Follow-up (done, failed).** The `dimmingoff` test was run; see `touch-warm-dimmingoff` above.
+TWRP sends `dimmingon` (`0x53 0x28`) on every panel enable and XNU never clears it, so this was
+the obvious panel-register candidate. The writable DCS node is the sysfs one
+(`.../card0-DSI-1/mipi_reg`), not `/proc/mipi_reg`; format is 2-digit read flag, space,
+2-digit read length, space, then the hex packet, e.g. `00 00 390100000100025320`. The panel
+ignores a 0x53 readback, so the write cannot be confirmed by reading back. Dimming-off did not
+fix touch, and that boot reached the cold DSI signature anyway.
 
 ### Warm-boot touch: `0137` failed; `0138` probes the rail-off (2026-11-13)
 

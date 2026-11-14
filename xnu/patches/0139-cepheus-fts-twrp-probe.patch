@@ -1,0 +1,270 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -28,7 +28,8 @@
+  * cepheustouchsysinfo=0 skip the 0xa6 frame read, cepheustouchpoll=0 read
+  * only when IRQ is low instead of also polling every 10 ms,
+  * cepheustouchpwr=0 keep the touch rails on at start,
+- * cepheustouchpwrms=N hold the rails off for N ms (default 200), and
++ * cepheustouchpwrms=N hold the rails off for N ms (default 200),
++ * cepheustouchprobe=0 skip TWRP's lockdown/CRC probe steps, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -85,6 +86,33 @@
+ #define FTS_SYSINFO_SIZE     208u
+ #define FTS_SYSINFO_SIG      0xa5u
+ #define FTS_SYSINFO_LOAD_ID  0x01u
++
++/*
++ * Probe-only HW access, from TWRP's fts_521 driver (ftsHardware.h,
++ * ftsCore.h, ftsCore.c).  TWRP reads the lockdown record and the CRC status
++ * register between its system reset and the sense-on; this driver used to
++ * skip both.  On I2C the fts_521 driver uses no dummy byte (DUMMY_HW_REG and
++ * DUMMY_CONFIG are 0 in the I2C branch), so the value starts at byte 0.
++ */
++#define FTS_CMD_HW_REG_R     0xfbu
++#define FTS_CRC_ADDR         0x20000078u
++#define FTS_CRC_MASK         0x03u
++#define FTS_CMD_LOCKDOWN     0xa6u
++#define FTS_LOCKDOWN_ADDR    0x0000u
++#define FTS_LOCKDOWN_HEAD    4u
++#define FTS_LOCKDOWN_DATA    20u
++#define FTS_LOCKDOWN_SIZE    8u
++#define FTS_LOCKDOWN_RETRY   2u
++#define FTS_LOCKDOWN_ID      0x70u
++#define FTS_EVT_TYPE_ECHO    0x01u
++#define FTS_EVT_CRC_CFG_HEAD 0x20u
++#define FTS_EVT_CRC_CFG      0x21u
++#define FTS_EVT_CRC_CX_HEAD  0xa0u
++#define FTS_EVT_CRC_CX       0xa1u
++#define FTS_EVT_CRC_CX_SUB_HEAD 0xa5u
++#define FTS_EVT_CRC_CX_SUB   0xa6u
++#define FTS_EVT_LOCKDOWN_FLASH 0x30u
++#define FTS_EVT_LOCKDOWN_NO_DATA 0x32u
+ 
+ /*
+  * ST FTS events (ftsSoftware.h): event[0] is the event id, event[1] holds
+@@ -568,13 +596,187 @@
+ 			}
+ 		} else if (ft.log || t == 0) {
+ 			printf("SWEET FTS: ready poll err=%d\n", err);
++		}
++		fts_wait(5);
++	}
++	return ETIMEDOUT;
++}
++
++/* Read one 32-bit-addressed HW register (0xfb, address, value). */
++static int
++fts_hw_reg_read(uint32_t addr, uint8_t *val)
++{
++	const uint8_t cmd[5] = {
++		FTS_CMD_HW_REG_R,
++		(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
++		(uint8_t)(addr >> 8), (uint8_t)addr,
++	};
++	return fts_i2c_read_buf(cmd, sizeof(cmd), val, 1);
++}
++
++/*
++ * Poll the FIFO for the FW echo of a command: status event 0x43, type 0x01,
++ * then the first bytes of the command (ftsCore.c checkEcho).
++ */
++static int
++fts_check_echo(const uint8_t *cmd, unsigned len, unsigned ms)
++{
++	uint8_t ev[FTS_EVENT_SIZE];
++	if (len > FTS_EVENT_SIZE - 3u) {
++		len = FTS_EVENT_SIZE - 3u;
++	}
++	for (unsigned t = 0; t < ms; t += 5) {
++		int err = fts_fifo_read(ev, sizeof(ev));
++		if (!err) {
++			if (ev[0] == FTS_EVT_STATUS &&
++			    ev[1] == FTS_EVT_TYPE_ECHO) {
++				unsigned i;
++				for (i = 0; i < len; ++i) {
++					if (ev[2 + i] != cmd[i]) {
++						break;
++					}
++				}
++				if (i == len) {
++					return 0;
++				}
++			}
++			if (ev[0] != 0x00u) {
++				fts_log_event("pre-echo", ev);
++			}
+ 		}
+ 		fts_wait(5);
+ 	}
+ 	return ETIMEDOUT;
+ }
+ 
++/* 0xa6 with a 16-bit address; no dummy byte on I2C. */
++static int
++fts_lockdown_read(uint16_t addr, uint8_t *buf, unsigned len)
++{
++	const uint8_t cmd[3] = {
++		FTS_CMD_LOCKDOWN,
++		(uint8_t)(addr >> 8), (uint8_t)addr,
++	};
++	return fts_i2c_read_buf(cmd, sizeof(cmd), buf, len);
++}
++
+ /*
++ * TWRP's fts_get_lockdown_info: read the 4-byte lockdown header, ask the FW
++ * for the record (0xa4/06/70), wait for the echo, then read the 28-byte
++ * record and require its sequence counter to advance.  The record itself is
++ * not used, but the command/echo exchange is part of TWRP's probe.
++ */
++static int
++fts_get_lockdown_info(void)
++{
++	uint8_t head[FTS_LOCKDOWN_HEAD];
++	uint8_t full[FTS_LOCKDOWN_DATA + FTS_LOCKDOWN_SIZE];
++
++	for (unsigned attempt = 0; attempt < FTS_LOCKDOWN_RETRY; ++attempt) {
++		int err = fts_lockdown_read(FTS_LOCKDOWN_ADDR, head,
++		    sizeof(head));
++		if (err) {
++			printf("SWEET FTS: lockdown head err=%d\n", err);
++			return err;
++		}
++		unsigned before = head[2] | ((unsigned)head[3] << 8);
++		const uint8_t cmd[3] = { 0xa4u, 0x06u, FTS_LOCKDOWN_ID };
++		err = fts_i2c_write_buf(cmd, sizeof(cmd));
++		fts_wait(10);
++		if (!err) {
++			err = fts_check_echo(cmd, sizeof(cmd), 200);
++		}
++		if (err) {
++			printf("SWEET FTS: lockdown echo err=%d\n", err);
++			continue;
++		}
++		err = fts_lockdown_read(FTS_LOCKDOWN_ADDR, full,
++		    sizeof(full));
++		if (err) {
++			printf("SWEET FTS: lockdown read err=%d\n", err);
++			return err;
++		}
++		unsigned after = full[2] | ((unsigned)full[3] << 8);
++		if (full[4] == FTS_EVT_LOCKDOWN_FLASH ||
++		    full[4] == FTS_EVT_LOCKDOWN_NO_DATA) {
++			printf("SWEET FTS: lockdown error type %02x\n",
++			    full[4]);
++			return EIO;
++		}
++		printf("SWEET FTS: lockdown sig=%02x id=%02x %02x cnt=%u/%u "
++		    "data=%02x%02x%02x%02x%02x%02x%02x%02x\n", full[0],
++		    full[1], FTS_LOCKDOWN_ID, before, after,
++		    full[FTS_LOCKDOWN_DATA], full[FTS_LOCKDOWN_DATA + 1],
++		    full[FTS_LOCKDOWN_DATA + 2], full[FTS_LOCKDOWN_DATA + 3],
++		    full[FTS_LOCKDOWN_DATA + 4], full[FTS_LOCKDOWN_DATA + 5],
++		    full[FTS_LOCKDOWN_DATA + 6], full[FTS_LOCKDOWN_DATA + 7]);
++		if (after == before + 1u) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/*
++ * TWRP's fts_crc_check: read the CRC status register, then reset the chip
++ * and scan the events that follow for a config or Cx checksum error.  The
++ * reset also leaves the FW in the same post-probe state TWRP senses on
++ * from; without it our first scan starts from the sysinfo-read state.
++ */
++static int
++fts_crc_check(void)
++{
++	uint8_t val = 0;
++	int err = fts_hw_reg_read(FTS_CRC_ADDR, &val);
++
++	printf("SWEET FTS: crc reg err=%d val=%02x\n", err, val);
++	if (err) {
++		return err;
++	}
++	if (val & FTS_CRC_MASK) {
++		printf("SWEET FTS: crc error %02x\n", val & FTS_CRC_MASK);
++		return EIO;
++	}
++
++	fts_reset();
++	if (!fts_bb_recover()) {
++		printf("SWEET FTS: SCL stuck low after crc reset\n");
++		return EIO;
++	}
++
++	uint8_t ev[FTS_EVENT_SIZE];
++	unsigned events = 0, cfg = 0, cx = 0;
++	bool ready = false;
++	for (unsigned t = 0; t < 500; t += 5) {
++		err = fts_fifo_read(ev, sizeof(ev));
++		if (!err) {
++			if (ev[0] == FTS_EVT_READY) {
++				ready = true;
++				break;
++			}
++			if (ev[0] == FTS_EVT_ERROR) {
++				events++;
++				if (ev[1] == FTS_EVT_CRC_CFG_HEAD ||
++				    ev[1] == FTS_EVT_CRC_CFG) {
++					cfg++;
++				} else if (ev[1] == FTS_EVT_CRC_CX_HEAD ||
++				    ev[1] == FTS_EVT_CRC_CX ||
++				    ev[1] == FTS_EVT_CRC_CX_SUB_HEAD ||
++				    ev[1] == FTS_EVT_CRC_CX_SUB) {
++					cx++;
++				}
++			} else if (ev[0] != 0x00u) {
++				fts_log_event("crc pre-ready", ev);
++			}
++		}
++		fts_wait(5);
++	}
++	printf("SWEET FTS: crc reset ready=%d events=%u cfg=%u cx=%u\n",
++	    ready, events, cfg, cx);
++	return ready ? 0 : ETIMEDOUT;
++}
++
++/*
+  * Both touch rails are dedicated to the controller: vdd-supply is
+  * touch_vddio_vreg (fixed regulator, GPIO 84) and avdd-supply is PM8150L L1
+  * (RPMh ldoc1, 1.8 V). Assert reset and remove both before powering up again.
+@@ -876,6 +1078,23 @@
+ 	}
+ 
+ 	/*
++	 * TWRP's probe reads the lockdown record and checks the CRC register
++	 * between its first reset and the final sense-on; the CRC check adds
++	 * a system reset of its own.  Replay both, so the FW has seen the
++	 * same probe commands before the first scan.  cepheustouchprobe=0
++	 * skips this and keeps the old path.
++	 */
++	unsigned do_probe = 1;
++	(void)PE_parse_boot_argn("cepheustouchprobe", &do_probe,
++	    sizeof(do_probe));
++	if (do_probe) {
++		int lerr = fts_get_lockdown_info();
++		printf("SWEET FTS: lockdown probe err=%d\n", lerr);
++		int cerr = fts_crc_check();
++		printf("SWEET FTS: crc probe err=%d\n", cerr);
++	}
++
++	/*
+ 	 * Xiaomi's probe reads sysinfo after its first reset and then resets
+ 	 * the chip again (twice, in fact) before the final a0/00/01. The last
+ 	 * reset clears whatever the 0xa6 frame read leaves behind; without it
+@@ -897,8 +1116,8 @@
+ 	}
+ 
+ 	err = fts_sense_on();
+-	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u\n",
+-	    err, poll_enable, extra_resets, do_si);
++	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u "
++	    "probe=%u\n", err, poll_enable, extra_resets, do_si, do_probe);
+ 	if (err) {
+ 		goto out;
+ 	}
