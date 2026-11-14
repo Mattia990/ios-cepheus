@@ -249,6 +249,11 @@ Of the ~81 original ios-sweet kernel patches:
   sense-off (`a0 00 00`), wait 50 ms (`WAIT_AFTER_SENSEOFF`) and sense-on again, matching
   TWRP's `fts_init_sensing` FOD branch; the first calibration is aborted before it
   completes. `cepheustouchsensecycle=0` keeps the single sense-on.
+- 0141 touch: `SweetFramebuffer.cpp` increments `sweet_fb_display_on_count` in
+  `kSweetFBRequestPowerChange` when the display turns on; the FTS thread polls it and,
+  on a change, resets the controller, waits for ready and sends sense-on (`a0 00 01`, no
+  rail cycle), matching TWRP's `fts_drm_state_chg_callback` after `DSI_CMD_SET_ON`.
+  `cepheustouchdisplay=0` disables it.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

@@ -5,6 +5,32 @@ Last updated **2026-11-14** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### 0140 sense cycle failed; display-on reinit is next (2026-11-14)
+
+**0140 warm run (`touch-0140`).** Kernel built with 0140
+(`work/boot/kernel-brightness/kernel.development.sweet`, SHA-256 `9635bbb...`), booted
+warm from TWRP 3.5.2. The sense-on line reports `cycle=1`: sense-on at 30.495 s, then the
+usual failure: ghost multi-touch burst at 34.027-34.137 s, `early status failure` at
+34.320 s (+3.8 s), clean recovery power cycle at 35.000 s, display on at 49.554 s, alive
+through 90 s, **no real touch**. Logs: `logs/runs/touch-0140/`.
+
+**Result.** The sense-on/off/on cycle is not the trigger either. The last TWRP difference
+is its DRM notifier: on `DSI_CMD_SET_ON` it resets the FTS controller (reset
+1.838-1.860 s) and sends sense-on (1.8604 s). XNU's display turns on at 49.554 s, long
+after the first scan and recovery.
+
+**Next: 0141.** `xnu/patches/0141-cepheus-fts-display-reinit.patch` makes
+`SweetFramebuffer.cpp` bump `sweet_fb_display_on_count` in `kSweetFBRequestPowerChange`
+when `!off`; the FTS thread polls it and, on a change, resets the controller
+(`fts_reset`), waits for ready and sends sense-on (`a0 00 01`, no rail cycle), matching
+TWRP's `fts_drm_state_chg_callback`. `cepheustouchdisplay=0` disables it, and the sense-on
+line now ends `display=1`. Build on top of 0140, boot warm from TWRP, swipe from ~30 s to
+~90 s: expect `SWEET FTS: display on 1; reset and sense on` around 49.5 s, and touch
+should start after it. Run with `cepheustouchlog=1` to see the force-cal byte that follows
+the reinit; the reinit itself logs regardless. If it still fails, rerun the same kernel
+with `cepheustouchpwr=0 cepheustouchrecover=0` to remove every rail cycle and isolate the
+display reinit.
+
 ### 0139 probe replayed, warm touch still fails; test the sense-on/off/on cycle (2026-11-14)
 
 **0139 warm run (`touch-0139`).** Kernel built with 0139
@@ -29,12 +55,12 @@ first scan calibrates badly either way. What TWRP still does that we do not is i
 TWRP's force-cal event then carries sub-status `02`; ours carries `01` (the cold-boot
 success also logs `01`, so the byte alone proves nothing).
 
-**Next: 0140.** `xnu/patches/0140-cepheus-fts-sense-cycle.patch` adds `fts_sense_cycle()`
-(on, 2 ms, off, 50 ms, on) and uses it at init and recovery; `cepheustouchsensecycle=0`
-keeps the old single sense-on, and the sense-on line now ends `cycle=1`. Build on top of
-0139, boot warm from TWRP, swipe from ~30 s to ~65 s. If it still fails, the last TWRP
-step is the display-notifier: a system reset + sense-on right after the panel's
-`DSI_CMD_SET_ON` (TWRP 1.838-1.860 s; XNU display-on was 49.527 s in `touch-0139-pwr0`).
+**0140 (tested, failed).** `xnu/patches/0140-cepheus-fts-sense-cycle.patch` adds
+`fts_sense_cycle()` (on, 2 ms, off, 50 ms, on) and uses it at init and recovery;
+`cepheustouchsensecycle=0` keeps the old single sense-on, and the sense-on line ends
+`cycle=1`. The warm test still failed (see the 0140 section above). The last TWRP step is
+the display-notifier: a system reset + sense-on right after the panel's `DSI_CMD_SET_ON`
+(TWRP 1.838-1.860 s; XNU display-on was 49.527 s in `touch-0139-pwr0`).
 
 ### Panel re-init replay: DSI path works, display stays dark, touch unchanged (2026-11-14)
 

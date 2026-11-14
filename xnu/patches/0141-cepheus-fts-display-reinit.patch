@@ -1,0 +1,115 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index ec2ca70..e13ea8c 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -30,7 +30,8 @@
+  * cepheustouchpwr=0 keep the touch rails on at start,
+  * cepheustouchpwrms=N hold the rails off for N ms (default 200),
+  * cepheustouchprobe=0 skip TWRP's lockdown/CRC probe steps,
+- * cepheustouchsensecycle=0 keep the single sense-on, and
++ * cepheustouchsensecycle=0 keep the single sense-on,
++ * cepheustouchdisplay=0 skip the reset+sense-on on display-on, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -52,6 +53,8 @@ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets,
+     const uint32_t *values);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++/* Bumped by SweetFramebuffer.cpp when the display turns on. */
++extern volatile uint32_t sweet_fb_display_on_count;
+ void sweet_fts_init(void);
+ 
+ #define FTS_TLMM_SOUTH_PA 0x03d00000u   /* SDA 55 / SCL 56 / IRQ 122 */
+@@ -1067,7 +1070,7 @@ fts_thread(void *arg, wait_result_t result)
+ 	printf("SWEET FTS: bus sda=%u scl=%u\n", ft.sda, ft.scl);
+ 
+ 	unsigned do_si = 1, extra_resets = 1, poll_enable = 1, recover_enable = 1;
+-	unsigned do_cycle = 1;
++	unsigned do_cycle = 1, display_reinit = 1;
+ 	(void)PE_parse_boot_argn("cepheustouchsysinfo", &do_si, sizeof(do_si));
+ 	(void)PE_parse_boot_argn("cepheustouchreset2", &extra_resets,
+ 	    sizeof(extra_resets));
+@@ -1077,6 +1080,8 @@ fts_thread(void *arg, wait_result_t result)
+ 	    sizeof(recover_enable));
+ 	(void)PE_parse_boot_argn("cepheustouchsensecycle", &do_cycle,
+ 	    sizeof(do_cycle));
++	(void)PE_parse_boot_argn("cepheustouchdisplay", &display_reinit,
++	    sizeof(display_reinit));
+ 	ft.recover_enable = recover_enable != 0;
+ 	if (extra_resets > 5u) {
+ 		extra_resets = 5u;
+@@ -1152,12 +1157,13 @@ fts_thread(void *arg, wait_result_t result)
+ 
+ 	err = do_cycle ? fts_sense_cycle() : fts_sense_on();
+ 	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u "
+-	    "probe=%u cycle=%u\n", err, poll_enable, extra_resets, do_si,
+-	    do_probe, do_cycle);
++	    "probe=%u cycle=%u display=%u\n", err, poll_enable, extra_resets,
++	    do_si, do_probe, do_cycle, display_reinit);
+ 	if (err) {
+ 		goto out;
+ 	}
+ 	ft.sense_time = mach_absolute_time();
++	uint32_t display_seen = sweet_fb_display_on_count;
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!ft.dead) {
+ 		/* The IRQ line (active low) says events are pending; also read
+@@ -1210,6 +1216,30 @@ fts_thread(void *arg, wait_result_t result)
+ 				ft.sense_time = mach_absolute_time();
+ 			}
+ 		}
++		/*
++		 * TWRP resets the controller in its DRM notifier right after
++		 * DSI_CMD_SET_ON. Recalibrate once the panel is up: a scan
++		 * started while it was off can lock onto a bad baseline.
++		 */
++		if (display_reinit && !ft.dead &&
++		    sweet_fb_display_on_count != display_seen) {
++			display_seen = sweet_fb_display_on_count;
++			printf("SWEET FTS: display on %u; reset and sense on\n",
++			    display_seen);
++			fts_release_all();
++			fts_reset();
++			int derr = fts_bb_recover() ? 0 : EIO;
++			if (!derr) {
++				derr = fts_wait_ready(500);
++			}
++			if (!derr) {
++				derr = fts_sense_on();
++			}
++			printf("SWEET FTS: display reinit err=%d\n", derr);
++			if (!derr) {
++				ft.sense_time = mach_absolute_time();
++			}
++		}
+ 		if ((ticks % 2000u) == 0u) {
+ 			printf("SWEET FTS: alive ticks=%u irq=%u errors=%u\n",
+ 			    ticks,
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 998d4e9..aa076de 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -108,6 +108,13 @@ static int sweet_fb_sel_log;
+ /* boot-arg sweetfb_async_log=1: log every async call/completion, not just the first per selector */
+ static int sweet_fb_async_log;
+ 
++/*
++ * 0141: bumped by kSweetFBRequestPowerChange when the display turns on.
++ * The FTS touch driver polls it and recalibrates after the panel is up,
++ * like TWRP's fts_drm_state_chg_callback after DSI_CMD_SET_ON.
++ */
++extern "C" volatile uint32_t sweet_fb_display_on_count = 0;
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ 
+@@ -1438,6 +1445,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (!off) {
+ 				/* sweetbl=2: give CoreBrightness a backlight only once the display is up */
+ 				sweet_bl_publish(fFB, true);
++				/* 0141: the panel is up; FTS resets and recalibrates */
++				sweet_fb_display_on_count++;
+ 			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
