@@ -126,6 +126,23 @@ void sde_kick(void)
 }
 
 /*
+ * Restart scanout after the panel was reset: the panel stops driving TE, the
+ * INTF tear check goes idle, and autorefresh alone no longer starts frames.
+ * This is disptest phase G's proven manual sequence (autorefresh off, flush,
+ * kick, one frame, autorefresh back on).
+ */
+void sde_restart(void)
+{
+	if (!sde.ctl || !sde.intf)
+		return;
+	sde_autorefresh(0);
+	wr32(sde.ctl + CTL_FLUSH, 0x3u | (1u << 17));
+	sde_kick();
+	delay_ms(40);
+	sde_autorefresh(1);
+}
+
+/*
  * No CTL_START here: a kick while autorefresh runs wedges the pipe, and the
  * panel keeps its last frame with noise on top (disptest phase D, 2026-10-20).
  * Autorefresh starts frames by itself; a kick is only for manual mode.

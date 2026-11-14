@@ -15,6 +15,7 @@
 #include "ramlog.h"
 #include "log.h"
 #include "sde.h"
+#include "panel.h"
 #include "showlog.h"
 #include "diag.h"
 #include "disptest.h"
@@ -189,6 +190,156 @@ static void log_pmic(void)
 	log_printf("\n");
 }
 
+static void log_spmi_regs(uint32_t sid, uint32_t base, const char *name,
+			  const uint16_t *regs, unsigned n)
+{
+	log_printf("%s:", name);
+	for (unsigned i = 0; i < n; i++) {
+		uint8_t v = 0;
+		int rc = spmi_read(sid, base + regs[i], &v);
+		log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+	}
+	log_printf("\n");
+}
+
+/*
+ * PM8150L LDO1 (touch AVDD, fixed 1.8 V) lives on SPMI SID 5, peripheral
+ * 0x40, so its registers are at 0x4000+off.  The RPMh regulator driver
+ * controls it through the AOP, but the SPMI observer channel can read the
+ * PMIC's actual retained state.  Compare cold and warm boots: 0x40 range,
+ * 0x41 set point, 0x45 mode, 0x46 enable, 0x4c soft start.  Subtype 0x71
+ * is LDO_510 (hfsmps ops): its output pull-down is 0xa0 bit 7, not 0x48.
+ * LDO2 (0x4100) is a control that no touch code touches.
+ */
+static void log_pm8150l_ldo(uint32_t sid, uint32_t base, const char *name)
+{
+	static const uint16_t regs[] = {
+		0x04, 0x05, 0x08, 0x09, 0x0a, 0x0b,
+		0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x48, 0x4c,
+		0x53, 0x60, 0x62, 0x64, 0x88, 0xa0,
+	};
+	log_spmi_regs(sid, base, name, regs, sizeof(regs) / sizeof(regs[0]));
+}
+
+/*
+ * Touch pins at shim entry, before XNU or its driver touches TLMM.
+ *   south TLMM: SDA 55, SCL 56, IRQ 122
+ *   north TLMM: reset 12, VDDIO 84 (disp_vddio_vreg enable)
+ * Same layout as the XNU driver: cfg [1:0] pull (0 none, 1 down, 2 keeper,
+ * 3 up), [5:2] mux, [8:6] drive (mA/2 - 1), [9] output; io bit 1 is the
+ * output latch and bit 0 the pad level.
+ */
+#define TLMM_SOUTH_PA		0x03d00000UL
+#define TLMM_NORTH_PA		0x03900000UL
+#define TLMM_EAST_PA		0x03500000UL	/* GPIO 21: disp_vci_vreg enable */
+#define TLMM_CFG(n)		((uint32_t)(n) * 0x1000u)
+#define TLMM_IO(n)		(TLMM_CFG(n) + 4u)
+
+/* N none, D down, K keeper, U up -- avoid string-pointer tables. */
+static char pull_char(uint32_t cfg)
+{
+	uint32_t pull = cfg & 3;
+	if (pull == 0)
+		return 'N';
+	if (pull == 1)
+		return 'D';
+	if (pull == 2)
+		return 'K';
+	return 'U';
+}
+
+static void log_pin(const char *name, uintptr_t base, unsigned pin)
+{
+	uint32_t cfg = rd32(base + TLMM_CFG(pin));
+	uint32_t io = rd32(base + TLMM_IO(pin));
+	log_printf("  %s[%u] cfg %x (pull %c mux %u %umA %s) io %x\n", name, pin,
+		   cfg, pull_char(cfg), (cfg >> 2) & 0xf,
+		   (((cfg >> 6) & 7) + 1) * 2, (cfg & 0x200) ? "out" : "in", io);
+}
+
+static void log_touch_pins(const char *tag)
+{
+	log_printf("touch tlmm %s:\n", tag);
+	log_pin("sda", TLMM_SOUTH_PA, 55);
+	log_pin("scl", TLMM_SOUTH_PA, 56);
+	log_pin("irq", TLMM_SOUTH_PA, 122);
+	log_pin("reset", TLMM_NORTH_PA, 12);
+	log_pin("vddio", TLMM_NORTH_PA, 84);
+}
+
+/*
+ * Panel state at shim entry. ABL owns the panel on both cold and warm boots
+ * and XNU never re-initializes it (patch 0079 only tracks the backlight
+ * state), so a warm reset that skips ABL's panel init leaves the DDIC in
+ * whatever state the previous OS left. Log the pins and rails that decide
+ * that state.
+ *
+ * pinctrl-sm8150: GPIO 6 (panel reset) is on the south tile, GPIO 8 (TE) on
+ * the north tile.  VCI/VDDIO are PM8150 LDO13/LDO14 (SID 0, 0x4c00/0x4d00,
+ * RPMh-controlled; read-only here).  LAB/IBB are the PM8150L LCDB block
+ * (SID 5, 0xec00): 0x46 enable, 0x45 module ready, 0x08/0x0a/0x0b/0x10
+ * status, 0x71/0x81 LDO/NCP setpoints, 0x77/0x87 pull-downs, 0x60 touch
+ * wake.
+ */
+static void log_panel_state(int spmi_ok)
+{
+	static const uint16_t lcdb[] = {
+		0x08, 0x0a, 0x0b, 0x10, 0x40, 0x41, 0x45, 0x46, 0x47,
+		0x4b, 0x50, 0x53, 0x60, 0x62, 0x66, 0x71, 0x75, 0x77,
+		0x79, 0x7b, 0x81, 0x85, 0x87, 0x8b,
+	};
+	log_printf("panel tlmm entry:\n");
+	log_pin("reset", TLMM_SOUTH_PA, 6);
+	log_pin("te", TLMM_NORTH_PA, 8);
+	log_pin("vci", TLMM_EAST_PA, 21);
+	if (!spmi_ok)
+		return;
+	log_pm8150l_ldo(0, 0x4c00, "pm8150 ldo13 vci");
+	log_pm8150l_ldo(0, 0x4d00, "pm8150 ldo14 vddio");
+	log_spmi_regs(5, 0xec00, "pm8150l lcdb lab/ibb", lcdb,
+		      sizeof(lcdb) / sizeof(lcdb[0]));
+	/*
+	 * The OLED rails are the other analogue state that survives a warm
+	 * reset: the touch sensor sits on the panel, so ELVDD/ELVSS affect its
+	 * mutual capacitance.  qpnp-amoled-regulator.c: 0x04 peripheral type
+	 * (IBB 0x20, AB 0x24, OLEDB 0x2c), AB_STATUS1 0x08 (VREG_OK bit 6),
+	 * AB PD 0x78, IBB PS 0x50 / PD 0x47 / NLIMIT 0x61 / smart PS 0x65.
+	 * The block is status = "disabled" in the live DTB, so compare cold
+	 * and warm boots before trusting any of these values.
+	 */
+	static const uint16_t amoled[] = {
+		0x04, 0x08, 0x47, 0x50, 0x61, 0x65, 0x72, 0x78,
+	};
+	log_spmi_regs(5, 0xdc00, "pm8150l amoled ibb", amoled,
+		      sizeof(amoled) / sizeof(amoled[0]));
+	log_spmi_regs(5, 0xde00, "pm8150l amoled ab", amoled,
+		      sizeof(amoled) / sizeof(amoled[0]));
+	log_spmi_regs(5, 0xe000, "pm8150l amoled oledb", amoled,
+		      sizeof(amoled) / sizeof(amoled[0]));
+}
+
+/*
+ * Diagnostic for the warm-boot touch failure: hold the display panel in reset
+ * across the jump to XNU.  ABL leaves the panel initialized on both cold and
+ * warm boots and XNU never re-initializes it, so this isolates whether the
+ * display DDIC/sensor environment is what breaks the FTS mutual-strength
+ * calibration.  The screen stays dark; read the XNU log from TWRP afterwards.
+ */
+static void panel_hold_reset(void)
+{
+	uint32_t io = rd32(TLMM_SOUTH_PA + TLMM_IO(6));
+	log_printf("panel: hold reset, cfg %x io %x\n",
+		   rd32(TLMM_SOUTH_PA + TLMM_CFG(6)), io);
+	wr32(TLMM_SOUTH_PA + TLMM_IO(6), io & ~2u);
+	uint32_t cfg = rd32(TLMM_SOUTH_PA + TLMM_CFG(6)) & ~0x3ffu;
+	cfg |= (1u << 6) | 0x200u;	/* mux 0, no pull, 4 mA, output low */
+	wr32(TLMM_SOUTH_PA + TLMM_CFG(6), cfg);
+	delay_ms(5);
+	log_printf("panel: reset held, cfg %x io %x\n",
+		   rd32(TLMM_SOUTH_PA + TLMM_CFG(6)),
+		   rd32(TLMM_SOUTH_PA + TLMM_IO(6)));
+}
+
 static void log_gic(void)
 {
 	log_printf("gic: ctlr %x typer %x iidr %x\n", rd32(GICD_BASE), rd32(GICD_BASE + 4),
@@ -263,9 +414,13 @@ void shim_main(uintptr_t dtb)
 	log_printf("CEPHEUSSHIM probe v1 t=%lu\n", ticks_now());
 	log_cpu(dtb);
 	dump_pram();
+	log_touch_pins("entry");
 	int spmi_ok = !spmi_init();
+	log_panel_state(spmi_ok);
 	if (spmi_ok) {
 		log_pmic();
+		log_pm8150l_ldo(5, 0x4000, "pm8150l ldo1");
+		log_pm8150l_ldo(5, 0x4100, "pm8150l ldo2");
 		set_reboot_bootloader();
 		set_hard_reset();
 	}
@@ -341,6 +496,16 @@ void shim_main(uintptr_t dtb)
 	sde_sample("autorefresh", 16, 20);
 	save_log("display");
 
+#ifdef SHIM_PANEL_OFF
+	panel_hold_reset();
+	save_log("panel reset held");
+#endif
+#ifdef SHIM_PANEL_INIT
+	panel_reinit();
+	sde_restart();
+	sde_sample("after panel", 8, 20);
+	save_log("panel reinit");
+#endif
 	/* An XNU payload in the ramdisk means: boot it. */
 	struct loader_fb lfb = { fb, stride, FB_W, FB_H, save_before_jump };
 	if (loader_has_payload(dtb) && 0)

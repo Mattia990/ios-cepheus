@@ -12,4 +12,5 @@ extern struct sde_state sde;
 void sde_probe(void);
 void sde_sample(const char *what, int n, unsigned ms);
 void sde_kick(void);
+void sde_restart(void);
 void sde_autorefresh(int frames);

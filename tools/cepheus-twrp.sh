@@ -13,8 +13,24 @@ fastboot set_active a 2>&1 | tail -1
 # ABL drops off USB for a moment after set_active; boot only once it answers.
 sleep 2
 for i in $(seq 1 30); do fastboot getvar product >/dev/null 2>&1 && break; sleep 1; done
-twrp=downloads/twrp/twrp-3.7.1_12-0-cepheus.img
+twrp=downloads/twrp/twrp-3.5.2_9-0-cepheus.img
 [ -f "$twrp" ] || twrp=downloads/twrp/twrp-3.6.1_9-0-cepheus.img
+# A recovery image that still carries its AVB footer is rejected by ABL with
+# "Failed to load/authenticate boot image: Load Error": the vbmeta names the
+# recovery partition and its hash covers the original image size, but
+# `fastboot boot` loads the whole file.  Strip the footer into a sibling
+# -nofooter.img (avbtool truncates it in place).
+case $twrp in
+*-nofooter.img) ;;
+*)
+	stripped=${twrp%.img}-nofooter.img
+	if [ ! -f "$stripped" ] || [ "$twrp" -nt "$stripped" ]; then
+		cp "$twrp" "$stripped"
+		python3 downloads/avb/avbtool.py erase_footer --image "$stripped" >/dev/null
+	fi
+	twrp=$stripped
+	;;
+esac
 fastboot boot "$twrp" 2>&1 | tail -1
 for i in $(seq 1 60); do
 	adb devices | grep -q recovery && { echo "TWRP up after ${i}s"; exit 0; }
