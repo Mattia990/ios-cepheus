@@ -5,6 +5,54 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Pre-XNU shim FTS probe reproduces the burst (`fts-probe-pre-xnu`, 2026-11-15)
+
+**Run.** Payload-less shim built with `-DSHIM_FTS_TEST`
+(`shim/build.sh "" work/boot/runs/fts-probe.img`, image sha256 `5a6513aa0cbf9550...`),
+warm from TWRP. `fts_test()` runs right after `wdt_off()`, before `ufs_init()` and
+before any XNU code (a few seconds after handoff; `saved (ufs up)` at 13.2 s). Logs:
+`logs/runs/fts-probe-pre-xnu/shim.txt`.
+
+**Setup.** Entry state matches every warm run (touch pins GPIO input/pull-up, panel pins
+unchanged, PM8150L LDO1 `46=0`, RPMh TCS 0-7 empty). VDDIO high, ldoc1 1800 mV (`err=0`,
+ACTIVE TCS0 3 commands, done; the off vote later shows TCS0 `first 4=0`). Reset low 10 ms /
+high 50 ms: ready event `err=0`, idle SDA/SCL high; sysinfo `err=0` (`a5 01 ...`);
+sense-on `err=0`.
+
+**Result.** `43 05 01` at t=0 and `43 01 a0 00 01` at t=6 ms, then a 33-event ghost burst
+from **t=3.786 to 3.978 s**, the same coordinates as XNU warm: x=1079 right edge (y=175,
+1465, 1759, 2175), y=174-176 top row (x=0, 165, 169, 372), and the same interior points
+(728,1512 / 169,1508 / 372,1472). No real touch. No `43 05 30` in the 6 s window (the
+probe stops there); both rails were then restored off with reset asserted before
+returning to fastboot.
+
+**Consequence.** The identical warm mis-calibration happens with no XNU code, 3.8 s
+after a clean reset and scan started a few seconds after ABL handoff. The poison is in
+pre-XNU warm-reset state (ABL warm path, an always-on domain, or something the shim
+setup shares with warm XNU boots). TWRP warm works from the same handoff, so the control
+is the **same probe image from a cold fastboot**: if it is clean cold, the poison
+predates XNU; if it also ghosts, the probe setup (bit-bang vs TWRP's hardware I2C/.ftb
+load, early-boot caches/MMU) is a confound and must be compared against TWRP before
+drawing pre-XNU conclusions.
+
+### Warm early scan fails: the poison is present before ~11 s (`touch-warm-early`, 2026-11-15)
+
+**Run.** Same 0141+0142 kernel (`logs/runs/touch-0150-warmnousb/kernel`), warm from TWRP,
+cmdline `cepheustouchdelay=0 cepheustouchlog=1 cepheusreboot=150`. Logs:
+`logs/runs/touch-warm-early/`. The user confirmed SpringBoard booted, display on, no touch.
+
+**Timeline.** FTS thread 9.696 s; first rails-off probe 9.862 s unpowered; rails off
+200 ms unpowered 10.226 s; rails cycled 10.253 s; ready 10.335 s (`sda=55 scl=56
+idle=1/1`); `sense on err=0 ... cycle=1 display=1` 10.970 s; `43 05 01` 10.973 s; ghost
+burst 14.373-14.520 s (+3.4 s) with the same ten contacts (x=1079 right edge at y=174,
+450, 1488, 2180; y=174-176 top row at x=0, 233, 306, 430, 569; interior 1050,1757);
+`43 05 30` 14.690 s; power cycle 14.690-15.778 s; display on 50.289 s; `display reinit
+err=0` 50.353 s; no real touch.
+
+**Consequence.** Starting the first scan at ~11 s, ~20 s before XNU's display-on and
+before backboardd, still produces the identical burst. The poison is present at the start
+of XNU bring-up; it is not created by later XNU subsystems (USB, display, GPU, UI).
+
 ### Cold with the panel already on works: the warm poison is host-side, not panel/chip (`touch-cold-delay55`, 2026-11-15)
 
 **Run.** Same 0141+0142 kernel (`logs/runs/touch-0150-warmnousb/kernel`), cmdline
@@ -40,14 +88,10 @@ ramp/POR, rails, panel, temperature, VBUS or display timing, and is present with
 visible entry state identical. It is host-side state created after ABL and surviving a
 warm reset, or an ABL cold-vs-warm boot-path difference.
 
-**Next control: scan early on a warm boot.** Warm from TWRP with the same kernel and
-`cepheustouchdelay=0` (default rails cycle): the first sense-on lands at ~10 s, before
-backboardd/display-on and ~20 s earlier than every previous warm run, roughly the
-position where TWRP's warm probe succeeds (1.2 s). If it works, XNU creates the poison
-between 10 s and 30 s and the next step is to bisect XNU bring-up (USB, PCIe, display,
-GPU). If it fails, the poison predates XNU and the next step is shim-side instrumentation
-of the always-on domains (AOP/RSC/GCC) and, if needed, a shim-side FTS sense test before
-the jump.
+**Next control: scan early on a warm boot.** Done as `touch-warm-early` (see the section
+above): first sense-on at 10.97 s still fails with the same burst at +3.4 s. A shim-side
+FTS bring-up (`fts-probe-pre-xnu`) also fails at +3.8 s with no XNU code, so the poison
+predates XNU. The open control is the same probe image cold (see the top section).
 
 ### Pre-powered rails do not fix warm touch; rail ramp/POR timing is ruled out (`touch-warm-prepower`, 2026-11-15)
 

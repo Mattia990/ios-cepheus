@@ -17,6 +17,7 @@
 #include "sde.h"
 #include "panel.h"
 #include "rpmh.h"
+#include "ftstest.h"
 #include "showlog.h"
 #include "diag.h"
 #include "disptest.h"
@@ -544,6 +545,14 @@ void shim_main(uintptr_t dtb)
 	}
 	/* Probe runs reset themselves; only an XNU boot arms the watchdog. */
 	wdt_off();
+#ifdef SHIM_FTS_TEST
+	/*
+	 * Runs before ufs_init(), i.e. ~1 s after handoff and before any XNU
+	 * code.  The log lines stay in RAM and are written by the first save
+	 * after UFS is up.
+	 */
+	fts_test();
+#endif
 #ifdef SHIM_DIAG
 	sde_probe();
 	uintptr_t dfb = sde.pipe ? rd32(sde.pipe + 0x14) : 0;
