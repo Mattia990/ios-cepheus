@@ -254,6 +254,11 @@ Of the ~81 original ios-sweet kernel patches:
   on a change, resets the controller, waits for ready and sends sense-on (`a0 00 01`, no
   rail cycle), matching TWRP's `fts_drm_state_chg_callback` after `DSI_CMD_SET_ON`.
   `cepheustouchdisplay=0` disables it.
+- 0142 touch: `fts_sense_cycle()` runs the first scan for `cepheustouchsensems` ms
+  (default 350), senses off, waits 50 ms, then resets the controller, waits for ready and
+  senses on, matching the point where TWRP cuts its first scan and system-resets FTS
+  before the second calibration. `cepheustouchcyclereset=0` skips the reset (control);
+  the sense-on line reports `ms=N cr=1`.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

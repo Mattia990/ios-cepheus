@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -31,6 +31,9 @@
+  * cepheustouchpwrms=N hold the rails off for N ms (default 200),
+  * cepheustouchprobe=0 skip TWRP's lockdown/CRC probe steps,
+  * cepheustouchsensecycle=0 keep the single sense-on,
++ * cepheustouchsensems=N run the first scan for N ms before cutting it
++ * short and resetting the controller (default 350),
++ * cepheustouchcyclereset=0 skip that reset (350 ms on, 50 ms off only),
+  * cepheustouchdisplay=0 skip the reset+sense-on on display-on, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+@@ -143,7 +146,7 @@
+ 	bool recover, recover_enable;
+ 	int log;
+ 	unsigned sda, scl;
+-	unsigned recoveries, off_ms;
++	unsigned recoveries, off_ms, sense_ms, cycle_reset;
+ 	uint64_t sense_time;
+ 	uint32_t active;
+ 	int x[FTS_MAX], y[FTS_MAX];
+@@ -478,6 +481,10 @@
+ 	*count = more + 1u;
+ 	return 0;
+ }
++
++static void fts_reset(void);
++static int fts_wait_ready(unsigned ms);
++static void fts_release_all(void);
+ 
+ /* 0xa0/00/01: active scan mode, MT sensing on. */
+ static int
+@@ -494,28 +501,44 @@
+ }
+ 
+ /*
+- * TWRP's fts_init_sensing (fts_521, CONFIG_FTS_FOD_AREA_REPORT) turns the
+- * scan on, off again immediately, waits WAIT_AFTER_SENSEOFF (50 ms) and
+- * turns it back on.  The first calibration is aborted before it completes;
+- * the second one is the calibration the chip keeps.  A warm-boot chip
+- * without the toggle reports edge ghosts and 43 05 30 a few seconds after
+- * the first scan starts.
++ * TWRP's first scan only runs for ~350 ms: sense-on at 1.231 s, DRM blank
++ * at 1.604 s (sense-off, low-power scan), panel power cycle, then a
++ * controller system reset and the second sense-on at 1.880 s. That second
++ * calibration never reports the warm-boot edge ghosts or 43 05 30, while a
++ * scan left running in XNU latches the bad mutual baseline after ~3.5 s and
++ * a later reset (0141's display reinit) does not clear it. Cut the first
++ * scan at the same point, reset, and keep the second calibration.
+  */
+ static int
+ fts_sense_cycle(void)
+ {
+ 	int err = fts_sense_set(FTS_SENSE_ON);
+-	fts_wait(2);
++	fts_wait(ft.sense_ms);
+ 	int off = fts_sense_set(0);
+ 	if (off && !err) {
+ 		err = off;
+ 	}
+ 	fts_wait(50);
+-	int on = fts_sense_set(FTS_SENSE_ON);
+-	if (on && !err) {
+-		err = on;
++	if (ft.cycle_reset) {
++		fts_release_all();
++		fts_reset();
++		if (!fts_bb_recover() && !err) {
++			err = EIO;
++		}
++		int rerr = fts_wait_ready(500);
++		if (rerr && !err) {
++			err = rerr;
++		}
+ 	}
+-	return err;
++	int on = fts_sense_set(FTS_SENSE_ON);
++	if (!on) {
++		/* The second scan is up; a slow reset handshake is not fatal. */
++		if (err) {
++			printf("SWEET FTS: sense cycle err=%d, scan on\n", err);
++		}
++		return 0;
++	}
++	return err ? err : on;
+ }
+ 
+ /* 0xa6/00/00 loads the system-info frame into the framebuffer. */
+@@ -1082,6 +1105,20 @@
+ 	    sizeof(do_cycle));
+ 	(void)PE_parse_boot_argn("cepheustouchdisplay", &display_reinit,
+ 	    sizeof(display_reinit));
++	unsigned sense_ms = 350;
++	(void)PE_parse_boot_argn("cepheustouchsensems", &sense_ms,
++	    sizeof(sense_ms));
++	if (sense_ms < 10u) {
++		sense_ms = 10u;
++	}
++	if (sense_ms > 2000u) {
++		sense_ms = 2000u;
++	}
++	ft.sense_ms = sense_ms;
++	unsigned cycle_reset = 1;
++	(void)PE_parse_boot_argn("cepheustouchcyclereset", &cycle_reset,
++	    sizeof(cycle_reset));
++	ft.cycle_reset = cycle_reset != 0;
+ 	ft.recover_enable = recover_enable != 0;
+ 	if (extra_resets > 5u) {
+ 		extra_resets = 5u;
+@@ -1157,8 +1194,9 @@
+ 
+ 	err = do_cycle ? fts_sense_cycle() : fts_sense_on();
+ 	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u "
+-	    "probe=%u cycle=%u display=%u\n", err, poll_enable, extra_resets,
+-	    do_si, do_probe, do_cycle, display_reinit);
++	    "probe=%u cycle=%u display=%u ms=%u cr=%u\n", err, poll_enable,
++	    extra_resets, do_si, do_probe, do_cycle, display_reinit,
++	    ft.sense_ms, ft.cycle_reset);
+ 	if (err) {
+ 		goto out;
+ 	}
