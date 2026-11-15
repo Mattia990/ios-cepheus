@@ -5,6 +5,40 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### 0150 warm with USB unplugged: VBUS makes the +0.5 s burst, not the +3.5 s failure (2026-11-15)
+
+**Run.** `touch-0150-warmnousb`, same 0141+0142 kernel (`5cc977a1...`), warm from TWRP,
+default shim, `cepheustouchlog=1`, 150 s. `adb reboot bootloader` -> `fastboot boot`; the
+USB cable was unplugged when the Mac spoke, 6 s after the image was sent (before XNU start
+at 9.459 s), and stayed off through the run. Logs: `logs/runs/touch-0150-warmnousb/`
+(`xnu.txt`, `shim.txt`).
+
+**Still warm, still fails.** Shim jump 9.459 s (warm UFS 7.5 s); FTS rails 30.163-30.190 s,
+sysinfo 30.298 s (same fw/cfg/afe/res), reset2 30.443 s, `sense on ... cycle=1 display=1
+ms=350 cr=1` 30.910 s, `43 05 01` + `43 01 a0 00 01` 30.913 s. XNU's battery line still
+prints `external=1` with `100% 4200mV`, but SWEET BATTERY is a hardcoded static fallback
+(the battery was at 92% when checked in TWRP), so it is not evidence of VBUS; the cable was
+physically off.
+
+**The +0.5 s ghost burst is gone.** In 0148 (USB on) five contacts appeared at +0.47 s;
+here there is **no event at all between sense-on and +3.22 s**. The early burst was
+USB/charger-coupled noise, and it also explains the "touch" seen at +0.45 s in 0147.
+
+**The main failure is unchanged.** At 34.133-34.206 s (+3.22 s after sense-on) six contacts
+entered: x=1079 at y=176/1481/1343 and y=176 at x=697/440/149, the same right/top edge
+pattern. `43 05 30` at 34.481 s (+3.57 s), early recovery 34.481-35.583 s, clean status
+35.583 s. Display on 49.929 s, reinit 49.991 s; second display on 92.138 s, reinit 92.201 s;
+alive ticks through 81.9 s (`irq=1 errors=0`); no finger events after the 34.2 s burst.
+
+**Consequences.** VBUS/charger is dead as the cause of the main failure: without a cable the
+chip still mis-calibrates at +3.2 s and goes silent. The early burst is a separate charger
+transient, not the defect. The phone is not hot either (battery 25.5 C, SoC 30-34 C in TWRP
+after the run), so the remaining cold/warm delta is not power, not temperature, and not the
+FTS chip's retained state (unpowered at entry, POR'd in both). The next clean control is a
+**cold boot with the display on before sense-on** (`cepheustouchdelay=55`): if it fails like
+the old touch-on4/on5, the panel's active state is a sufficient poison and the warm failure
+may be the same mechanism; if it works, the warm reset itself is the cause.
+
 ### 0149 cold control: 0142 works cold, no ghosts, 0141 display reinit harmless (2026-11-15)
 
 **Run.** `touch-0149-cold`, same 0141+0142 kernel (SHA-256 `5cc977a1...`), **cold**
@@ -47,7 +81,8 @@ sent removes VBUS/charger negotiation well before the first scan. Logs live on u
 replug and pull from TWRP afterwards. A 5 s rails-off warm run (`touch-warm3`) already
 failed, so discharge time and FTS retained state are ruled out. Cold with USB connected
 works (0149), so a warm-unplugged pass would isolate VBUS; a warm-unplugged fail would
-rule the charger out.
+rule the charger out. **Done as `touch-0150-warmnousb`: the main failure is unchanged, so
+VBUS/charger is ruled out; only the +0.5 s burst disappeared. See 0150 above.**
 
 ### 0148 quiet run: the chip mis-calibrates by itself on a warm boot (2026-11-15)
 
@@ -73,8 +108,9 @@ has **zero** finger events after 36 s.
 
 **Consequences.** The early-swipe confound is dead: a warm boot mis-calibrates with an
 untouched panel. The single "touch" seen at +0.5 s in 0147 and 0143 was this same early
-ghost burst, not a real finger. The failure is a chip-side calibration/baseline defect
-that appears immediately (early ghost burst) and trips `43 05 30` ~4 s later.
+ghost burst, not a real finger; 0150 later showed that burst is USB/charger noise and that
+it is not the defect. The defect is the chip-side calibration/baseline that trips
+`43 05 30` ~4 s later.
 
 **Next: cold control with this kernel** (same protocol: no touch until display-on + 20 s).
 Open questions it answers: (a) does cold still work with 0142, (b) does 0141's display-on
