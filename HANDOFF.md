@@ -5,6 +5,131 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### 0149 cold control: 0142 works cold, no ghosts, 0141 display reinit harmless (2026-11-15)
+
+**Run.** `touch-0149-cold`, same 0141+0142 kernel (SHA-256 `5cc977a1...`), **cold**
+(power off, power+vol to fastboot) at 12:16:50, default shim, `cepheustouchlog=1`, 150 s.
+The user touched only after SpringBoard was up. Logs: `logs/runs/touch-0149-cold/`
+(`cmdline`, `kernel`, `xnu.txt`, `shim.txt`).
+
+**Cold timing.** XNU starts at 40.237 s (cold ABL takes ~40 s; warm ABL ~9.5 s). FTS
+`starting in 20 s` 40.395 s, TLMM 60.397 s, rails-off positive probe 60.562 s
+(`controller before rails-off: unpowered`), rails off 200 ms 60.927 s, rails on 60.954 s,
+ready 61.038 s, sysinfo 61.062 s (fw 0060, cfg 0037, cx ffff, afe 03/03/03, 2339x1079
+tx=16 rx=34), lockdown 61.079 s, CRC 61.080-61.144 s, reset2 61.207 s, `sense on ...
+cycle=1 display=1 ms=350 cr=1` 61.674 s, then only `43 05 01` and `43 01 a0 00 01`
+(61.677 s).
+
+**No ghosts.** From sense-on 61.674 s to display-on 80.365 s (18.7 s, exactly the window
+where a warm chip fires its first five-contact burst at +0.47 s) there are **zero** events.
+Display on 80.365 s, `display on 1; reset and sense on` 80.367 s, `display reinit err=0`
+80.430 s, clean status 80.438 s; still nothing after the reinit. Alive ticks at
+74.165/86.653/99.120 s with `irq=1 errors=0`. No `43 05 30` anywhere in the run.
+
+**Touch works.** First finger: `enter 13 01 64 02 8b 00 07 00`, `touch 0 down at
+612,2224` 105.858 s (25.4 s after display-on, 44.2 s after sense-on), then normal
+enter/motion/leave through `touch 0 up at 464,1642` 135.338 s; 24 down/up pairs (48 events)
+in that window. One `43 05 31` at 192.677 s, immediately after the user's volume-up/power
+key events (192.515/192.557 s) and far outside the 5 s early-failure window, so it is not
+a failure; touch had already worked for 30 s.
+
+**What it settles.** (a) 0142 and 0141's display-on reset/reinit do not break cold touch;
+(b) a cold chip stays quiet through the whole warm failure window; (c) the shim's
+pre-XNU dump is identical warm vs cold except SDE scanout counters: PON/PS_HOLD,
+`reboot reason: pon spare 0 -> 4 (imem 77665500)`, panel VCI/VDDIO (both off), AMOLED
+AB/IBB, pm8150l ldo1/ldo2 and UFS all match. The differentiator is not a register the
+shim sees; it is either the warm environment during the scan (USB/charger, temperature)
+or state the shim does not dump.
+
+**Next experiment: warm boot with USB unplugged right after `fastboot boot`.** Sense-on
+is at ~30.9 s warm (XNU ~9.5 s + 21.4 s), so unplugging the cable 2-3 s after the image is
+sent removes VBUS/charger negotiation well before the first scan. Logs live on userdata;
+replug and pull from TWRP afterwards. A 5 s rails-off warm run (`touch-warm3`) already
+failed, so discharge time and FTS retained state are ruled out. Cold with USB connected
+works (0149), so a warm-unplugged pass would isolate VBUS; a warm-unplugged fail would
+rule the charger out.
+
+### 0148 quiet run: the chip mis-calibrates by itself on a warm boot (2026-11-15)
+
+**Run.** `touch-0148-quiet`, same 0141+0142 kernel (`5cc977a1...`), warm from TWRP,
+default shim, `cepheustouchlog=1`, 150 s. The user was told **not to touch at all** until
+SpringBoard had been visible for ~20 s. Logs: `logs/runs/touch-0148-quiet/` (`xnu.txt`,
+`shim.txt`).
+
+**Init identical to 0147.** FTS thread 9.654 s, TLMM 29.656 s, rails off 200 ms 30.185 s,
+rails on 30.212 s, ready 30.297 s, sysinfo/lockdown/CRC 30.320-30.402 s, reset2 30.466 s,
+`sense on ... ms=350 cr=1` 30.932 s.
+
+**The chip produced ghosts on its own.** At **31.405-31.443 s**, only 0.47 s after the
+second sense-on and ~18 s before XNU's display on, five contacts entered and left within
+38 ms: (135,988), (300,1763), (589,352), (591,1636), (589,2073). No finger was on the
+panel. A second five-contact burst followed at 34.599-34.646 s, four of them on the
+x=1079 edge plus (443,175); `43 05 30` came at 34.965 s (+4.03 s after sense-on), then
+the early recovery power cycle (34.965-36.057 s).
+
+**No touch ever worked.** Display on 49.825 s, `display reinit err=0` 49.895 s; second
+display on 88.358 s, reinit 88.427 s. The user swiped after the display was up; the log
+has **zero** finger events after 36 s.
+
+**Consequences.** The early-swipe confound is dead: a warm boot mis-calibrates with an
+untouched panel. The single "touch" seen at +0.5 s in 0147 and 0143 was this same early
+ghost burst, not a real finger. The failure is a chip-side calibration/baseline defect
+that appears immediately (early ghost burst) and trips `43 05 30` ~4 s later.
+
+**Next: cold control with this kernel** (same protocol: no touch until display-on + 20 s).
+Open questions it answers: (a) does cold still work with 0142, (b) does 0141's display-on
+reinit at ~50 s poison an otherwise healthy cold boot, and (c) what does the panel do
+during a cold `fastboot boot` (the shim's SDE probe shows a live scanning pipe with
+autorefresh on both cold and warm, so the panel is *not* simply off on cold). **Done as
+`touch-0149-cold`: cold touch works, no ghosts, the reinit is harmless; see above. Next:
+the warm USB-unplugged test.**
+
+### 0147 sense-window run: the cycle ran, an early ghost, then the same failure (2026-11-15)
+
+**Run.** `touch-0147-sensewindow`, 0141+0142 kernel (SHA-256 `5cc977a1...`, contains
+`cepheustouchsensems` and the `ms=%u cr=%u` format), warm from TWRP, default shim (no
+`SHIM_PANEL_*`), `cepheustouchlog=1`, 150 s. Logs: `logs/runs/touch-0147-sensewindow/`
+(`xnu.txt`, `shim.txt`).
+
+**The cycle ran.** FTS thread at 9.656 s (`starting in 20 s`), probe at 29.658 s, rails
+off 200 ms at 30.188 s, rails cycled 30.215 s, ready 30.299 s, sysinfo 30.323 s (fw 0060,
+cfg 0037, cx ffff, afe 03/03/03, 2339x1079 tx=16 rx=34), lockdown 30.340 s, CRC 30.341 s,
+crc reset 30.405 s, reset2 30.468 s, and `sense on err=0 ... cycle=1 display=1 ms=350 cr=1`
+at 30.935 s. The first (cut) sense-on was at ~30.47 s, so the 350 ms window, the 50 ms
+sense-off and the reset all executed. The usual `43 05 01` (mutual negative detect) and
+`43 01 a0 00 01` arrived at 30.938 s.
+
+**An early ghost, not a finger.** `SWEET HID: touch 0 down at 199,172` at 31.389 s and up
+at 31.404 s (17 ms after the second sense-on). The controller is not dead at sense-on (the
+status is clean), but 0148 later produced this exact burst with no finger on the panel, so
+this contact is display/touch noise, not a valid touch. The user was swiping from ~30 s as
+instructed.
+
+**Then the same failure, slightly later.** Ghost burst 35.146-35.235 s: six contacts,
+x=1079 (y=176, 1754), x=1068 (y=1482), x=983 (y=2190), x=981 (y=1758 edge), x=429
+(y=176), x=830 (y=1480). `43 05 30` (MS invalid Mutual Strength soft Force cal) at
+35.523 s, i.e. +4.21 s after the second sense-on and +4.68 s after the first one. Early
+recovery: `early status failure; power cycle 1` 35.523 s, `power cycle 1 err=0` 36.615 s,
+clean `43 05 01` + `43 01 a0 00 01` 36.623 s, and **no finger events after that** through
+the end of the run. Display on 49.537 s, `display on 1; reset and sense on` 49.539 s,
+`display reinit err=0` 49.602 s, `43 05 01` 49.611 s; second display on 71.025 s, reinit
+71.092 s, same status; alive ticks through 119.5 s with `errors=0`.
+
+**Reading.** The reset-before-the-latch idea is wrong: the chip still goes MS-invalid
+~4 s after scan start. The clean status right after the second calibration shows the
+controller and the I2C path are healthy at sense-on, so the failure is a later
+calibration/baseline event, not a dead bus or a rejected sense-on. The cycle also moved
+the failure later (from ~3.5 s to ~4.2-4.7 s after the first sense-on), so the 350 ms
+first scan did change the chip's timing.
+
+**Open confound (answered by 0148).** In every failing warm run the user was swiping a
+black screen from ~30 s, i.e. during/just after the chip's calibration; the cold runs that
+work were touched only after the display came on (~60-80 s). `touch-on5` (cold, delay 55,
+untouched at sense-on) failed on the first touch at +3.7 s, so early touch is not proven to
+be the trigger, but the warm runs never had a clean no-touch calibration. `touch-0148-quiet`
+(warm, same kernel, no touch before ~75 s) was the control: it produced the ghost burst at
+~35 s with no touch at all, so the warm state itself is the trigger.
+
 ### 0142 sense-window patch: cut the first scan early, reset, sense-on (2026-11-15)
 
 **Patch.** `xnu/patches/0142-cepheus-fts-sense-window.patch`, on top of 0141 (only
@@ -22,12 +147,11 @@ baseline after ~3.5 s, and a reset *after* that does not clear it (0140/0141). T
 variable is a reset *before* the latch, on a chip whose first scan was stopped the way
 TWRP stops it.
 
-**Test.** Build 0141+0142, boot warm from TWRP with the default shim (no `SHIM_PANEL_*`
-flags), `cepheustouchlog=1`, and swipe from ~30 s to the end of the run. Expected:
-`sense on ... ms=350 cr=1`, no edge ghost burst, no `43 05 30`, real `SWEET HID: touch`
-events. If the ghosts still appear ~3.5 s after the second sense-on, this cycle fails too;
-the next variable is reset timing relative to the panel (TWRP resets ~22 ms after
-`DSI_CMD_SET_ON`). Run name: `touch-0147-sensewindow`.
+**Test (ran as `touch-0147-sensewindow`; failed, see above).** Build 0141+0142, boot warm
+from TWRP with the default shim (no `SHIM_PANEL_*` flags), `cepheustouchlog=1`, and swipe
+from ~30 s to the end of the run. Expected: `sense on ... ms=350 cr=1`, no edge ghost
+burst, no `43 05 30`, real `SWEET HID: touch` events. Actual: the cycle ran, one early
+ghost at +0.45 s, then the ghost burst and `43 05 30` at +4.2 s.
 
 ### 0146 shim PHY cycle restores TE, not touch; panel state is ruled out (2026-11-14)
 
