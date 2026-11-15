@@ -340,6 +340,61 @@ static void panel_hold_reset(void)
 		   rd32(TLMM_SOUTH_PA + TLMM_IO(6)));
 }
 
+#ifdef SHIM_DSI_PROBE
+/*
+ * DSI0 controller/PHY/PLL state at shim entry (-DSHIM_DSI_PROBE).
+ *
+ * TWRP logs "PLL is already enabled. Skipping configuration." and still
+ * re-initializes the DSI controller and PHY from dsi_display_enable() when it
+ * powers the panel on; the shim has no such code.  A warm reset can leave the
+ * PLL, PLL SSC and PHY timing registers in a state the DDIC never recovers
+ * from once its rails drop.  Dump the three whole blocks so a cold and a warm
+ * log can be diffed word for word.
+ */
+#define DSI0_CTRL_PA	0xae94000UL
+#define DSI0_PHY_PA	0xae94400UL
+#define DSI0_PLL_PA	0xae94900UL
+#define DSI0_CTRL_LEN	0x400
+#define DSI0_PHY_LEN	0x760
+#define DSI0_PLL_LEN	0x260
+
+static void log_dsi_block(const char *name, uintptr_t base, uint32_t len)
+{
+	log_printf("dsi %s @%lx:", name, (uint64_t)base);
+	for (uint32_t off = 0; off < len; off += 4) {
+		log_printf(" %x=%x", off, rd32(base + off));
+		if ((off & 0x1f) == 0x1c)
+			log_printf("\n");
+	}
+	if (len & 0x1f)
+		log_printf("\n");
+}
+
+static unsigned log_te_edges(unsigned ms)
+{
+	uintptr_t io = TLMM_NORTH_PA + TLMM_IO(8);
+	unsigned last = rd32(io) & 1u, edges = 0;
+	uint64_t end = ticks_now() + rsr("cntfrq_el0") / 1000 * ms;
+
+	while (ticks_now() < end) {
+		unsigned v = rd32(io) & 1u;
+		if (v != last) {
+			edges++;
+			last = v;
+		}
+	}
+	return edges;
+}
+
+static void log_dsi_state(void)
+{
+	log_printf("dsi te 20ms %u edges\n", log_te_edges(20));
+	log_dsi_block("ctrl", DSI0_CTRL_PA, DSI0_CTRL_LEN);
+	log_dsi_block("phy", DSI0_PHY_PA, DSI0_PHY_LEN);
+	log_dsi_block("pll", DSI0_PLL_PA, DSI0_PLL_LEN);
+}
+#endif
+
 static void log_gic(void)
 {
 	log_printf("gic: ctlr %x typer %x iidr %x\n", rd32(GICD_BASE), rd32(GICD_BASE + 4),
@@ -417,6 +472,9 @@ void shim_main(uintptr_t dtb)
 	log_touch_pins("entry");
 	int spmi_ok = !spmi_init();
 	log_panel_state(spmi_ok);
+#ifdef SHIM_DSI_PROBE
+	log_dsi_state();
+#endif
 	if (spmi_ok) {
 		log_pmic();
 		log_pm8150l_ldo(5, 0x4000, "pm8150l ldo1");

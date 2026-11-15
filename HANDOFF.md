@@ -1,9 +1,178 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-14** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-15** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### 0142 sense-window patch: cut the first scan early, reset, sense-on (2026-11-15)
+
+**Patch.** `xnu/patches/0142-cepheus-fts-sense-window.patch`, on top of 0141 (only
+`bsd/dev/sweet_fts.c`; applies cleanly with `git apply`). `fts_sense_cycle()` now does
+sense-on, waits `cepheustouchsensems` ms (default 350), sense-off (`A0 00 00`), waits
+50 ms, then `fts_release_all()` + `fts_reset()` + `fts_bb_recover()` + `fts_wait_ready(500)`
+before the final sense-on. The sense-on line ends with `ms=350 cr=1`;
+`cepheustouchsensecycle=0` still gives the old single sense-on, and
+`cepheustouchcyclereset=0` keeps the 350 ms pulse but skips the reset (control).
+
+**Rationale.** TWRP cuts its first scan at 1.6048 s, ~373 ms after sense-on at 1.2315 s,
+then power-cycles the panel, system-resets FTS at 1.8582 s and senses on at 1.8805 s; its
+second calibration stays healthy. A warm XNU scan left running latches the bad mutual
+baseline after ~3.5 s, and a reset *after* that does not clear it (0140/0141). The untested
+variable is a reset *before* the latch, on a chip whose first scan was stopped the way
+TWRP stops it.
+
+**Test.** Build 0141+0142, boot warm from TWRP with the default shim (no `SHIM_PANEL_*`
+flags), `cepheustouchlog=1`, and swipe from ~30 s to the end of the run. Expected:
+`sense on ... ms=350 cr=1`, no edge ghost burst, no `43 05 30`, real `SWEET HID: touch`
+events. If the ghosts still appear ~3.5 s after the second sense-on, this cycle fails too;
+the next variable is reset timing relative to the panel (TWRP resets ~22 ms after
+`DSI_CMD_SET_ON`). Run name: `touch-0147-sensewindow`.
+
+### 0146 shim PHY cycle restores TE, not touch; panel state is ruled out (2026-11-14)
+
+**Probe.** Image built with `SHIM_CFLAGS="-DSHIM_PANEL_INIT -DSHIM_PANEL_CYCLE
+-DSHIM_PHY_CYCLE"` and the 0141 kernel (`35b48585...`), booted warm from TWRP with
+`cepheustouchlog=1`, 300 s. Shim log: `phy entry ctrl0 7f pll 1 rbuf 1 vreg 5b/19 ctrl3 4
+cfg 21/84 clk 31/31 st 7`, `phy cycle done ctrl 1f5 clk 23f status 0`,
+`init 34 cmds, 0 errors, pos 458/458`, `backlight 0x7ff -> 0`, **`te after init 6 edges`**,
+`dma restored 14000000`. The full DSI0 PHY/controller re-init does revive the DDIC's TE
+after the panel rail POR.
+
+**Touch unchanged.** XNU: sense-on 31.145 s, ghosts 34.856-34.921 s, `43 05 30` 35.166 s,
+recovery 35.8 s, display on 50.394 s, `display reinit err=0` 50.457 s. The user touched
+repeatedly; no HID touch events through 97 s. `SWEET FB: 5s: 0 swaps` throughout (the
+screen stayed black: the re-init breaks XNU scanout, while the DDIC itself is scanning).
+
+**Consequence.** With the DDIC reinitialized and TE streaming *before* FTS calibrates, the
+warm FTS failure is identical. The panel/DDIC state theory is dead; the 0142-delay control
+(display on with content before sense-on) already pointed the same way. The remaining delta
+is FTS chip calibration timing/state, not the panel.
+
+**TWRP blank path decoded.** At 1.6048 s TWRP's `fts_mode_handler` takes the FOD branch
+(`fod_status` set): it sends `A2 03 20 00 00 01` (gesture + longpress), `A0 01` (low-power
+scan, 2 bytes) and `C0 02 00 00` (single-tap delay). The non-FOD branch sends only
+`A0 00 00`. XNU has no FOD/gesture client, so `A0 00 00` is the correct analog; the gesture
+command does not belong in the kernel cycle.
+
+### 0145 rail-only cycle + TE probe: the RPMh vote really cuts panel VDDIO (2026-11-14)
+
+**Probe.** Image `work/boot/runs/touch-0145-teprobe/touch-0145-teprobe.img` (SHA-256
+`0a5f9651...`) is the 0144 code with the DCS 0x28/0x10 sleep/display-off removed: it only
+cycles VCIE + LDO14, so the DSI link stays alive, and samples the panel's TE output (north
+TLMM GPIO 8 pad level) for 50 ms at three points. Log:
+`logs/runs/touch-0145-teprobe/shim.txt`.
+
+**Result: TE 6 -> 0 -> 0.** `panel: cycle vcie cfg 3c3 io 3 te 50ms 6 edges` before the
+cycle, `panel: vcie off, ldoa14 off -> 0`, `panel: te with rails off 0 edges`, then
+`panel: ldoa14 on -> 0`, `panel: rails cycled, vcie io 3 te 50ms 0 edges`. Both RPMh votes
+report `done=1 ... ACTIVE vote complete`, so the vote reaches the RSC. Six edges per 50 ms
+(~60 Hz, two edges per frame) collapse to zero while LDO14 is off: **the shim's RPMh
+`ldoa14` vote genuinely removes panel VDDIO.** But the panel never resumes scanning when
+VDDIO returns. The DSI controller state at replay is unchanged (`hw 20030000 ctrl 1f5
+status 0 fifo 11111010`), yet the DDIC is left in a state only a DSI controller/PHY
+re-init recovers — the same dead end as 0144, now without the DCS sleep-in as an excuse.
+
+**Touch is unchanged.** Sense-on 31.082 s, ghost burst 34.607-34.680 s (four edge contacts
+at x=1072-1079), `43 05 30` 34.880 s, recovery 35.568 s, display on 50.353 s (dark), no
+real touch. A real POR of VDDIO alone neither fixes nor changes the warm FTS failure.
+Logs: `logs/runs/touch-0145-teprobe/`.
+
+### DSI0 PLL/PHY configuration is identical cold and warm (`dsi-probe`, 2026-11-14)
+
+**Probe.** Payload-less image `work/boot/runs/dsi-probe/dsi-probe.img` (SHA-256
+`953282ac...`), built with `SHIM_CFLAGS=-DSHIM_DSI_PROBE shim/build.sh "" OUT`. At shim
+entry it samples TE (north TLMM GPIO 8) for 20 ms and dumps the whole DSI0 controller
+(`0xae94000`, `0x400`), PHY (`0xae94400`, `0x760`) and PLL (`0xae94900`, `0x260`) blocks
+with offsets. Warm run from TWRP: `logs/runs/dsi-probe-warm/shim.txt`; cold run (phone
+powered off, Vol- + Power to fastboot, then `fastboot boot`):
+`logs/runs/dsi-probe-cold/shim.txt`.
+
+**Result: every PLL and PHY configuration register matches, word for word.** The only
+differences are volatile link status:
+
+- `DSI_LANE_STATUS` (`0xa8`): warm `0x1f0f`, cold `0x1f00`. Bits 8-12 (all five lanes not
+  in ULPS) are set in both. The low nibble is the per-lane stop-state status.
+- `DSI_CLK_STATUS` (`0x120`): warm `0x2343`, cold `0x8037c3`. Bit 16 is the sticky
+  PLL-unlocked flag (set on cold, from the ABL PLL startup; cold works), bit 31 is the
+  byte-clock/link state. Warm is the "link off" signature TWRP leaves when it powers the
+  panel down for reboot; it is not a configuration difference.
+- PHY lane blocks at `0x144`/`0x1c4` differ only in bit 0 (`0x4e` warm vs `0x4f` cold),
+  the matching link-active bit. The PLL range `0x1bc-0x1c4` changes between two reads of
+  the same address inside one run (it is a live counter/status).
+
+TE measured 2 edges/20 ms warm and 4 edges/20 ms cold; a 20 ms window is 1.2 frames, so
+this is pulse phase, not a refresh-rate difference (the 0145 50 ms probe gives ~60 Hz).
+
+**Consequence.** The "warm PLL/PHY/SSC register state" theory is dead: the SoC-side DSI
+configuration is already the cold one on a warm boot. Therefore the panel difference that
+TWRP repairs cannot be read from the AP's DSI registers; it is either DDIC-internal state
+or the link on/off state, which XNU (or ABL) already recovers for scanout in the working
+0142 run. Note the PHY node's 0x760 window overlaps the PLL node (`0xae94400 + 0x500 =
+0xae94900`), which is why the last 19 lines of the PHY dump repeat the PLL dump.
+
+### 0144 full shim panel POR: RPMh works, panel does not come back (2026-11-14)
+
+**Implementation.** `shim/rpmh.c` (new) ports the XNU ACTIVE-set transaction from
+`bsd/dev/sweet_rpmh.c` (0062/0102) to the shim's identity-mapped Device memory, and
+`shim/panel.c` (`SHIM_PANEL_CYCLE`) now does TWRP's `dsi_panel_power_off/on` analogue
+sequence: reset low, VCIE (east TLMM GPIO 21) off, PM8150 LDO14 (`ldoa14`, panel VDDIO)
+off via RPMh, 20 ms, LDO14 on (1800 mV / mode 7 / enable), VCIE on, then the existing
+34-command replay. A failed probe skips the cycle so the panel is left as ABL had it.
+
+**0144 warm run (`touch-0144-panelpor`).** Image SHA-256 `1ec633a1...`, booted warm from
+TWRP with the 0141 kernel and the usual `cepheustouchlog=1`. Shim log:
+`rpmh: ldoa14 addr=0x42100 slave=4`, `probe ldoa14 ok, TCS0 free`, the 1-command disable
+and 3-command enable both `done=1 ... ACTIVE vote complete`; panel `vcie off, ldoa14 off
+-> 0`, `ldoa14 on -> 0`, replay `34 cmds, 0 errors`, backlight sent. **Screen stayed dark
+for the whole run.** XNU: sense-on 31.109 s, ghost burst 34.742-34.806 s, `43 05 30`
+35.057 s, recovery 35.737 s; display on 50.248 s but no visible output. The DCS 0x51
+`int ... (pending)` at display-on is not a clue: the working 0142 run logs the same.
+Logs: `logs/runs/touch-0144-panelpor/`.
+
+**Why it is dark.** TWRP recovers from a panel power cycle because `dsi_display_enable`
+re-initializes the DSI controller and PHY. The shim only replays DCS commands through
+ABL's DSI state; after the DDIC loses power (and especially after DCS 0x10 sleep-in),
+the replay reports DMA done at the controller but the panel never accepts it. So this
+run cannot yet test the panel-state theory: the touch result is the same as before
+because the panel state after the cycle is not TWRP's state.
+
+### 0141 display-on reinit failed; TWRP's real panel power cycle is the remaining delta (2026-11-14)
+
+**0141 warm run (`touch-0141`).** Kernel with 0141 (`work/boot/kernel-brightness/kernel.development.sweet`,
+SHA-256 `35b48585...`), booted warm from TWRP, `cepheustouchlog=1`. Sense-on at 30.503 s
+(`cycle=1 display=1`), then the usual ghosts at 34.137-34.173 s, `43 05 30` at 34.430 s,
+clean recovery at 35.112 s, display on at 49.743 s, `display reinit err=0` at 49.813 s and
+`43 05 01` + `43 01 a0 00 01` at 49.821 s. A second display off/on at 110.158/110.261 s
+reinit'd again at 110.265-110.329 s with `err=0`, still **no real touch** through 117 s.
+Logs: `logs/runs/touch-0141/`.
+
+**TWRP comparison, part 2.** `fts_fw_update` (1.209-1.282 s) does not burn: CRCs clean,
+one system reset, no CX/panel initialization, then `fts_init_sensing` sends the same
+`a0/00/01` sense-on and IRQ enable as us. `fts_read_touchmode_data` only reads
+(`0xc1/05`, `0xc1/08`); the `0xc0`/`0xa2` writes are sysfs-only (edge rejection, FOD,
+gesture) and never run during TWRP's boot. **There is no missing chip command left.**
+
+**New reading of the failure.** TWRP's first scan starts at 1.231 s but it senses OFF at
+1.586 s — only 0.35 s later, before the +3.5 s point where a warm scan reports the ghost
+burst and `43 05 30`. It then does a real panel power cycle (`FB_BLANK POWER DOWN` 1.586,
+`DSI_CMD_SET_OFF` 1.706, `DSI_CMD_SET_ON` 1.838) and resets FTS + senses on at 1.860.
+Our 0141 reinit is only an FTS reset: `SweetFramebuffer`'s display off/on never powers the
+panel off, so every scan still runs in the same stale warm panel environment and dies at
++3.5 s. The `43 05 30` (MS invalid mutual strength) is an analogue/panel-state failure,
+which is why rail-cycling the touch controller and resetting FTS cannot recover it.
+
+**Next test 1 (no rebuild, cheapest).** Boot 0141 with
+`cepheustouchdelay=55 cepheustouchpwr=0 cepheustouchrecover=0`, so the first calibration
+happens after the iOS display/UI is up and after the framebuffer has taken over, skipping
+the early bad calibration entirely. If touch works, the early scan poisons the chip and
+the fix is to gate the first sense-on on display-on. If it fails, the panel environment is
+the variable.
+
+**Next test 2 (shim).** Cycle VCI (east TLMM GPIO 21) off/on plus panel reset before the
+existing 34-command replay, then jump to XNU. The earlier replay only toggled panel reset
+with VCI live; a real VCI POR is the part of TWRP's panel power cycle that replay missed.
+Expect the screen to come back; if it does, check FTS with the same kernel.
 
 ### 0140 sense cycle failed; display-on reinit is next (2026-11-14)
 
