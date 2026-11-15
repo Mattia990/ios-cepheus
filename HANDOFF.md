@@ -5,6 +5,50 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Cold with the panel already on works: the warm poison is host-side, not panel/chip (`touch-cold-delay55`, 2026-11-15)
+
+**Run.** Same 0141+0142 kernel (`logs/runs/touch-0150-warmnousb/kernel`), cmdline
+`cepheustouchdelay=55 cepheustouchlog=1 cepheusreboot=150`, booted at 14:33:28 from a true
+cold fastboot (power off in TWRP, Vol- + Power). Logs: `logs/runs/touch-cold-delay55/`.
+The user confirmed display on and touch working.
+
+**The panel was live 15.7 s before the chip powered up.** `SWEET FB: display on` 65.966 s;
+FTS thread start 25.398 s + 55 s. `controller before rails-off: unpowered` 80.565 s,
+`rails off 200 ms: controller unpowered` 80.928 s, rails cycled 80.954 s, ready 81.038 s,
+sysinfo 81.061 s (fw 0060 cfg 0037 cx ffff afe 03/03/03, identical to warm), reset2
+81.206 s, `sense on ... cycle=1 display=1 ms=350 cr=1` 81.673 s, `43 05 01` 81.681 s,
+`43 05 21` (SS invalid self strength soft force cal) 82.567 s.
+
+**Touch works.** Real contacts from 82.967 s through the end of the log (user swipes at
+spread-out coordinates, no edge column). No ghost burst and no `43 05 30`. Later soft
+force-cals at 125.021 s (`43 05 21`) and 137.533 s (`43 05 31`) did not stop touch.
+
+**Warm comparison.** `touch-0142-delay` is the same panel environment (display on
+49.706 s, sense-on 65.012 s, 15.3 s later) and failed with the usual ghosts and
+`43 05 30`. `touch-warm-paneloff` held the panel reset low through the failed 30-33 s
+scan and still produced the identical right/top-edge burst. The panel/DDIC is therefore
+not the warm differentiator, and an active panel is not a poison by itself.
+
+**Entry state is identical cold vs warm.** `touch-cold-delay55/shim.txt` and
+`touch-warm-prepower/shim.txt` have the same touch pin state (all five pins `cfg 1
+(pull D mux 0 2mA in) io 0`), the same empty TCS 0-7, the same PM8150L LDO1/LDO2
+registers (LDO1 enable `46=0`), and the same panel pins. The chip is unpowered in both.
+
+**Consequence.** The warm defect needs no OS in between (`touch-ablwarm-0138`: cold
+fastboot -> `fastboot reboot-bootloader` -> XNU, failed), is not chip state, supply
+ramp/POR, rails, panel, temperature, VBUS or display timing, and is present with every
+visible entry state identical. It is host-side state created after ABL and surviving a
+warm reset, or an ABL cold-vs-warm boot-path difference.
+
+**Next control: scan early on a warm boot.** Warm from TWRP with the same kernel and
+`cepheustouchdelay=0` (default rails cycle): the first sense-on lands at ~10 s, before
+backboardd/display-on and ~20 s earlier than every previous warm run, roughly the
+position where TWRP's warm probe succeeds (1.2 s). If it works, XNU creates the poison
+between 10 s and 30 s and the next step is to bisect XNU bring-up (USB, PCIe, display,
+GPU). If it fails, the poison predates XNU and the next step is shim-side instrumentation
+of the always-on domains (AOP/RSC/GCC) and, if needed, a shim-side FTS sense test before
+the jump.
+
 ### Pre-powered rails do not fix warm touch; rail ramp/POR timing is ruled out (`touch-warm-prepower`, 2026-11-15)
 
 **Run.** Same 0141+0142 kernel (`5cc977a1...`) as 0149/0150, shim rebuilt with
@@ -41,13 +85,9 @@ out. The defect is created during scanning, after a correctly powered and reset 
 needs a warm-specific environment difference (or a host-side difference in how the first
 scan is serviced).
 
-**Next control: cold boot with the display on before sense-on.** Use the 0149 kernel and
-`cepheustouchdelay=55` **cold** (power off, Vol- + Power to fastboot): the panel reaches
-XNU display-on at ~80 s and the chip is powered/calibrated at ~95 s. Warm `0142-delay`
-already did the same with a warm panel and failed; the cold version separates "panel active
-at chip power-up" from "warm reset state". If it works, the warm-specific state is in the
-SoC/always-on domains, not the panel; if it fails, an active panel is a sufficient poison
-on its own.
+**Next control: cold boot with the display on before sense-on.** Done as
+`touch-cold-delay55` (see the section at the top): it works, with the panel live 15.7 s
+before the chip powers up. Panel/chip state is ruled out; the warm poison is host-side.
 
 ### 0150 warm with USB unplugged: VBUS makes the +0.5 s burst, not the +3.5 s failure (2026-11-15)
 
