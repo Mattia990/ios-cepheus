@@ -16,6 +16,7 @@
 #include "log.h"
 #include "sde.h"
 #include "panel.h"
+#include "rpmh.h"
 #include "showlog.h"
 #include "diag.h"
 #include "disptest.h"
@@ -340,6 +341,64 @@ static void panel_hold_reset(void)
 		   rd32(TLMM_SOUTH_PA + TLMM_IO(6)));
 }
 
+#ifdef SHIM_TOUCH_PREPOWER
+/*
+ * Warm-boot diagnostic: power the touch rails from the shim and let them
+ * settle before XNU's driver reaches the chip.  Boot the payload with
+ * cepheustouchpwr=0 so the driver skips its own rails-off cycle; it still
+ * re-enables both rails and resets the chip, but the chip's supply has then
+ * been stable for the whole XNU boot.  This separates the chip's power-on
+ * ramp/POR timing from everything else that differs on a warm boot.
+ *
+ * The PMIC readback is also the missing positive control for the RPMh
+ * ldoc1 vote: enable it and check which SPMI slave (4 or 5) actually shows
+ * the LDO enabled.  The DT exposes PM8150L at both SIDs.
+ */
+static void
+touch_prepower(void)
+{
+	uint32_t io, cfg;
+
+	log_printf("prepower: entry reset %x/%x vddio %x/%x\n",
+		   rd32(TLMM_NORTH_PA + TLMM_CFG(12)),
+		   rd32(TLMM_NORTH_PA + TLMM_IO(12)),
+		   rd32(TLMM_NORTH_PA + TLMM_CFG(84)),
+		   rd32(TLMM_NORTH_PA + TLMM_IO(84)));
+
+	/* Reset asserted (low) before either rail comes up. */
+	io = rd32(TLMM_NORTH_PA + TLMM_IO(12));
+	wr32(TLMM_NORTH_PA + TLMM_IO(12), io & ~2u);
+	cfg = rd32(TLMM_NORTH_PA + TLMM_CFG(12)) & ~0x3ffu;
+	wr32(TLMM_NORTH_PA + TLMM_CFG(12), cfg | 0x2c3u); /* pull up, 8 mA, out */
+
+	/* VDDIO (the bus pull-up supply) first, as in the driver. */
+	io = rd32(TLMM_NORTH_PA + TLMM_IO(84));
+	wr32(TLMM_NORTH_PA + TLMM_IO(84), (io & ~2u) | 2u);
+	cfg = rd32(TLMM_NORTH_PA + TLMM_CFG(84)) & ~0x3ffu;
+	wr32(TLMM_NORTH_PA + TLMM_CFG(84), cfg | 0x200u); /* no pull, 2 mA, out */
+	delay_ms(50);
+
+	log_pm8150l_ldo(4, 0x4000, "prepower sid4 ldo1 before");
+	log_pm8150l_ldo(5, 0x4000, "prepower sid5 ldo1 before");
+	int err = shim_rpmh_vreg("ldoc1", 1800, 1);
+	delay_ms(200);
+	log_printf("prepower: ldoc1 on err=%d\n", err);
+
+	log_pm8150l_ldo(4, 0x4000, "prepower sid4 ldo1 after");
+	log_pm8150l_ldo(5, 0x4000, "prepower sid5 ldo1 after");
+
+	/* Release reset: the chip boots now; XNU will reset it once more. */
+	io = rd32(TLMM_NORTH_PA + TLMM_IO(12));
+	wr32(TLMM_NORTH_PA + TLMM_IO(12), io | 2u);
+	delay_ms(100);
+	log_printf("prepower: released reset %x/%x vddio %x/%x\n",
+		   rd32(TLMM_NORTH_PA + TLMM_CFG(12)),
+		   rd32(TLMM_NORTH_PA + TLMM_IO(12)),
+		   rd32(TLMM_NORTH_PA + TLMM_CFG(84)),
+		   rd32(TLMM_NORTH_PA + TLMM_IO(84)));
+}
+#endif
+
 #ifdef SHIM_DSI_PROBE
 /*
  * DSI0 controller/PHY/PLL state at shim entry (-DSHIM_DSI_PROBE).
@@ -470,6 +529,7 @@ void shim_main(uintptr_t dtb)
 	log_cpu(dtb);
 	dump_pram();
 	log_touch_pins("entry");
+	shim_rpmh_dump("entry");
 	int spmi_ok = !spmi_init();
 	log_panel_state(spmi_ok);
 #ifdef SHIM_DSI_PROBE
@@ -563,6 +623,10 @@ void shim_main(uintptr_t dtb)
 	sde_restart();
 	sde_sample("after panel", 8, 20);
 	save_log("panel reinit");
+#endif
+#ifdef SHIM_TOUCH_PREPOWER
+	touch_prepower();
+	save_log("prepower");
 #endif
 	/* An XNU payload in the ramdisk means: boot it. */
 	struct loader_fb lfb = { fb, stride, FB_W, FB_H, save_before_jump };

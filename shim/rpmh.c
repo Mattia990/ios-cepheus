@@ -377,3 +377,55 @@ shim_rpmh_vreg(const char *res, unsigned mv, int on)
 	const uint32_t values[3] = {mv, 7, 1};
 	return shim_rpmh_write(res, 3, offsets, values);
 }
+
+/* Resolve a resource without sending anything; 0 and *address on success. */
+static int
+rh_resolve(const char *res, uint32_t *address)
+{
+	if (rh_map())
+		return -1;
+	return rh_lookup(res, address);
+}
+
+void
+shim_rpmh_dump(const char *tag)
+{
+	uint32_t ldoc1 = 0, ldoa14 = 0;
+	int have_ldoc1 = !rh_resolve("ldoc1", &ldoc1);
+	int have_ldoa14 = !rh_resolve("ldoa14", &ldoa14);
+
+	log_printf("rpmh: TCS dump %s (ldoc1=%x ldoa14=%x)\n", tag,
+		   have_ldoc1 ? ldoc1 : 0xffffffffu,
+		   have_ldoa14 ? ldoa14 : 0xffffffffu);
+	if (rh_map_error)
+		return;
+
+	for (unsigned t = 0; t < 8; ++t) {
+		uint32_t b = t * RH_TCS_STRIDE;
+		uint32_t enable = rh_read(rh_tcs, b + RH_ENABLE);
+		uint32_t wait = rh_read(rh_tcs, b + RH_WAIT);
+		uint32_t status = rh_read(rh_tcs, b + RH_STATUS);
+		uint32_t control = rh_read(rh_tcs, b + RH_CONTROL);
+		uint32_t irqen = rh_read(rh_tcs, RH_IRQ_EN);
+		uint32_t irqsts = rh_read(rh_tcs, RH_IRQ_STATUS);
+
+		log_printf("rpmh: tcs%u sts=%x ctl=%x en=%x wait=%x irqen=%x irqsts=%x\n",
+			   t, status, control, enable, wait, irqen, irqsts);
+		for (unsigned c = 0; c < rh_ncpt; ++c) {
+			if (!(enable & (1u << c)))
+				continue;
+			uint32_t cmd = b + c * RH_CMD_STRIDE;
+			uint32_t addr = rh_read(rh_tcs, cmd + RH_ADDR);
+			uint32_t base = addr & ~15u;
+			const char *res = "";
+			if (have_ldoc1 && base == ldoc1)
+				res = " ldoc1";
+			else if (have_ldoa14 && base == ldoa14)
+				res = " ldoa14";
+			log_printf("rpmh:  tcs%u cmd%u msg=%x addr=%x data=%x sts=%x%s\n",
+				   t, c, rh_read(rh_tcs, cmd + RH_MSGID), addr,
+				   rh_read(rh_tcs, cmd + RH_DATA),
+				   rh_read(rh_tcs, cmd + RH_CMD_STATUS), res);
+		}
+	}
+}

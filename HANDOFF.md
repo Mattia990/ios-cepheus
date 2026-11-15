@@ -5,6 +5,50 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Pre-powered rails do not fix warm touch; rail ramp/POR timing is ruled out (`touch-warm-prepower`, 2026-11-15)
+
+**Run.** Same 0141+0142 kernel (`5cc977a1...`) as 0149/0150, shim rebuilt with
+`-DSHIM_TOUCH_PREPOWER`, cmdline `cepheustouchpwr=0 cepheustouchlog=1 cepheusreboot=150`,
+warm from TWRP (`adb reboot bootloader` -> `fastboot boot`). Logs:
+`logs/runs/touch-warm-prepower/`. The user confirmed no touch; SpringBoard booted normally.
+
+**What the shim did.** Entry `reset 1/0 vddio 1/0`. It then held reset low, drove VDDIO
+(GPIO 84) high, waited 50 ms, enabled ldoc1 at 1800 mV (ACTIVE RPMh vote, err 0), waited
+200 ms, and released reset at 8.561 s (`reset 2c3/3 vddio 200/3`). The chip therefore ran
+with both rails stable for ~22 s before the driver touched it.
+
+**The RPMh vote is real at the PMIC.** The payload-less control
+`work/boot/runs/prepower-probe.img` (`logs/runs/prepower-probe/shim.txt`) read PM8150L
+LDO1 at both SPMI SIDs. SID 4 has no regulator block (all reads error/zero); SID 5 is the
+real LDO and changed `46=0 -> 80`, `08=3 -> 84`, `42=0 -> 8` after the enable. This is the
+missing positive control for the ldoc1 vote; the earlier `touch-pmic-cold/warm` dumps at
+SID 5 were reading the right rail.
+
+**Still fails, with the same burst.** FTS TLMM 30.073 s, `rails unchanged, off 200 ms,
+avdd ldoc1 err=0` 30.100 s, sysinfo/lockdown/CRC unchanged, reset2 30.354 s, `sense on ...
+cycle=1 display=1 ms=350 cr=1` 30.820 s, `43 05 01` + `43 01 a0 00 01` 30.823 s. At
+**32.607-32.665 s (+1.79 s)** six contacts entered with the same right/top-edge pattern as
+all other warm runs: x=1079 at y=175/1754/1343/1466 and y=176 at x=170/4. There was **no
+`43 05 30`** this time (the `pwr=0` path also suppressed it in `touch-0139-pwr0`); the chip
+went silent. Display on 50.654 s, `display reinit err=0` 50.720 s, clean `43 05 01`
+50.729 s, alive ticks through 93.3 s, zero real finger events. The log ends at 103.5 s
+because the user rebooted to TWRP.
+
+**Consequence.** A 22 s stable supply before the driver's reset does not change the
+failure; only the ghost-burst timing moved earlier (+1.8 s vs +3.2 s) and the explicit
+`43 05 30` disappeared. The chip's power-up ramp, POR timing and rail settling are ruled
+out. The defect is created during scanning, after a correctly powered and reset chip, and
+needs a warm-specific environment difference (or a host-side difference in how the first
+scan is serviced).
+
+**Next control: cold boot with the display on before sense-on.** Use the 0149 kernel and
+`cepheustouchdelay=55` **cold** (power off, Vol- + Power to fastboot): the panel reaches
+XNU display-on at ~80 s and the chip is powered/calibrated at ~95 s. Warm `0142-delay`
+already did the same with a warm panel and failed; the cold version separates "panel active
+at chip power-up" from "warm reset state". If it works, the warm-specific state is in the
+SoC/always-on domains, not the panel; if it fails, an active panel is a sufficient poison
+on its own.
+
 ### 0150 warm with USB unplugged: VBUS makes the +0.5 s burst, not the +3.5 s failure (2026-11-15)
 
 **Run.** `touch-0150-warmnousb`, same 0141+0142 kernel (`5cc977a1...`), warm from TWRP,

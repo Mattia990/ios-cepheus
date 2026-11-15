@@ -19,3 +19,10 @@ int shim_rpmh_write(const char *res, unsigned n, const uint32_t *offsets,
 
 /* PMIC5 LDO on: voltage/mode 7/enable; off: enable=0 (offset 4). */
 int shim_rpmh_vreg(const char *res, unsigned mv, int on);
+
+/*
+ * Read-only dump of every TCS (ACTIVE 0-1, SLEEP 2-4, WAKE 5-7): status,
+ * control, enable/wait masks and each enabled command.  Used to compare the
+ * inherited RPMh state after a cold boot and after a warm reboot.
+ */
+void shim_rpmh_dump(const char *tag);
