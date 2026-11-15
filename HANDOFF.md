@@ -5,6 +5,41 @@ Last updated **2026-11-15** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Warm poison survives 300 s in fastboot: it is latched, not charge (`fts-probe-warm-wait300`, 2026-11-15)
+
+**Run.** Warm from TWRP (`adb reboot bootloader`), then **300 s idle in fastboot**
+(15:05:17-15:10:17), then the same pre-XNU probe image (sha256 `5a6513aa0cbf9550...`).
+Logs: `logs/runs/fts-probe-warm-wait300/shim.txt`.
+
+**Result.** Entry block, rails (`vddio=1`, `ldoc1 err=0`), sysinfo and `sense on err=0` all
+match the earlier warm probe. 17 events: the two startup events (`43 05 01` t=0,
+`43 01 a0 00 01` t=6 ms) and **15 contacts from t=3.598 to 3.688 s**: right edge x=1079
+at y=1343, 1496, 1754, 2207; top row y=175/176 at x=106, 704, 1024; interior 1038,1496.
+Same signature as the 31-contact burst (`fts-probe-pre-xnu`), smaller. No `43 05 30` in
+the 6 s window. A five-minute dwell does not clear it: the poison is a latched state, not
+a decaying charge or temperature transient.
+
+**ABL logs (corrects the earlier "identical" claim).** `logs/runs/abl-after-probe/` holds
+the logfs dump. The two probe boots are identified by the probe image cmdline
+(`... cepheusreboot=600`) and by the EBS -> shim-entry match (+240 ms in both):
+
+- **Cold = `UEFILOG1`**: PON 128, KeyPress 8, UEFI start 1283 ms, UEFI Total 2103 ms,
+  EBS 9202 ms, shim entry 9.44 s.
+- **Warm = `UEFILOG3`**: PON 1, KeyPress 0, UEFI start 2158 ms, UEFI Total 769 ms,
+  EBS 6460 ms, shim entry 6.70 s.
+
+Panel/power init text is identical (panel id 00070000, 1080x2340, same regulator steps).
+The differences are USB/charger order and boot timing: warm does CDP charger detection in
+SBL1 (~0.9 s; cold sees `vbus_low` and detects USB later in UEFI), cold spends ~2.2 s
+longer between `display picture 1` and `display picture 2` (3116 vs 903 ms), and boot
+reason/keypress/haptics differ. Net warm reaches the image 2.74 s earlier. USB/charger is
+already ruled out (`touch-0150-warmnousb`) and the panel/power state is identical, so this
+is a timing/boot-reason difference, not a panel or rail difference.
+
+**Next.** Warm boot of the 0141+0142 kernel with `cepheustouchdelay=0 cepheustouchpoll=0`
+(IRQ-only reads, no 10 ms FIFO polling): if the burst disappears and real touches work,
+host FIFO polling during calibration is the trigger and the driver default should change.
+
 ### Cold probe is clean: the warm poison is pre-XNU reset state (`fts-probe-pre-xnu-cold`, 2026-11-15)
 
 **Run.** Same image as the warm probe (sha256 `5a6513aa0cbf9550...`), booted at 15:02:15
@@ -14,7 +49,8 @@ from a true cold fastboot (phone powered off in TWRP, Vol- + Power). Logs:
 **Entry state is byte-identical.** The shim entry block (lines 9-52) diffs empty against
 the warm probe: same touch pins, RPMh RSC/TCS 0-7, PM8150L LDO1 (`46=0`), panel pins,
 `pon:` registers and reboot reason. `saved (ufs up)` is 15.961 s cold vs 13.222 s warm,
-but entry-to-UFS is 6.52 s in both; the difference is before ABL handoff.
+but entry-to-UFS is 6.52 s in both; the 2.74 s difference is inside ABL (cold EBS 9.202 s,
+warm 6.460 s; see the wait300 section), not in the shim or UFS.
 
 **Clean scan.** Same rails (`vddio=1`, `ldoc1 err=0`), ready (`err=0`, idle SDA/SCL high),
 sysinfo (`a5 01 ...`), `sense on err=0`. The 6 s window logged **2 events**: `43 05 01`
@@ -24,10 +60,9 @@ logged 33 events: the same two plus **31 contacts from t=3.786 to 3.978 s**.
 **Consequence.** The shim setup (bit-bang, no `.ftb` load, pre-UFS, early boot) is not the
 confound: the same binary calibrates correctly cold and mis-calibrates warm. The warm
 poison is created before ABL hands off and survives a warm reset, but a full power-off
-clears it. Candidates are the ABL cold-vs-warm path and always-on state (GCC/AOP/RSC/
-PMIC). Next: dump and diff the ABL logfs for the cold and warm probe boots, then dump the
-always-on register state cold vs warm; also test whether a multi-minute fastboot wait
-before `fastboot boot` clears the warm defect.
+clears it. The ABL cold/warm logs differ only in USB order and boot timing (wait300
+section), so the leading candidate is always-on state the dumps do not cover (GCC/AOP/
+RSC/PMIC); the 300 s dwell rules out a decaying charge/thermal transient.
 
 ### Pre-XNU shim FTS probe reproduces the burst (`fts-probe-pre-xnu`, 2026-11-15)
 
