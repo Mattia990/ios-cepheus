@@ -1,0 +1,410 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -35,8 +35,10 @@
+  * short and resetting the controller (default 350),
+  * cepheustouchcyclereset=0 skip that reset (350 ms on, 50 ms off only),
+  * cepheustouchdisplay=0 skip the reset+sense-on on display-on,
+- * cepheustouchpanel=0 skip the panel SET_ON replay at display-on,
+- * cepheustouchpanelhs=1 send that replay in HS instead of LP mode, and
++ * cepheustouchpanel=0 skip the panel SET_ON replay after a panel POR,
++ * cepheustouchpanelhs=1 send that replay in HS instead of LP mode,
++ * cepheustouchpanelpor=0 keep panel VCI and reset powered during the boot
++ * rail cycle, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -60,10 +62,13 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ /* Bumped by SweetFramebuffer.cpp when the display turns on. */
+ extern volatile uint32_t sweet_fb_display_on_count;
++/* 0144: resend the panel's current DCS 0x51 level after a SET_ON replay. */
++extern void sweet_bl_reassert(void);
+ void sweet_fts_init(void);
+ 
+ #define FTS_TLMM_SOUTH_PA 0x03d00000u   /* SDA 55 / SCL 56 / IRQ 122 */
+ #define FTS_TLMM_NORTH_PA 0x03900000u   /* reset 12, VDDIO enable 84 */
++#define FTS_TLMM_EAST_PA  0x03500000u   /* panel VCI enable 21 */
+ #define FTS_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
+ #define FTS_GPIO_IO(n)   (FTS_GPIO_CFG(n) + 4u)
+ #define FTS_PIN_SDA      55
+@@ -71,6 +76,8 @@
+ #define FTS_PIN_IRQ      122
+ #define FTS_PIN_RESET    12
+ #define FTS_PIN_VDDIO    84
++#define FTS_PIN_PANEL_RST 6		/* south TLMM, panel reset, active low */
++#define FTS_PIN_PANEL_VCI 21		/* east TLMM, disp_vci_vreg enable */
+ #define FTS_MAX          10u
+ #define FTS_ADDR         0x49u
+ #define FTS_RX_MAX       FTS_DATA_MAX
+@@ -143,9 +150,10 @@
+ #define FTS_DATA_MAX         (FTS_EVENT_SIZE * FTS_STACK_DEPTH)
+ 
+ static struct {
+-	vm_offset_t gpio_n, gpio_s;
++	vm_offset_t gpio_n, gpio_s, gpio_e;
+ 	bool started, dead;
+ 	bool recover, recover_enable;
++	bool panel_por, panel_ready;
+ 	int log;
+ 	unsigned sda, scl;
+ 	unsigned recoveries, off_ms, sense_ms, cycle_reset;
+@@ -489,7 +497,7 @@
+ static void fts_release_all(void);
+ 
+ /*
+- * 0143: replay the EA8076 SET_ON sequence at display-on.
++ * 0143/0144: replay the EA8076 SET_ON sequence after a panel POR.
+  *
+  * A cold boot gets a true panel POR in ABL, and the FTS calibration that
+  * follows is clean.  A warm reset skips ABL's panel init: the DDIC keeps
+@@ -498,18 +506,22 @@
+  * TWRP works warm because it re-inits the panel (DSI_CMD_SET_ON at 1.838 s)
+  * before its FTS sense-on at 1.880 s.
+  *
+- * XNU never replays SET_ON; it only sends DCS 0x51 for brightness.  Send
+- * the live DTB's 34-command on sequence through the DSI0 command FIFO at
+- * display-on, then let the existing display-on path reset and recalibrate
+- * the controller, mirroring TWRP's order.  The DTB marks the sequence
+- * dsi_lp_mode.  The FIFO image format is the one dsi_cmd_dma_add() builds
+- * (same as shim/panel.c and the DCS 0x51 path in SweetFramebuffer.cpp):
++ * 0144 makes the FTS boot rail cycle drop panel VCI and reset too, so the
++ * DDIC is really powered from zero.  XNU never replays SET_ON; it only
++ * sends DCS 0x51 for brightness.  Send the live DTB's 34-command on
++ * sequence through the DSI0 command FIFO after the power-up, then resend
++ * the current brightness, then let the existing display-on path reset and
++ * recalibrate the controller, mirroring TWRP's order.  The DTB marks the
++ * sequence dsi_lp_mode.  The FIFO image format is the one dsi_cmd_dma_add()
++ * builds (same as shim/panel.c and the DCS 0x51 path in
++ * SweetFramebuffer.cpp):
+  *
+  *   long:  wc_lo wc_hi 0x39 0xc0 payload... 0xff padding
+  *   short: data0 data1 dtype 0x80
+  *
+  * The 0x51 step is skipped: it writes brightness 0, and CoreBrightness's
+- * first 0x51 write lands in the middle of this replay.  XNU owns brightness.
++ * first 0x51 write lands in the middle of this replay.  XNU owns brightness,
++ * so sweet_bl_reassert() resends the level CoreBrightness last asked for.
+  *
+  * cepheustouchpanel=0 disables the replay; cepheustouchpanelhs=1 sends the
+  * commands in HS mode instead of the DTB's LP mode.
+@@ -642,11 +654,43 @@
+ 	return 0;
+ }
+ 
++static volatile uint32_t *
++fts_dsi_ctrl0(void)
++{
++	static volatile uint32_t *dsi;
++	static bool failed;
++
++	if (dsi == NULL && !failed) {
++		dsi = (volatile uint32_t *)ml_io_map(FTS_DSI0_PA, FTS_DSI0_SIZE);
++		if (dsi == NULL) {
++			printf("SWEET FTS: panel: cannot map DSI0\n");
++			failed = true;
++		}
++	}
++	return dsi;
++}
++
++/* Live DTB off-command: 0x28 display off (no wait), 0x10 sleep in + 120 ms. */
++static void
++fts_panel_off_seq(void)
++{
++	volatile uint32_t *dsi = fts_dsi_ctrl0();
++	uint8_t image[4] = { 0x28, 0x00, 0x05, 0x80 };
++
++	if (dsi == NULL) {
++		return;
++	}
++	(void)fts_dsi_send_image(dsi, image, sizeof(image), 1);
++	image[0] = 0x10;
++	(void)fts_dsi_send_image(dsi, image, sizeof(image), 1);
++	fts_wait(120);
++}
++
+ static int
+ fts_panel_replay_on(void)
+ {
+ 	uint8_t image[160];
+-	static volatile uint32_t *dsi;
++	volatile uint32_t *dsi = fts_dsi_ctrl0();
+ 	uint32_t dma_save;
+ 	unsigned pos = 0, n = 0, sent = 0, errs = 0;
+ 	int enabled = 1;
+@@ -661,11 +705,7 @@
+ 	lpm = hs ? 0 : 1;
+ 
+ 	if (dsi == NULL) {
+-		dsi = (volatile uint32_t *)ml_io_map(FTS_DSI0_PA, FTS_DSI0_SIZE);
+-		if (dsi == NULL) {
+-			printf("SWEET FTS: panel replay: cannot map DSI0\n");
+-			return EIO;
+-		}
++		return EIO;
+ 	}
+ 	printf("SWEET FTS: panel replay dsi hw %x ctrl %x status %x fifo %x "
+ 	    "int %x dma %x\n",
+@@ -737,7 +777,17 @@
+ 	    n, sent, errs, pos, (unsigned)sizeof(fts_panel_on));
+ 	/* TWRP's DRM notifier resets the controller 42 ms after SET_ON. */
+ 	fts_wait(50);
+-	return errs ? EIO : 0;
++	if (errs) {
++		return EIO;
++	}
++	ft.panel_ready = true;
++	/*
++	 * 0144: the panel came out of reset with its default brightness.
++	 * The 0x51 step above was skipped, so restore the level iOS set
++	 * before the POR (CoreBrightness's own write happened earlier).
++	 */
++	sweet_bl_reassert();
++	return 0;
+ }
+ 
+ /* 0xa0/00/01: active scan mode, MT sensing on. */
+@@ -1092,6 +1142,13 @@
+  * Both touch rails are dedicated to the controller: vdd-supply is
+  * touch_vddio_vreg (fixed regulator, GPIO 84) and avdd-supply is PM8150L L1
+  * (RPMh ldoc1, 1.8 V). Assert reset and remove both before powering up again.
++ *
++ * 0144: the panel's VDDIO is the same fixed regulator and VCI is the
++ * disp_vci_vreg switch on east TLMM GPIO 21.  Dropping VCI here turns the
++ * touch rail cycle into a true DDIC power-on reset, which is what TWRP's
++ * DSI_CMD_SET_OFF / SET_ON path gets from the DRM panel driver.  A warm
++ * reboot otherwise leaves VCI on while VDDIO is cycled, and the DDIC keeps
++ * the state that poisons the first FTS calibration.
+  */
+ static void
+ fts_rails_off(void)
+@@ -1100,6 +1157,14 @@
+ 	const uint32_t value_off[1] = { 0 };
+ 
+ 	fts_gpio(ft.gpio_n, FTS_PIN_RESET, 0, 3, 3, true, false);
++	if (ft.panel_por) {
++		/* TWRP's DSI_CMD_SET_OFF, then drop VCI and reset. */
++		fts_panel_off_seq();
++		fts_gpio(ft.gpio_s, FTS_PIN_PANEL_RST, 0, 0, 0, true, false);
++		fts_gpio(ft.gpio_e, FTS_PIN_PANEL_VCI, 0, 0, 0, true, false);
++		ft.panel_ready = false;
++		fts_wait(10);		/* DTB supply pre-off sleep */
++	}
+ 	(void)sweet_rpmh_write("ldoc1", 1, enable_off, value_off);
+ 	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, false);
+ }
+@@ -1112,6 +1177,13 @@
+ 	fts_wait(4);
+ 	int err = sweet_rpmh_vreg_enable("ldoc1", 1800);
+ 	fts_wait(20);
++	if (ft.panel_por) {
++		/* Live DTB: vcie post-on 10 ms, reset low 1 ms / high 10 ms. */
++		fts_gpio(ft.gpio_e, FTS_PIN_PANEL_VCI, 0, 0, 0, true, true);
++		fts_wait(10);
++		fts_gpio(ft.gpio_s, FTS_PIN_PANEL_RST, 0, 0, 0, true, true);
++		fts_wait(10);
++	}
+ 	return err;
+ }
+ 
+@@ -1284,17 +1356,23 @@
+ 	fts_wait(delay_s * 1000u);
+ 	ft.gpio_n = ml_io_map(FTS_TLMM_NORTH_PA, 0x81000);
+ 	ft.gpio_s = ml_io_map(FTS_TLMM_SOUTH_PA, 0x81000);
+-	if (!ft.gpio_n || !ft.gpio_s) {
++	ft.gpio_e = ml_io_map(FTS_TLMM_EAST_PA, 0x20000);
++	if (!ft.gpio_n || !ft.gpio_s || !ft.gpio_e) {
+ 		printf("SWEET FTS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	printf("SWEET FTS: TLMM reset=%#x/%#x vddio=%#x/%#x irq=%#x/%#x\n",
++	printf("SWEET FTS: TLMM reset=%#x/%#x vddio=%#x/%#x irq=%#x/%#x "
++	    "vci=%#x/%#x prst=%#x/%#x\n",
+ 	    fts_rd(ft.gpio_n, FTS_GPIO_CFG(FTS_PIN_RESET)),
+ 	    fts_rd(ft.gpio_n, FTS_GPIO_IO(FTS_PIN_RESET)),
+ 	    fts_rd(ft.gpio_n, FTS_GPIO_CFG(FTS_PIN_VDDIO)),
+ 	    fts_rd(ft.gpio_n, FTS_GPIO_IO(FTS_PIN_VDDIO)),
+ 	    fts_rd(ft.gpio_s, FTS_GPIO_CFG(FTS_PIN_IRQ)),
+-	    fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)));
++	    fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_IRQ)),
++	    fts_rd(ft.gpio_e, FTS_GPIO_CFG(FTS_PIN_PANEL_VCI)),
++	    fts_rd(ft.gpio_e, FTS_GPIO_IO(FTS_PIN_PANEL_VCI)),
++	    fts_rd(ft.gpio_s, FTS_GPIO_CFG(FTS_PIN_PANEL_RST)),
++	    fts_rd(ft.gpio_s, FTS_GPIO_IO(FTS_PIN_PANEL_RST)));
+ 	/* Take the qup17 pins away from the SE before the chip is reset. */
+ 	ft.sda = FTS_PIN_SDA;
+ 	ft.scl = FTS_PIN_SCL;
+@@ -1306,10 +1384,16 @@
+ 	 * (43 05 30/31 or water mode) and the chip stays silent. This is the
+ 	 * cold-boot sequence; cepheustouchpwr=0 keeps the old power-up and
+ 	 * cepheustouchpwrms sets the rails-off window.
++	 *
++	 * 0144: by default the same window also drops panel VCI and reset
++	 * (VDDIO is shared), so the DDIC sees a real power-on reset before
++	 * the SET_ON replay.  cepheustouchpanelpor=0 keeps that off.
+ 	 */
+-	unsigned pwr = 1, pwr_ms = 200;
++	unsigned pwr = 1, pwr_ms = 200, panel_por = 1;
+ 	(void)PE_parse_boot_argn("cepheustouchpwr", &pwr, sizeof(pwr));
+ 	(void)PE_parse_boot_argn("cepheustouchpwrms", &pwr_ms, sizeof(pwr_ms));
++	(void)PE_parse_boot_argn("cepheustouchpanelpor", &panel_por,
++	    sizeof(panel_por));
+ 	if (pwr_ms < 200u) {
+ 		pwr_ms = 200u;
+ 	}
+@@ -1317,12 +1401,14 @@
+ 		pwr_ms = 30000u;
+ 	}
+ 	ft.off_ms = pwr_ms;
++	ft.panel_por = panel_por != 0;
+ 	if (pwr) {
+ 		fts_power_off();
+ 	}
+ 	int perr = fts_rails_on();
+-	printf("SWEET FTS: rails %s, off %u ms, avdd ldoc1 err=%d\n",
+-	    pwr ? "cycled" : "unchanged", pwr_ms, perr);
++	printf("SWEET FTS: rails %s, off %u ms, panel por=%u, avdd ldoc1 "
++	    "err=%d\n", pwr ? "cycled" : "unchanged", pwr_ms, ft.panel_por,
++	    perr);
+ 	fts_wait(20);
+ 	/*
+ 	 * Board notes say SDA=55/SCL=56; if that order is wrong the chip never
+@@ -1447,9 +1533,10 @@
+ 	}
+ 
+ 	/*
+-	 * 0143: if the panel is already up (FTS started after display-on),
+-	 * replay SET_ON before the first calibration, as TWRP does, instead
+-	 * of waiting for another display-on event.
++	 * 0143/0144: if the panel is already up (FTS started after
++	 * display-on) the boot rail cycle above power-cycled it, so replay
++	 * SET_ON before the first calibration, as TWRP does, instead of
++	 * waiting for another display-on event.
+ 	 */
+ 	uint32_t display_seen = sweet_fb_display_on_count;
+ 	if (display_seen) {
+@@ -1509,6 +1596,17 @@
+ 			printf("SWEET FTS: early status failure; power cycle %u\n",
+ 			    ft.recoveries);
+ 			int rerr = fts_power_cycle();
++			/*
++			 * 0144: the cycle dropped panel VCI as well, so a
++			 * display that is already up needs SET_ON again.
++			 */
++			if (!rerr && ft.panel_por &&
++			    sweet_fb_display_on_count) {
++				if (fts_panel_replay_on()) {
++					printf("SWEET FTS: recovery panel "
++					    "replay failed\n");
++				}
++			}
+ 			if (!rerr) {
+ 				rerr = do_cycle ? fts_sense_cycle() :
+ 				    fts_sense_on();
+@@ -1530,15 +1628,19 @@
+ 			printf("SWEET FTS: display on %u; reset and sense on\n",
+ 			    display_seen);
+ 			/*
+-			 * 0143: TWRP re-inits the panel right before this.
+-			 * A warm DDIC otherwise keeps state from before the
+-			 * reset and the new scan calibrates against it.  Wait
+-			 * out CoreBrightness's first DCS 0x51 (~57 ms after
+-			 * display-on) so the two FIFO users do not overlap.
++			 * 0144: only the first display-on after a panel POR
++			 * needs SET_ON.  A power-key wake keeps the DDIC
++			 * powered; replaying SET_ON there resets its
++			 * brightness/gamma state and left the screen dark.
++			 * Wait out CoreBrightness's first DCS 0x51 (~57 ms
++			 * after display-on) so the two FIFO users do not
++			 * overlap while the replay runs.
+ 			 */
+-			fts_wait(200);
+-			if (fts_panel_replay_on()) {
+-				printf("SWEET FTS: panel replay failed\n");
++			if (!ft.panel_ready) {
++				fts_wait(200);
++				if (fts_panel_replay_on()) {
++					printf("SWEET FTS: panel replay failed\n");
++				}
+ 			}
+ 			fts_release_all();
+ 			fts_reset();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -119,6 +119,10 @@
+ 	return dsi;
+ }
+ 
++/* 0144: last level CoreBrightness asked for, and a forced resend. */
++static uint32_t sweet_bl_requested;
++static bool sweet_bl_force;
++
+ static void
+ sweet_bl_dcs_level(uint32_t level)
+ {
+@@ -129,7 +133,7 @@
+ 	uint32_t ctrl, ints, packet0, packet1;
+ 	int tries;
+ 
+-	if (!sweet_bl_dcs_mode() || level == last) {
++	if (!sweet_bl_dcs_mode() || (level == last && !sweet_bl_force)) {
+ 		return;
+ 	}
+ 	dsi = sweet_dsi_ctrl0();
+@@ -145,7 +149,7 @@
+ 	 * waits assume the completion status is not visible and take the
+ 	 * FIFO back anyway.
+ 	 */
+-	if (pending) {
++	if (pending && !sweet_bl_force) {
+ 		for (tries = 0; tries < 2000; tries++) {
+ 			if (sweet_dsi_read(dsi, SWEET_DSI_INT_CTRL) & 1u) {
+ 				break;
+@@ -167,6 +171,11 @@
+ 		}
+ 		pending = false;
+ 	}
++	if (sweet_bl_force) {
++		/* The FIFO was reset by an external SET_ON replay. */
++		pending = false;
++		sweet_bl_force = false;
++	}
+ 
+ 	last = level;
+ 
+@@ -221,7 +230,22 @@
+ 		drops = 0;
+ 		pending = false;
+ 	}
++}
++
++/*
++ * 0144: the FTS panel SET_ON replay owns the DSI command FIFO for a
++ * moment and skips the sequence's DCS 0x51 (it would write brightness 0).
++ * Forget the in-flight state and resend the level CoreBrightness last
++ * asked for, so a panel POR at boot does not leave the screen black.
++ */
++extern "C" void
++sweet_bl_reassert(void)
++{
++	sweet_bl_force = true;
++	sweet_bl_dcs_level(sweet_bl_requested);
++	sweet_bl_force = false;
+ }
++
+ IOReturn
+ IOMobileFramebuffer::setProperties(OSObject *properties)
+ {
+@@ -248,7 +272,9 @@
+ 		number = OSDynamicCast(OSNumber, dict->getObject("backlight-level"));
+ 	}
+ 	if (number != NULL) {
+-		sweet_bl_dcs_level(sweet_bl_level(number->unsigned64BitValue()));
++		sweet_bl_requested =
++		    sweet_bl_level(number->unsigned64BitValue());
++		sweet_bl_dcs_level(sweet_bl_requested);
+ 	}
+ 	return kIOReturnSuccess;
+ }

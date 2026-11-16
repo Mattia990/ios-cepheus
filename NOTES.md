@@ -266,6 +266,14 @@ Of the ~81 original ios-sweet kernel patches:
   the sequence's `51 00 00`, waits 200 ms after display-on so CoreBrightness's first
   `0x51` is not overlapped, and 50 ms after `0x29` like TWRP. `cepheustouchpanel=0`
   disables the replay; `cepheustouchpanelhs=1` sends it in HS instead of LP.
+- 0144 touch: the boot rail cycle also sends TWRP's `DSI_CMD_SET_OFF` (`28 00`, then
+  `10 00` with the DTB's 120 ms sleep), drops panel VCI (east TLMM GPIO 21) and reset
+  (south TLMM GPIO 6) with the DTB's pre-off sleep, and re-applies the rail order
+  VDDIO -> AVDD -> 20 ms -> VCI -> 10 ms -> reset -> 10 ms, so the DDIC gets a real
+  POR. The SET_ON replay then runs at boot, first display-on and recovery, sets
+  `panel_ready`, and is skipped on power-key wakes; `SweetFramebuffer.cpp` exports
+  `sweet_bl_reassert()` to resend the last DCS `0x51` level and clear the stale
+  FIFO-pending flag after the replay. `cepheustouchpanelpor=0` keeps VCI/reset powered.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

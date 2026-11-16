@@ -5,9 +5,53 @@ Last updated **2026-11-16** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### 0143 panel SET_ON replay from XNU: patch ready to build and test warm (2026-11-16)
+### 0144 FTS panel POR + brightness reassert: patch ready to build and test warm (2026-11-16)
 
-**Why this is the next test.** In the warm shim-entry state the DSI0 link is off
+**Why.** 0143's register-only replay is clean on the bus but does not fix the warm path.
+In `touch-0143-warm` the replay ran at 65.510-65.873 (33 sent, 0 errors, pos 458/458, DSI
+`hw 20030000 ctrl 1f5 status 5 fifo 1010 int 501 dma 10000000`) and the sense-on at
+66.391 was clean, but the ghost burst still came at 70.084-70.165: x=1079 at
+y=0/1346/1754/2187/2572 plus (717,1754) and (946,1754), `43 05 30` at 70.419, then the
+early recovery power cycle. No touch after it. Worse, the power-key wake at 84.3 s left
+the screen dark: the 83.7 s `0x51 0` was deferred as "still busy" (the 0143 replay clears
+the DMA-done bit that 0136's `pending`/`last` state relies on), so `last` stayed 442 and
+the wake's identical 14125-level write was skipped, while the 84.52 s replay skipped the
+sequence's own `51 00 00`. The phone had to be rebooted.
+
+**Patch.** `xnu/patches/0144-cepheus-fts-panel-power-cycle.patch` (both files; applies
+after 0143):
+
+- `fts_rails_off()` now sends TWRP's `DSI_CMD_SET_OFF` (`28 00` then `10 00`, 120 ms
+  after sleep-in) and then drops panel VCI (east TLMM GPIO 21) and reset (south TLMM
+  GPIO 6); VDDIO (north GPIO 84) is already dropped by the touch rail cycle.
+  `fts_rails_on()` restores the DTB order: VDDIO -> AVDD -> 20 ms -> VCI -> 10 ms ->
+  reset high -> 10 ms. This is the DDIC POR the shim tests could not do (link off) and
+  TWRP gets from its DRM driver.
+- `fts_panel_replay_on()` is now shared by the boot path, the first display-on and the
+  early recovery; it sets `ft.panel_ready` so later power-key wakes do not replay SET_ON
+  (the 0143 wake replay is what reset the brightness/gamma state).
+- `sweet_bl_reassert()` in `SweetFramebuffer.cpp` resends the last `0x51` level after a
+  replay, clearing the stale `pending` flag and bypassing the `level == last` skip.
+- waits 200 ms after display-on so CoreBrightness's first `0x51` lands before the replay.
+- boot args: `cepheustouchpanelpor=0` keeps VCI/reset powered (control);
+  `cepheustouchpanel=0` still disables the replay itself.
+
+**Warm test.** Build, then from TWRP:
+`tools/cepheus-run.sh touch-0144-warm -k <kernel> -s 200 -a "cepheustouchdelay=55 cepheustouchlog=1"`
+Expected: display on ~49.9 s, FTS start ~64.7 s, SET_OFF + POR then `panel replay`
+~65.2 s, the `sweet_bl_reassert` DCS 0x51 level 0x372d, sense-on ~66 s, no x=1079 burst
+and no `43 05 30`; then press power twice: brightness 0 must be sent (no "still busy"),
+no second replay, and the screen must visibly return. Logs: `logs/runs/touch-0144-*`.
+
+**Controls / next.** If the screen stays dark, rerun with `cepheustouchpanelpor=0` to
+separate the POR from the reassert. If the ghosts persist, the DDIC state is not the
+whole story and the next step is moving the replay into `SweetFramebuffer.cpp`, where
+brightness and display-on are owned. Known cosmetic cost: on a normal boot the logo goes
+dark when FTS starts (SET_OFF + VCI off) and returns with the replay at display-on.
+
+### 0143 panel SET_ON replay from XNU: design (superseded by 0144 in the warm test)
+
+**Why the replay has to come from XNU.** In the warm shim-entry state the DSI0 link is off
 (`DSI_CLK_STATUS` `0x2343` vs cold `0x8037c3`), which is why the shim's 34-command panel
 replay never reached the DDIC (`touch-0144`/`0145`/`panelinit`). XNU's DSI FIFO path is
 live: the DCS `0x51` brightness writes work. TWRP has a live DSI link and works warm after
@@ -31,19 +75,9 @@ applies after 0142):
   in HS instead of the DTB's LP mode. The panel can blink once while the gamma table is
   rewritten; that is expected.
 
-**Warm test (the one that matters).** Build, then from TWRP:
-`tools/cepheus-run.sh touch-0143-warm -a "cepheustouchdelay=55 cepheustouchlog=1"`
-(pass `-k` if the kernel is not the script default). Display comes up at ~49.7 s, FTS
-starts at 55 s, so the replay runs before the first calibration. Expected: 33 sent,
-0 errors, pos 458/458, then a clean sense-on and real touches with no x=1079 / top-row
-ghosts. Control: the same run with `cepheustouchpanel=0` should reproduce the ghosts. Cold
-control should be unchanged (ABL already ran the sequence). Logs: `logs/runs/touch-0143-*`.
-
-**If register-only replay fails.** Next combination: a real panel POR (VCI + VDDIO, and
-the DTB's reset timing) before the replay, then SET_ON, then the FTS reset/sense-on. The
-open question is which always-on domain holds the DDIC state: the 30 s VCI+reset-off test
-below drops VCI but leaves the shared VDDIO (GPIO 84) in place, and with the panel off the
-sensor also loses its ground plane, so it cannot answer that alone.
+**Result (2026-11-16).** The replay itself is clean (33 sent, 0 errors, pos 458/458) but
+the warm ghost burst survives and the next power-key wake is dark. See the 0144 section
+above for the run details and the follow-up design. Logs: `logs/runs/touch-0143-warm/`.
 
 ### Panel VCI + reset off 30 s does not clear the warm poison (`fts-quiet-paneloff30`, 2026-11-16)
 
