@@ -374,12 +374,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  	last = level;
  
-@@ -221,7 +230,22 @@
- 		drops = 0;
- 		pending = false;
+@@ -223,6 +232,20 @@
  	}
-+}
-+
+ }
+ 
 +/*
 + * 0144: the FTS panel SET_ON replay owns the DSI command FIFO for a
 + * moment and skips the sequence's DCS 0x51 (it would write brightness 0).
@@ -392,12 +390,12 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	sweet_bl_force = true;
 +	sweet_bl_dcs_level(sweet_bl_requested);
 +	sweet_bl_force = false;
- }
++}
 +
  IOReturn
  IOMobileFramebuffer::setProperties(OSObject *properties)
  {
-@@ -248,7 +272,9 @@
+@@ -249,7 +272,9 @@
  		number = OSDynamicCast(OSNumber, dict->getObject("backlight-level"));
  	}
  	if (number != NULL) {

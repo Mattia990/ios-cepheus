@@ -36,6 +36,12 @@ after 0143):
 - boot args: `cepheustouchpanelpor=0` keeps VCI/reset powered (control);
   `cepheustouchpanel=0` still disables the replay itself.
 
+**Apply check.** The first CI build (run #62, `eec9fde`) silently skipped the patch:
+`git apply --check` failed on `SweetFramebuffer.cpp` because the generated hunk was
+missing the blank-line context before `IOReturn` (the local apply-test used a synthesized
+baseline). Fixed 2026-11-16; the patch now passes `git apply --check` against the #62
+buildtree with all six hunks.
+
 **Warm test.** Build, then from TWRP:
 `tools/cepheus-run.sh touch-0144-warm -k <kernel> -s 200 -a "cepheustouchdelay=55 cepheustouchlog=1"`
 Expected: display on ~49.9 s, FTS start ~64.7 s, SET_OFF + POR then `panel replay`
