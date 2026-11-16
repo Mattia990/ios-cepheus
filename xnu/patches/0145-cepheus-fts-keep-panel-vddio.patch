@@ -1,0 +1,77 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -38,7 +38,8 @@
+  * cepheustouchpanel=0 skip the panel SET_ON replay after a panel POR,
+  * cepheustouchpanelhs=1 send that replay in HS instead of LP mode,
+  * cepheustouchpanelpor=0 keep panel VCI and reset powered during the boot
+- * rail cycle, and
++ * rail cycle, cepheustouchvddio=0 keep the shared panel VDDIO (north GPIO
++ * 84) up and cycle only the touch AVDD + reset, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -153,7 +154,7 @@
+ 	vm_offset_t gpio_n, gpio_s, gpio_e;
+ 	bool started, dead;
+ 	bool recover, recover_enable;
+-	bool panel_por, panel_ready;
++	bool panel_por, panel_ready, cycle_vddio;
+ 	int log;
+ 	unsigned sda, scl;
+ 	unsigned recoveries, off_ms, sense_ms, cycle_reset;
+@@ -1166,15 +1167,19 @@
+ 		fts_wait(10);		/* DTB supply pre-off sleep */
+ 	}
+ 	(void)sweet_rpmh_write("ldoc1", 1, enable_off, value_off);
+-	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, false);
++	if (ft.cycle_vddio) {
++		fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, false);
++	}
+ }
+ 
+ /* Xiaomi's power-on order: VDDIO (bus) first, then AVDD (pwr). */
+ static int
+ fts_rails_on(void)
+ {
+-	fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
+-	fts_wait(4);
++	if (ft.cycle_vddio) {
++		fts_gpio(ft.gpio_n, FTS_PIN_VDDIO, 0, 0, 0, true, true);
++		fts_wait(4);
++	}
+ 	int err = sweet_rpmh_vreg_enable("ldoc1", 1800);
+ 	fts_wait(20);
+ 	if (ft.panel_por) {
+@@ -1389,11 +1394,12 @@
+ 	 * (VDDIO is shared), so the DDIC sees a real power-on reset before
+ 	 * the SET_ON replay.  cepheustouchpanelpor=0 keeps that off.
+ 	 */
+-	unsigned pwr = 1, pwr_ms = 200, panel_por = 1;
++	unsigned pwr = 1, pwr_ms = 200, panel_por = 1, vddio = 1;
+ 	(void)PE_parse_boot_argn("cepheustouchpwr", &pwr, sizeof(pwr));
+ 	(void)PE_parse_boot_argn("cepheustouchpwrms", &pwr_ms, sizeof(pwr_ms));
+ 	(void)PE_parse_boot_argn("cepheustouchpanelpor", &panel_por,
+ 	    sizeof(panel_por));
++	(void)PE_parse_boot_argn("cepheustouchvddio", &vddio, sizeof(vddio));
+ 	if (pwr_ms < 200u) {
+ 		pwr_ms = 200u;
+ 	}
+@@ -1402,13 +1408,14 @@
+ 	}
+ 	ft.off_ms = pwr_ms;
+ 	ft.panel_por = panel_por != 0;
++	ft.cycle_vddio = vddio != 0;
+ 	if (pwr) {
+ 		fts_power_off();
+ 	}
+ 	int perr = fts_rails_on();
+-	printf("SWEET FTS: rails %s, off %u ms, panel por=%u, avdd ldoc1 "
+-	    "err=%d\n", pwr ? "cycled" : "unchanged", pwr_ms, ft.panel_por,
+-	    perr);
++	printf("SWEET FTS: rails %s, off %u ms, panel por=%u, vddio=%u, "
++	    "avdd ldoc1 err=%d\n", pwr ? "cycled" : "unchanged", pwr_ms,
++	    ft.panel_por, ft.cycle_vddio, perr);
+ 	fts_wait(20);
+ 	/*
+ 	 * Board notes say SDA=55/SCL=56; if that order is wrong the chip never

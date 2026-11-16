@@ -274,6 +274,11 @@ Of the ~81 original ios-sweet kernel patches:
   `panel_ready`, and is skipped on power-key wakes; `SweetFramebuffer.cpp` exports
   `sweet_bl_reassert()` to resend the last DCS `0x51` level and clear the stale
   FIFO-pending flag after the replay. `cepheustouchpanelpor=0` keeps VCI/reset powered.
+- 0145 touch: `cepheustouchvddio=0` keeps the shared panel VDDIO (north TLMM GPIO 84)
+  up during the boot/recovery rail cycle and cycles only the touch AVDD (PM8150L L1)
+  plus reset. Warm boots showed that dropping the shared VDDIO kills the DDIC's
+  scanout and the DCS SET_ON replay cannot revive it without a DSI controller/PHY
+  re-init, so a VDDIO cycle is never safe once ABL has the panel scanning.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
