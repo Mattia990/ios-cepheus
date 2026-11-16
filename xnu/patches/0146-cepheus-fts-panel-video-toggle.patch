@@ -1,0 +1,69 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -39,7 +39,9 @@
+  * cepheustouchpanelhs=1 send that replay in HS instead of LP mode,
+  * cepheustouchpanelpor=0 keep panel VCI and reset powered during the boot
+  * rail cycle, cepheustouchvddio=0 keep the shared panel VDDIO (north GPIO
+- * 84) up and cycle only the touch AVDD + reset, and
++ * 84) up and cycle only the touch AVDD + reset,
++ * cepheustouchvideo=1 stop the DSI video engine while that replay runs
++ * and restore it after, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -692,10 +694,10 @@
+ {
+ 	uint8_t image[160];
+ 	volatile uint32_t *dsi = fts_dsi_ctrl0();
+-	uint32_t dma_save;
++	uint32_t dma_save, ctrl_save = 0, ctrl_off = 0;
+ 	unsigned pos = 0, n = 0, sent = 0, errs = 0;
+ 	int enabled = 1;
+-	unsigned hs = 0;
++	unsigned hs = 0, video = 0;
+ 	int lpm;
+ 
+ 	(void)PE_parse_boot_argn("cepheustouchpanel", &enabled, sizeof(enabled));
+@@ -703,6 +705,7 @@
+ 		return 0;
+ 	}
+ 	(void)PE_parse_boot_argn("cepheustouchpanelhs", &hs, sizeof(hs));
++	(void)PE_parse_boot_argn("cepheustouchvideo", &video, sizeof(video));
+ 	lpm = hs ? 0 : 1;
+ 
+ 	if (dsi == NULL) {
+@@ -717,6 +720,20 @@
+ 	    fts_rd((vm_offset_t)dsi, FTS_DSI_INT_CTRL),
+ 	    fts_rd((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL));
+ 	dma_save = fts_rd((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL);
++	/*
++	 * 0146: sending the SET_ON replay while the video engine scans out
++	 * kills the panel for good (0145 keepvddio: black at replay, even
++	 * with VDDIO untouched).  Stop the engine for the replay like the
++	 * shim's PHY cycle does, then restore it.
++	 */
++	ctrl_save = fts_rd((vm_offset_t)dsi, FTS_DSI_CTRL);
++	if (video) {
++		ctrl_off = ctrl_save & ~7u;
++		fts_wr((vm_offset_t)dsi, FTS_DSI_CTRL, ctrl_off);
++		fts_wait(20);
++		printf("SWEET FTS: panel replay video off ctrl %x -> %x\n",
++		    ctrl_save, ctrl_off);
++	}
+ 
+ 	while (pos + 7 <= sizeof(fts_panel_on)) {
+ 		const uint8_t *cmd = fts_panel_on + pos;
+@@ -778,6 +795,12 @@
+ 	    n, sent, errs, pos, (unsigned)sizeof(fts_panel_on));
+ 	/* TWRP's DRM notifier resets the controller 42 ms after SET_ON. */
+ 	fts_wait(50);
++	if (video) {
++		fts_wr((vm_offset_t)dsi, FTS_DSI_CTRL, ctrl_save);
++		fts_wait(20);
++		printf("SWEET FTS: panel replay video on ctrl %x -> %x\n",
++		    ctrl_off, fts_rd((vm_offset_t)dsi, FTS_DSI_CTRL));
++	}
+ 	if (errs) {
+ 		return EIO;
+ 	}

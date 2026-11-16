@@ -5,46 +5,56 @@ Last updated **2026-11-16** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### 0145 keep the shared panel VDDIO up: 0144's rail cycle kills warm scanout (2026-11-16)
+### 0145/0146: the SET_ON replay kills warm scanout; stop the DSI video engine around it (2026-11-16)
 
-**Three warm runs of the 0144 kernel** (`e94f1b6f...`, built from `892a586`; log markers
-`panel por=`, `vci=... prst=...` verified in the binary before booting):
+**Warm runs of the 0144 kernel** (`e94f1b6f...`, built from `892a586`):
 
-- `touch-0144-warm` (`cepheustouchdelay=55`, por=1): rails 65.36 (`panel por=1`), replay
-  65.66-65.95 (33 sent, 0 errors), reassert `DCS 0x51 level 0x1ba` 65.99, sense-on 66.46.
-  Ghost burst 71.21, `43 05 30` 71.71, recovery 70.4-71.6. **Screen black from ~66 s**:
-  power presses at 97.6-102.6 toggled only the logical display; 442 was sent each time.
-- `touch-0144-nopor` (delay 55, por=0): display 49.68, rails 65.2 (`panel por=0`) - but
-  the shared VDDIO (north GPIO 84) still dropped - replay 65.5, reassert 65.88, sense-on
-  66.34. Ghost at 66.8/70.1, `43 05 30` 70.52, recovery 70.5-71.6. **Screen black again**;
-  no `SWEET FB: display off` at all.
-- `touch-0144-default` (default delay 20, por=0): rails 30.2, sense-on 30.9, ghost burst
-  34.8; display-on 54.52, replay 54.73-55.08, reassert 55.13, reinit 55.19. **Screen never
-  lit**; power presses 103.5-118.2 all logical only.
+- `touch-0144-warm` (delay 55, por=1): rails 65.36, replay 65.66-65.95, reassert 65.99,
+  sense-on 66.46. Ghost 71.21, `43 05 30` 71.71. **Screen black from ~66 s**; power
+  presses 97.6-102.6 only toggled the logical display.
+- `touch-0144-nopor` (delay 55, por=0): rails 65.2 (VDDIO still dropped), replay 65.5,
+  reassert 65.88. Ghost 66.8/70.1, `43 05 30` 70.52. **Screen black again.**
+- `touch-0144-default` (delay 20, por=0): rails 30.2, ghost burst 34.8; display-on 54.52,
+  replay 54.73-55.08, reinit 55.19. **Screen never lit.**
 
-**Conclusion.** The shared `touch_vddio_vreg` (north TLMM GPIO 84) also powers the panel's
-VDDIO. Dropping it on a warm boot stops the DDIC's scanout, and the DCS SET_ON replay
-reports FIFO DMA done but the panel never resumes: only a DSI controller/PHY re-init
-recovers it (the shim TE tests said the same). Ordering does not save it - the default
-flow drops VDDIO at 30 s, before display-on, and the panel still never comes back. The
-cold `touch-0149-cold` run survived because the DDIC/link was cold-initialized. **Never
-drop GPIO 84 after ABL has the panel scanning.** The cycle never fixed the FTS ghost
-either.
+**Warm runs of the 0145 kernel** (`93b0d415...`, built from `6f76c61`; marker
+`panel por=%u, vddio=%u` verified):
 
-**Patch.** `xnu/patches/0145-cepheus-fts-keep-panel-vddio.patch` (after 0144) adds
-`cepheustouchvddio=0`: `fts_rails_off()/fts_rails_on()` keep the shared VDDIO up and cycle
-only the touch AVDD (PM8150L L1) plus reset. Default stays 1 so the 0144 behaviour is
-reproducible. The rails log line now ends `panel por=%u, vddio=%u, avdd ldoc1 err=%d`.
+- `touch-0145-keepvddio` (`por=0 vddio=0`): rails 30.25 (`panel por=0, vddio=0`), sense-on
+  30.97; display on 49.97, `DCS 0x51` 442 at 50.03, replay 50.18-50.54 (33 sent, 0
+  errors), reassert 50.59, reinit 50.65. **Screen black exactly at the replay**, even
+  though north GPIO 84 never dropped. Power presses 74.8-88.5 logical only.
+- `touch-0145-noreplay` (`panel=0 por=0 vddio=0`): rails 30.25, sense-on 30.97; **no
+  ghost burst at 34.8 and no `43 05 30`**; display on 50.15, brightness 442; power
+  off/on 66.38/67.24 restored the screen (442 again at 67.45). FTS was alive
+  (`sysinfo`, probe, sense-on all OK) but produced **zero touch events**: the AVDD-only
+  cycle leaves the controller half-reset and silent.
 
-**Test.** Build, then from TWRP:
-`tools/cepheus-run.sh touch-0145-avdd -k <kernel> -s 200 -a "cepheustouchlog=1 cepheustouchpanelpor=0 cepheustouchvddio=0"`
-Expected: rails line `panel por=0, vddio=0` at ~30 s; the screen/logo must stay up (no
-GPIO-84 drop); display-on ~50-55 s with replay + 442; power-key off/on must return the
-screen. Swipe afterwards: if the ghost persists, the warm poison is not in the AVDD
-domain and the cycle should be dropped entirely (`cepheustouchpwr=0`) to keep the display.
-Logs: `logs/runs/touch-0145-*`.
+**Conclusions.** (1) The warm ghost/`43 05 30` correlates with dropping the shared panel
+VDDIO (north TLMM GPIO 84), not with the FTS AVDD state. (2) The 34-command DCS SET_ON
+replay itself kills XNU's live scanout even when the rails are untouched; nothing after
+it revives the panel. (3) An AVDD-only cycle is not enough to reset the FTS controller.
 
-### 0144 FTS panel POR + brightness reassert: tested warm, superseded by 0145 (2026-11-16)
+**0146 patch.** `xnu/patches/0146-cepheus-fts-panel-video-toggle.patch` (after 0145) adds
+`cepheustouchvideo=1` (default 0, so existing behaviour is unchanged): before the replay
+it saves `DSI_CTRL` (0xae94004) and writes `ctrl & ~7u` to stop the video engine, waits
+20 ms; after the sequence's 50 ms `0x29` wait it restores `DSI_CTRL`, waits 20 ms, then
+`sweet_bl_reassert()` runs as before. Logs: `panel replay video off ctrl %x -> %x` and
+`panel replay video on ctrl %x -> %x`.
+
+**Next test.** Full touch rail cycle (`vddio=1`, `panelpor=0`) + video toggle, so the FTS
+chip gets a real reset while the panel is expected to survive the replay:
+
+`tools/cepheus-run.sh touch-0146-video -s 200 -a "cepheustouchlog=1 cepheustouchpanelpor=0 cepheustouchvideo=1"`
+
+Expected: rails 30 s with `vddio=1`; display on ~50 s; replay bracketed by
+`video off ctrl 1f5 -> 1f0` / `video on ctrl 1f0 -> 1f5`; screen must stay up through
+the replay and power off/on. Then swipe: the ghost may still appear (VDDIO drop) but the
+touch should finally report events. If the display still dies at the replay, stop the
+engine + `DSI_SOFT_RESET`/PHY re-init or replay before display-on instead. Logs:
+`logs/runs/touch-0146-*`.
+
+### 0144 FTS panel POR + brightness reassert: tested warm, superseded by 0145/0146 (2026-11-16)
 
 **Why.** 0143's register-only replay is clean on the bus but does not fix the warm path.
 In `touch-0143-warm` the replay ran at 65.510-65.873 (33 sent, 0 errors, pos 458/458, DSI

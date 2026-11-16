@@ -276,9 +276,14 @@ Of the ~81 original ios-sweet kernel patches:
   FIFO-pending flag after the replay. `cepheustouchpanelpor=0` keeps VCI/reset powered.
 - 0145 touch: `cepheustouchvddio=0` keeps the shared panel VDDIO (north TLMM GPIO 84)
   up during the boot/recovery rail cycle and cycles only the touch AVDD (PM8150L L1)
-  plus reset. Warm boots showed that dropping the shared VDDIO kills the DDIC's
-  scanout and the DCS SET_ON replay cannot revive it without a DSI controller/PHY
-  re-init, so a VDDIO cycle is never safe once ABL has the panel scanning.
+  plus reset. Warm tests showed the warm ghost/`43 05 30` follows the VDDIO drop, not
+  the AVDD state (`touch-0145-noreplay`: no ghost, display and wake stable), but an
+  AVDD-only cycle leaves the FTS controller half-reset and silent (zero touch events).
+- 0146 touch: `cepheustouchvideo=1` (default 0) stops the DSI video engine around the
+  SET_ON replay (`DSI_CTRL` 0xae94004 saved, `ctrl & ~7u`, 20 ms, replay, 50 ms, restore,
+  20 ms, then the brightness reassert). `touch-0145-keepvddio` showed the replay itself
+  kills XNU's live scanout even with VDDIO untouched (black at 50.5 s), so the engine
+  must not be scanning out while the FIFO replays the warm panel init.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
