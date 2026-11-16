@@ -259,6 +259,13 @@ Of the ~81 original ios-sweet kernel patches:
   senses on, matching the point where TWRP cuts its first scan and system-resets FTS
   before the second calibration. `cepheustouchcyclereset=0` skips the reset (control);
   the sense-on line reports `ms=N cr=1`.
+- 0143 touch: replay the live DTB's 34-command EA8076 SET_ON sequence through the DSI0
+  command FIFO at display-on (and at FTS start when the display is already up), before
+  the 0141 reset/sense-on. This is the panel re-init the warm path lacks: the shim cannot
+  replay it because the DSI link is off at shim entry, while XNU's FIFO is live. Skips
+  the sequence's `51 00 00`, waits 200 ms after display-on so CoreBrightness's first
+  `0x51` is not overlapped, and 50 ms after `0x29` like TWRP. `cepheustouchpanel=0`
+  disables the replay; `cepheustouchpanelhs=1` sends it in HS instead of LP.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

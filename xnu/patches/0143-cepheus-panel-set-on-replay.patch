@@ -1,0 +1,319 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 9b403a5..c57fb2a 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -34,7 +34,9 @@
+  * cepheustouchsensems=N run the first scan for N ms before cutting it
+  * short and resetting the controller (default 350),
+  * cepheustouchcyclereset=0 skip that reset (350 ms on, 50 ms off only),
+- * cepheustouchdisplay=0 skip the reset+sense-on on display-on, and
++ * cepheustouchdisplay=0 skip the reset+sense-on on display-on,
++ * cepheustouchpanel=0 skip the panel SET_ON replay at display-on,
++ * cepheustouchpanelhs=1 send that replay in HS instead of LP mode, and
+  * cepheustouchrecover=0 disable the early force-cal recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+@@ -486,6 +488,258 @@ static void fts_reset(void);
+ static int fts_wait_ready(unsigned ms);
+ static void fts_release_all(void);
+ 
++/*
++ * 0143: replay the EA8076 SET_ON sequence at display-on.
++ *
++ * A cold boot gets a true panel POR in ABL, and the FTS calibration that
++ * follows is clean.  A warm reset skips ABL's panel init: the DDIC keeps
++ * internal state across the reset and the first scan locks onto a bad
++ * baseline (right-edge/top-row ghosts, 43 05 30) 3-4 s after sense-on.
++ * TWRP works warm because it re-inits the panel (DSI_CMD_SET_ON at 1.838 s)
++ * before its FTS sense-on at 1.880 s.
++ *
++ * XNU never replays SET_ON; it only sends DCS 0x51 for brightness.  Send
++ * the live DTB's 34-command on sequence through the DSI0 command FIFO at
++ * display-on, then let the existing display-on path reset and recalibrate
++ * the controller, mirroring TWRP's order.  The DTB marks the sequence
++ * dsi_lp_mode.  The FIFO image format is the one dsi_cmd_dma_add() builds
++ * (same as shim/panel.c and the DCS 0x51 path in SweetFramebuffer.cpp):
++ *
++ *   long:  wc_lo wc_hi 0x39 0xc0 payload... 0xff padding
++ *   short: data0 data1 dtype 0x80
++ *
++ * The 0x51 step is skipped: it writes brightness 0, and CoreBrightness's
++ * first 0x51 write lands in the middle of this replay.  XNU owns brightness.
++ *
++ * cepheustouchpanel=0 disables the replay; cepheustouchpanelhs=1 sends the
++ * commands in HS mode instead of the DTB's LP mode.
++ */
++#define FTS_DSI0_PA			0xae94000u
++#define FTS_DSI0_SIZE			0x400u
++
++#define FTS_DSI_HW_VERSION		0x0000
++#define FTS_DSI_CTRL			0x0004
++#define FTS_DSI_STATUS			0x0008
++#define FTS_DSI_FIFO_STATUS		0x000c
++#define FTS_DSI_COMMAND_MODE_DMA_CTRL	0x003c
++#define FTS_DSI_DMA_CMD_LENGTH		0x004c
++#define FTS_DSI_CMD_MODE_DMA_SW_TRIGGER	0x0090
++#define FTS_DSI_INT_CTRL		0x0110
++#define FTS_DSI_TEST_PATTERN_GEN_CTRL	0x015c
++#define FTS_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL 0x017c
++#define FTS_DSI_TPG_DMA_FIFO_RESET	0x01ec
++
++#define FTS_DSI_INT_CMD_DMA_DONE	(1u << 0)
++#define FTS_DSI_INT_ERROR		(1u << 24)
++
++/*
++ * Live DTB panel qcom,mdss-dsi-on-command: 34 commands,
++ * each [dtype last vc ack wait len_hi len_lo payload...].  Copied from
++ * shim/panel.c (f1mp_on).
++ */
++static const uint8_t fts_panel_on[] = {
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x02, 0xb0, 0x0c, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
++	0xff, 0x10, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x2f, 0x39,
++	0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0xd1, 0x01, 0x39, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5, 0x39, 0x01, 0x00, 0x00, 0x00, 0x00,
++	0x03, 0xfc, 0xa5, 0xa5, 0x05, 0x01, 0x00, 0x00, 0x0a, 0x00, 0x02, 0x11,
++	0x00, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x35, 0x00, 0x39, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x03, 0xb7, 0x01, 0x4b, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x02, 0xb0, 0x06, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb7, 0x10,
++	0x39, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5, 0x39, 0x01,
++	0x00, 0x00, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x23, 0x39, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x02, 0xb0, 0x23, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xd1, 0x33,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0xe9, 0x11, 0x55, 0xa6, 0x75,
++	0xa3, 0xa6, 0x37, 0xbe, 0x00, 0x1a, 0xb8, 0x39, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x0c, 0xd9, 0x14, 0x00, 0x00, 0x8f, 0x6e, 0x00, 0x00, 0x8f, 0x2e,
++	0x6e, 0x34, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6d, 0xc0, 0x31, 0x01,
++	0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x40, 0x3d, 0x00, 0x5e, 0x00, 0x00,
++	0x00, 0x20, 0x07, 0x20, 0x30, 0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0xe0, 0x0b, 0x75, 0xd8, 0x00, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x00, 0x00,
++	0xf6, 0x97, 0x0f, 0x6d, 0xe6, 0xcd, 0x05, 0x21, 0x8b, 0xec, 0xed, 0xed,
++	0xed, 0x0d, 0x3f, 0x60, 0x00, 0x67, 0xfd, 0x6d, 0x51, 0xbc, 0xdd, 0xdd,
++	0x00, 0x00, 0x07, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x2f, 0x00, 0x00, 0x03, 0x2e,
++	0x3c, 0x20, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x8c, 0x39, 0x01,
++	0x00, 0x00, 0x00, 0x00, 0x02, 0xc0, 0x31, 0x39, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x07, 0xe1, 0x00, 0x00, 0x02, 0x02, 0x42, 0x02, 0x39, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x07, 0xe2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x39,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x0c, 0x39, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x02, 0xe1, 0x19, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
++	0xf0, 0xa5, 0xa5, 0x39, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0xfc, 0xa5,
++	0xa5, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x53, 0x20, 0x39, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x03, 0x51, 0x00, 0x00, 0x39, 0x01, 0x00, 0x00,
++	0x43, 0x00, 0x02, 0x55, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02,
++	0x29, 0x00,
++};
++
++static int
++fts_dsi_send_image(volatile uint32_t *dsi, const uint8_t *image, unsigned size,
++    int lpm)
++{
++	uint32_t ctrl, ints;
++	uint64_t deadline;
++	unsigned i;
++
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TEST_PATTERN_GEN_CTRL, 0);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TPG_DMA_FIFO_RESET, 1);
++	fts_udelay(1000);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TPG_DMA_FIFO_RESET, 0);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TEST_PATTERN_GEN_CTRL,
++	    (1u << 1) | (1u << 2) | (0x3u << 16));
++	for (i = 0; i < size; i += 4) {
++		uint32_t w = (uint32_t)image[i] |
++		    ((uint32_t)image[i + 1] << 8) |
++		    ((uint32_t)image[i + 2] << 16) |
++		    ((uint32_t)image[i + 3] << 24);
++		fts_wr((vm_offset_t)dsi,
++		    FTS_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, w);
++	}
++	/* The hardware wants an extra zero DWORD for an odd word count. */
++	if ((size / 4) & 1u) {
++		fts_wr((vm_offset_t)dsi,
++		    FTS_DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, 0);
++	}
++
++	ctrl = fts_rd((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL);
++	ctrl &= ~((1u << 31) | (1u << 30) | (1u << 26));
++	if (lpm) {
++		ctrl |= 1u << 26;
++	}
++	ctrl |= 1u << 28;		/* embedded FIFO mode */
++	fts_wr((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL, ctrl);
++
++	ints = fts_rd((vm_offset_t)dsi, FTS_DSI_INT_CTRL);
++	if (ints & FTS_DSI_INT_CMD_DMA_DONE) {
++		fts_wr((vm_offset_t)dsi, FTS_DSI_INT_CTRL,
++		    ints & ~FTS_DSI_INT_ERROR);
++	}
++	fts_wr((vm_offset_t)dsi, FTS_DSI_DMA_CMD_LENGTH, size);
++	__sync_synchronize();
++	fts_wr((vm_offset_t)dsi, FTS_DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
++
++	deadline = mach_absolute_time() +
++	    (uint64_t)50u * FTS_TICKS_PER_US * 1000u;
++	while (!(fts_rd((vm_offset_t)dsi, FTS_DSI_INT_CTRL) &
++	    FTS_DSI_INT_CMD_DMA_DONE)) {
++		if (mach_absolute_time() > deadline) {
++			return EIO;
++		}
++		__asm__ volatile("yield" ::: "memory");
++	}
++	ints = fts_rd((vm_offset_t)dsi, FTS_DSI_INT_CTRL);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_INT_CTRL, ints & ~FTS_DSI_INT_ERROR);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TEST_PATTERN_GEN_CTRL, 0);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TPG_DMA_FIFO_RESET, 1);
++	fts_udelay(1000);
++	fts_wr((vm_offset_t)dsi, FTS_DSI_TPG_DMA_FIFO_RESET, 0);
++	return 0;
++}
++
++static int
++fts_panel_replay_on(void)
++{
++	uint8_t image[160];
++	static volatile uint32_t *dsi;
++	uint32_t dma_save;
++	unsigned pos = 0, n = 0, sent = 0, errs = 0;
++	int enabled = 1;
++	unsigned hs = 0;
++	int lpm;
++
++	(void)PE_parse_boot_argn("cepheustouchpanel", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return 0;
++	}
++	(void)PE_parse_boot_argn("cepheustouchpanelhs", &hs, sizeof(hs));
++	lpm = hs ? 0 : 1;
++
++	if (dsi == NULL) {
++		dsi = (volatile uint32_t *)ml_io_map(FTS_DSI0_PA, FTS_DSI0_SIZE);
++		if (dsi == NULL) {
++			printf("SWEET FTS: panel replay: cannot map DSI0\n");
++			return EIO;
++		}
++	}
++	printf("SWEET FTS: panel replay dsi hw %x ctrl %x status %x fifo %x "
++	    "int %x dma %x\n",
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_HW_VERSION),
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_CTRL),
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_STATUS),
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_FIFO_STATUS),
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_INT_CTRL),
++	    fts_rd((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL));
++	dma_save = fts_rd((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL);
++
++	while (pos + 7 <= sizeof(fts_panel_on)) {
++		const uint8_t *cmd = fts_panel_on + pos;
++		unsigned len = ((unsigned)cmd[5] << 8) | cmd[6];
++		unsigned wait = cmd[4];
++		unsigned size;
++		int rc;
++
++		if (pos + 7 + len > sizeof(fts_panel_on)) {
++			printf("SWEET FTS: panel cmd %u truncated at %u\n",
++			    n, pos);
++			errs++;
++			break;
++		}
++		/* Brightness is XNU's: 0x51 00 00 would blank the panel. */
++		if (cmd[0] == 0x39 && len == 3 && cmd[7] == 0x51) {
++			pos += 7 + len;
++			n++;
++			continue;
++		}
++		if (cmd[0] == 0x39) {
++			if (len > sizeof(image) - 4) {
++				errs++;
++				break;
++			}
++			image[0] = (uint8_t)len;
++			image[1] = (uint8_t)(len >> 8);
++			image[2] = 0x39;
++			image[3] = 0xc0;	/* long packet, last */
++			for (unsigned i = 0; i < len; i++) {
++				image[4 + i] = cmd[7 + i];
++			}
++			size = (4 + len + 3u) & ~3u;
++			for (unsigned i = 4 + len; i < size; i++) {
++				image[i] = 0xff;
++			}
++		} else {
++			/* Short packet: data0, data1, type, last. */
++			image[0] = cmd[7];
++			image[1] = cmd[8];
++			image[2] = cmd[0];
++			image[3] = 0x80;
++			size = 4;
++		}
++		rc = fts_dsi_send_image(dsi, image, size, lpm);
++		if (rc) {
++			errs++;
++		}
++		if (wait) {
++			fts_wait(wait);
++		}
++		pos += 7 + len;
++		n++;
++		sent++;
++	}
++
++	fts_wr((vm_offset_t)dsi, FTS_DSI_COMMAND_MODE_DMA_CTRL, dma_save);
++	printf("SWEET FTS: panel replay %u cmds, %u sent, %u errors, pos %u/%u\n",
++	    n, sent, errs, pos, (unsigned)sizeof(fts_panel_on));
++	/* TWRP's DRM notifier resets the controller 42 ms after SET_ON. */
++	fts_wait(50);
++	return errs ? EIO : 0;
++}
++
+ /* 0xa0/00/01: active scan mode, MT sensing on. */
+ static int
+ fts_sense_set(uint8_t settings)
+@@ -1192,6 +1446,18 @@ fts_thread(void *arg, wait_result_t result)
+ 		}
+ 	}
+ 
++	/*
++	 * 0143: if the panel is already up (FTS started after display-on),
++	 * replay SET_ON before the first calibration, as TWRP does, instead
++	 * of waiting for another display-on event.
++	 */
++	uint32_t display_seen = sweet_fb_display_on_count;
++	if (display_seen) {
++		if (fts_panel_replay_on()) {
++			printf("SWEET FTS: boot panel replay failed\n");
++		}
++	}
++
+ 	err = do_cycle ? fts_sense_cycle() : fts_sense_on();
+ 	printf("SWEET FTS: sense on err=%d; poll=%u reset2=%u sysinfo=%u "
+ 	    "probe=%u cycle=%u display=%u ms=%u cr=%u\n", err, poll_enable,
+@@ -1201,7 +1467,6 @@ fts_thread(void *arg, wait_result_t result)
+ 		goto out;
+ 	}
+ 	ft.sense_time = mach_absolute_time();
+-	uint32_t display_seen = sweet_fb_display_on_count;
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!ft.dead) {
+ 		/* The IRQ line (active low) says events are pending; also read
+@@ -1264,6 +1529,17 @@ fts_thread(void *arg, wait_result_t result)
+ 			display_seen = sweet_fb_display_on_count;
+ 			printf("SWEET FTS: display on %u; reset and sense on\n",
+ 			    display_seen);
++			/*
++			 * 0143: TWRP re-inits the panel right before this.
++			 * A warm DDIC otherwise keeps state from before the
++			 * reset and the new scan calibrates against it.  Wait
++			 * out CoreBrightness's first DCS 0x51 (~57 ms after
++			 * display-on) so the two FIFO users do not overlap.
++			 */
++			fts_wait(200);
++			if (fts_panel_replay_on()) {
++				printf("SWEET FTS: panel replay failed\n");
++			}
+ 			fts_release_all();
+ 			fts_reset();
+ 			int derr = fts_bb_recover() ? 0 : EIO;

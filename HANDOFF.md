@@ -1,9 +1,69 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-15** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-16** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### 0143 panel SET_ON replay from XNU: patch ready to build and test warm (2026-11-16)
+
+**Why this is the next test.** In the warm shim-entry state the DSI0 link is off
+(`DSI_CLK_STATUS` `0x2343` vs cold `0x8037c3`), which is why the shim's 34-command panel
+replay never reached the DDIC (`touch-0144`/`0145`/`panelinit`). XNU's DSI FIFO path is
+live: the DCS `0x51` brightness writes work. TWRP has a live DSI link and works warm after
+`DSI_CMD_SET_OFF` at 1.706 s, `DSI_CMD_SET_ON` at 1.838 s and FTS sense-on at 1.880 s. So
+the replay has to run from XNU, not from the shim.
+
+**Patch.** `xnu/patches/0143-cepheus-panel-set-on-replay.patch` (only `bsd/dev/sweet_fts.c`;
+applies after 0142):
+
+- copies the live DTB's 34-command EA8076 on sequence (the same bytes as `shim/panel.c`
+  `f1mp_on`, 458 bytes) and sends each command through the DSI0 command FIFO with the
+  shim's packing, wait values and LP mode;
+- runs it at display-on before the 0141 reset/sense-on, and at FTS start when the display
+  is already up (the `cepheustouchdelay` case), which is TWRP's order: panel SET_ON, then
+  FTS reset + sense-on;
+- skips the sequence's `51 00 00` (it would blank the panel; XNU owns brightness), waits
+  200 ms after the display-on counter so CoreBrightness's first `0x51` (~57 ms) is not
+  overlapped, and 50 ms after `0x29` like TWRP;
+- logs `SWEET FTS: panel replay ...` at entry and `panel replay N cmds, N sent, N errors`;
+- boot args: `cepheustouchpanel=0` disables the replay, `cepheustouchpanelhs=1` sends it
+  in HS instead of the DTB's LP mode. The panel can blink once while the gamma table is
+  rewritten; that is expected.
+
+**Warm test (the one that matters).** Build, then from TWRP:
+`tools/cepheus-run.sh touch-0143-warm -a "cepheustouchdelay=55 cepheustouchlog=1"`
+(pass `-k` if the kernel is not the script default). Display comes up at ~49.7 s, FTS
+starts at 55 s, so the replay runs before the first calibration. Expected: 33 sent,
+0 errors, pos 458/458, then a clean sense-on and real touches with no x=1079 / top-row
+ghosts. Control: the same run with `cepheustouchpanel=0` should reproduce the ghosts. Cold
+control should be unchanged (ABL already ran the sequence). Logs: `logs/runs/touch-0143-*`.
+
+**If register-only replay fails.** Next combination: a real panel POR (VCI + VDDIO, and
+the DTB's reset timing) before the replay, then SET_ON, then the FTS reset/sense-on. The
+open question is which always-on domain holds the DDIC state: the 30 s VCI+reset-off test
+below drops VCI but leaves the shared VDDIO (GPIO 84) in place, and with the panel off the
+sensor also loses its ground plane, so it cannot answer that alone.
+
+### Panel VCI + reset off 30 s does not clear the warm poison (`fts-quiet-paneloff30`, 2026-11-16)
+
+**Run.** Warm from TWRP, shim built with `-DSHIM_FTS_QUIET -DSHIM_FTS_PANELOFF_MS=30000`
+(`work/boot/runs/fts-quiet-paneloff30.img`). It drives panel VCI (east TLMM GPIO 21) and
+panel reset (south TLMM GPIO 6) low, sleeps 30 s, and keeps both off through the scan.
+Log: `logs/runs/fts-quiet-paneloff30/shim.txt`.
+
+**Result.** 32 events / 24 contacts, still the warm signature: `43 05 01`, then
+`43 01 a0 00 01`, then `43 05 31` (SS invalid self strength) before any contact, and
+24 contacts with y=174 dominant (x=972, 432, 1003, 1016, 573, 951), plus two `43 05 30`
+(MS invalid mutual strength) and two `43 06` errors. Events are drained after the 6 s
+window, so their `t=` values are read times, not event times. Compare the panel-on quiet
+run (`fts-quiet`): 23 events / 20 contacts, no `43 05 30`/`43 06`.
+
+**Reading.** Dropping VCI and holding reset low for 30 s does not clear the warm state.
+The scan is *worse*, not better: `43 05 31` appears immediately, which is expected when the
+panel's ground plane is removed, so this test cannot separate DDIC state from the missing
+panel. What it does show is that a crude VCI-only power-down is not TWRP's panel POR; the
+shared VDDIO (GPIO 84) and the DTB power-up ordering are still untested.
 
 ### Warm poison survives 300 s in fastboot: it is latched, not charge (`fts-probe-warm-wait300`, 2026-11-15)
 
