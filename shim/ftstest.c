@@ -102,6 +102,19 @@
 #endif
 
 /*
+ * Panel-emission test: switch DCS 0x51 to 0 before the FTS rails come up and
+ * back to SHIM_FTS_BLLEVEL after this many ms of scanning.  The OLED emission
+ * changes the capacitive baseline the controller calibrates on; the warm
+ * ghost fires ~3-4 s after sense-on, while this window keeps the panel dark.
+ */
+#ifndef SHIM_FTS_BLDIM_MS
+#define SHIM_FTS_BLDIM_MS 0
+#endif
+#ifndef SHIM_FTS_BLLEVEL
+#define SHIM_FTS_BLLEVEL 0x7ff
+#endif
+
+/*
  * FIFO backpressure test: XNU prints every event synchronously to the serial
  * console (~6 ms per line at 115200 baud) while the shim logs to a RAM ring.
  * Delay this long after each logged event to model that stall.  If the chip
@@ -592,6 +605,11 @@ fts_test(void)
 	panel_reinit();
 #endif
 
+#if SHIM_FTS_BLDIM_MS > 0
+	/* Panel stays initialized and scanning, but emits nothing. */
+	panel_set_backlight(0);
+#endif
+
 #ifdef SHIM_FTS_TWRP_POWER
 	/*
 	 * TWRP/Linux power order: fts_enable_reg() enables info->vdd_reg
@@ -699,6 +717,9 @@ fts_test(void)
 	log_printf("fts test: sense on err=%d\n", err);
 
 	unsigned logged = 0;
+#if SHIM_FTS_BLDIM_MS > 0
+	int bl_restored = 0;
+#endif
 #if SHIM_FTS_SOFT_RECOVER
 	unsigned recover_at = 0;
 	int recover_armed = 0, recover_done = 0;
@@ -710,6 +731,15 @@ fts_test(void)
 		if (dt >= FT_POLL_MS) {
 			break;
 		}
+#if SHIM_FTS_BLDIM_MS > 0
+		if (!bl_restored && dt >= SHIM_FTS_BLDIM_MS) {
+			bl_restored = 1;
+			panel_set_backlight(SHIM_FTS_BLLEVEL);
+			log_printf("fts test: backlight restored at %u ms\n",
+			    (unsigned)dt);
+			logged = 0;
+		}
+#endif
 		if (!ft_fifo_read(ev) && ev[0] != 0x00u) {
 			if (logged < 64u) {
 				log_printf("fts test: ev t=%u ", (unsigned)dt);
@@ -745,6 +775,8 @@ fts_test(void)
 			delay_ms(50);
 			r = ft_write_buf(sense_on, sizeof(sense_on));
 			log_printf("fts test: soft recover sense on err=%d\n", r);
+			/* Log post-recovery touches even if the burst used the cap. */
+			logged = 0;
 		}
 #endif
 		delay_ms(5);

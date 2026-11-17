@@ -319,8 +319,32 @@ Of the ~81 original ios-sweet kernel patches:
 - 0147 touch: re-arm the scan instead of power-cycling when the controller reports
   `43 05 30/31` or water-mode enter within 10 s of sense-on (at most 4 times), waiting
   `cepheustouchrearmms` (default 600) first. `cepheustouchrearm=0` disables it; the 0137
-  power-cycle recovery remains the fallback. This is the first warm-boot recovery that
-  returns the chip to an armed state without a panel/rail cycle; needs a warm XNU test.
+  power-cycle recovery remains the fallback. Each re-arm is plain sense-off (`A0 00 00`)
+  immediately followed by sense-on. Warm XNU test (`touch-0147-noreplay`):
+  the re-arm returns the chip to `43 05 01` and suppresses the second force cal, but the
+  AFE reports no contacts at all, so `43 05 01` is a normal post-sense-on status, not
+  proof that the chip is scanning for fingers.
+- 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
+  ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
+  the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the
+  last byte is `event[7]`, the FIFO counter. `43 05 30` remains "MS invalid Mutual
+  Strength soft Force cal".
+- 2026-11-17 panel emission is not the trigger: `fts-bldim60` (DCS `0x51 = 0` before the
+  FTS rails and through sense-on + 15 s) still produced the same right/top-edge burst at
+  3.26-3.47 s and no touch after brightness restore. `fts-quiet-paneloff30` (panel VCI +
+  reset low for 30 s, scan with the panel off) also ghosts, so DDIC drive/emission is out.
+- 2026-11-17 LineageOS check: `drivers/input/touchscreen/xiaomi/fts_521` is the same ST
+  5.2.4 as TWRP (whitespace + Android plumbing only), but cepheus' vendor config selects
+  `CONFIG_TOUCHSCREEN_ST_FTS_V521=y`, i.e. `drivers/input/touchscreen/st/fts.c` 4.2.14
+  with DT `fts@49 compatible = "st,fts"`. Its probe path has no warm-boot-specific init
+  and 5.2.4 has no noise-parameter write, so there is nothing to port from there.
+- TWRP `/proc/fts/driver_test` (fts_proc.c): text mode is space-separated hex bytes.
+  `01 A0 00 01` = raw write (sense on), `12` = system reset, `14` = `fts_chip_powercycle`,
+  `15 00` = read sysinfo, `23 <type>` = get MS frame (0 raw, 1 filter, 2 strength,
+  3 baseline; `GETMSFRAME` senses on, waits, senses *off*, flushes the FIFO and reads the
+  frame, so send `01 A0 00 01` afterwards). `tools/cepheus-fts-driver-test.sh
+  baseline|cycle OUTDIR` runs these from TWRP over adb and saves dmesg + frames.
+
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

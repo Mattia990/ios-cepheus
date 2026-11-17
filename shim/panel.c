@@ -225,6 +225,14 @@ static int send_backlight(uint32_t level)
 	return send_image(image, sizeof(image), 1);
 }
 
+void
+panel_set_backlight(unsigned level)
+{
+	int rc = send_backlight(level);
+	log_printf("panel: backlight %#x -> %d int %x\n", level, rc,
+	    dsi_rd(DSI_INT_CTRL));
+}
+
 #if defined(SHIM_PANEL_CYCLE) || defined(SHIM_PHY_CYCLE)
 /* Count edges on the panel's TE output for the given window. */
 static unsigned panel_te_edges(unsigned ms)

@@ -5,6 +5,86 @@ Last updated **2026-11-17** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Panel emission exonerated; next test runs TWRP's own driver (2026-11-17)
+
+**Panel emission is not the trigger.** `fts-bldim60.img` (`2ab67032...`), warm: the shim
+brings the panel up fully (VCI, SET_ON, backlight `0x7ff`), sends DCS `0x51 = 0` *before*
+the FTS rails/sense-on, restores `0x7ff` 15 s after sense-on, then polls for 60 s
+(`SHIM_FTS_BLDIM_MS=15000`, `FT_POLL_MS=60000`). The same 10-contact right/top-edge burst
+arrived at 3260-3471 ms **while the panel was dark**, then silence; no touch after the
+backlight came back. With `fts-quiet-paneloff30` (VCI + reset held low 30 s, panel off
+through the whole scan) also ghosting, both OLED emission and DDIC drive are out.
+
+**LineageOS 23.2 has nothing new for warm boot.** `drivers/input/touchscreen/xiaomi/fts_521`
+is the same ST 5.2.4 code as TWRP's (`fts_lib/*` differs only in whitespace; `fts.c` differs
+only in Android 13/14 plumbing: `linux/msm_drm_notify.h`, `tp_common`,
+`CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE`). Cepheus does not even use it:
+`arch/arm64/configs/vendor/xiaomi/cepheus.config` sets
+`CONFIG_TOUCHSCREEN_ST_FTS_V521=y` and the overlay DT has `fts@49 compatible = "st,fts"`, so
+the shipped driver is `drivers/input/touchscreen/st/fts.c` **4.2.14** (with
+`CONFIG_FTS_FOD_AREA_REPORT=y`). Its probe path is `fts_system_reset` -> `readChipInfo` ->
+`fts_interrupt_install` -> delayed `fts_fw_update` -> sense-on, with an ESD/watchdog
+power-cycle recovery; there is no warm-boot-specific init and no noise-parameter write
+(`USE_NOISE_PARAM` does not exist in 5.2.4).
+
+**Status decode correction.** `43 05 01` is `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`,
+"Mutual negative detect Force cal" - a normal status emitted right after sense-on, which
+TWRP also reports and works with. The earlier note that TWRP emits a distinct `43 05 02`
+was a misread (the extra byte is `event[7]`, the FIFO counter). `43 05 30` remains
+`EVT_TYPE_STATUS_FORCE_CAL` subtype `0x30`, "MS invalid Mutual Strength soft Force cal".
+
+**What is still different.** TWRP boots warm and works; every attempt to reproduce its
+environment from the shim still ghosts: full command sequence (`fts-twrpseq`, 32 events then
+`43 05 30`), TWRP rail order (`fts-twrppwr`), panel POR with or without age, panel held off,
+300 s in fastboot, and an entry register dump that is byte-identical cold vs warm. A full
+power-off is still the only thing that clears it, yet `twrp-after-xnu` shows touch working
+again in TWRP after a failed XNU run. So the remaining difference is not the FTS command
+list, the rails, the panel, or AP-visible entry state.
+
+**Next experiment (no rebuild needed).** From warm TWRP (touch working), drive the 5.2.4
+driver through `/proc/fts/driver_test` with `tools/cepheus-fts-driver-test.sh`:
+
+- `baseline OUT`: reads sysinfo and MS raw/filter/strength/baseline frames while touch
+  works (raw frame = 16x34x2 bytes via `FTS_CMD_FRAMEBUFFER_R`). `GETMSFRAME` stops the
+  scan, so the script sends `A0 00 01` again afterwards.
+- `cycle OUT`: `14` (`fts_chip_powercycle`: VDDIO off, AVDD off, reset low, VDDIO on, 1 ms,
+  AVDD on, 5/10 ms, reset high), `12` (`fts_system_reset`), `01 A0 00 01` (sense-on), then
+  an 8 s watch plus frames.
+
+If `cycle` ghosts, the whole chip bring-up can be bisected inside one TWRP session, with
+TWRP's own IRQ handler logging the events. If it stays clean, the difference is in the boot
+environment rather than the command sequence, and the frame dumps show whether the *raw*
+mutual capacitance is wrong (electrical/physical) or only baseline/strength (firmware
+state). Two extra shim readbacks would close the remaining gaps: probe the chip on I2C
+*before* enabling VDDIO/AVDD (is something keeping it powered?), and read PM8150L L1 `0x46`
+*after* `ft_power_off()` (does the RPMh off vote really land?).
+
+### 0147 warm no-replay: re-arm works, but the AFE stays silent (2026-11-17)
+
+**Run.** `touch-0147-noreplay` with kernel `e16c5dc0...` (0147), warm from TWRP,
+`cepheustouchdelay=20 cepheustouchlog=1 cepheustouchpanel=0 cepheustouchpanelpor=0`.
+The user reports SpringBoard booted and that they touched the lit screen and pressed
+power twice. Logs: `logs/runs/touch-0147-noreplay/`.
+
+**Timeline.** rails 30.251, sense-on 30.967, `43 05 01` 30.969; ghost burst
+34.226-34.348 (10 contacts, IDs 0-9, right/top edges); `43 05 30` 34.593 and 34.806;
+`force cal; re-arm 1 after 600 ms` 35.193; `re-arm 1 off=0 on=0` 35.245; `43 05 01`
+35.255; display on 55.068 with the 0141 reset (`display reinit err=0` 55.331, `43 05 01`
+55.339); power-key wake 71.273 (`43 05 01` 71.546); auto-lock wake 103.213 (`43 05 01`
+103.486). Every `alive` line reports `irq=1` (none asserted). **There is not one
+`SWEET FTS: enter`, `motion`, or `leave` in the whole run**, although the display was
+lit and SpringBoard was running while the user touched it.
+
+**Reading.** `43 05 01` is a status response to the scan command, not proof of a sensing
+AFE; the 0147 re-arm only removes the *second* force cal. A hardware reset + sense-on at
+55 s and 71 s did not revive the AFE either, so this is not a one-shot FIFO stall that a
+reset clears. The 5 ms-polled, RAM-logged shim `fts-softrec90` run showed the same silence
+after its 3.08 s burst, so the serial-logging stall is not required to reproduce it.
+
+**Tested since.** The panel-emission hypothesis in the older version of this section was
+tested and rejected (`fts-bldim60`, above); LineageOS and the real `st/fts.c` 4.2.14 driver
+were checked as well. See the newer section at the top.
+
 ### Panel POR cannot fix the warm ghost; AFE matches TWRP; soft re-arm test (2026-11-17)
 
 **TWRP source + live DT re-check.** Cloned TeamWin's `android_device_xiaomi_cepheus`
@@ -72,10 +152,22 @@ remains as the fallback when the re-arm is disabled or its budget is spent.  The
 applies cleanly after 0146 (checked with `git apply --check` against a reconstructed
 post-0146 tree).
 
-**Next:** the user builds a kernel with 0147 and tests warm.  Expected: the ~3.3 s ghost
-burst still happens once, then `SWEET FTS: force cal; re-arm 1 after 600 ms` and
-`re-arm 1 off=0 on=0` at ~4.5 s, followed by working touch.  If phantom touches from the
-first burst are a problem, add a HID quarantine until the first re-arm completes.
+**First warm 0147 run (`touch-0147-warm`, kernel `e16c5dc0...`; default panel replay).**
+The re-arm works exactly as in the shim: sense-on 31.204, ghost burst 34.824-34.926
+(six contacts), `43 05 30` 35.502, `force cal; re-arm 1 after 600 ms` 36.097,
+`re-arm 1 off=0 on=0` 36.149, then `43 01 a0 00` + `43 05 01` at 36.158.  No second burst
+and no second force-cal afterwards.  The display-on reset at 54.734 re-sensed cleanly
+(`43 05 01` 55.331) and the power-key wake at 71.615 did too (`43 05 01` 71.692).  The
+screen went black at the display-on SET_ON replay (54.936-55.207), the known 0144/0145
+defect; the user pressed power twice (display off 71.310 / on 71.615) but the panel stayed
+dark.  **SpringBoard was nevertheless alive**: SMP SpringBoard samples at 99.762,
+`SWEET AKS: SpringBoard` calls and 60 fps / 3000 framebuffer swaps through 135 s, so the
+"SpringBoard did not boot" impression came from the unlit panel.  Log:
+`logs/runs/touch-0147-warm/`.
+
+**Next:** the no-replay warm run above answered this: the re-arm works but real touch
+still does not.  If the first ghost burst injects phantom taps, add a HID quarantine
+until the first re-arm completes.
 
 ### 0145/0146: skip the replay for a stable display; warm FTS calibration still fails (2026-11-16)
 
