@@ -288,6 +288,39 @@ Of the ~81 original ios-sweet kernel patches:
   auto-calibration ~3 s after sense-on and reports `43 05 30`. A minimal init (single
   reset, sysinfo, one `a0 00 01`, every optional step off) reproduces the same ghost, so
   the warm failure is in the chip's first calibration, not in the probe or rail cycle.
+- 2026-11-17 hardware re-check (TWRP source + live DT): panel supplies are `vddio`
+  (PM8150 L14) and `vcie` (`disp_vci_vreg`, east TLMM GPIO 21); the DT's `vci-supply`
+  (PM8150L L13) is not used by the ea8076 panel entries. `touch_vddio_vreg` (north
+  GPIO 84) is the FTS VDDIO load switch. TWRP power-on is vddio -> 10 ms -> vcie ->
+  reset low 1 ms/high 10 ms; power-off is the exact reverse. PM8150L L1 SPMI readback
+  proves the RPMh vote enables AVDD (`46=0 41=7 45=2` -> `46=80 41=7 45=2`).
+- 2026-11-17 TWRP FTS probe/blank sequence (source + dmesg): probe reset, sense-on,
+  sense-off, 50 ms `WAIT_AFTER_SENSEOFF`, sense-on; DRM blank senses off; panel SET_ON
+  system-resets and senses on again. Only `43 05 01`, never `43 05 30`. TWRP's AFE
+  readback (CFG/CX/PANEL `03/03/03`, config `0037`, fw `0060`) matches the shim exactly,
+  so config/firmware mismatch is ruled out.
+- 2026-11-17 shim panel-POR controls (all warm, logs under `logs/runs/`): a true
+  L14+VCIE POR with full 34-command SET_ON before a quiet drain still ghosts
+  (`fts-panelpor`); continuous polling is stochastic, the clean `fts-panelpor-poll` run
+  did not repeat (`fts-panelpor-poll2` ghosted twice); 25 s panel-on age + fast polling
+  ghosts (`fts-age25`); 6 ms per logged event ghosts (`fts-evdelay6`); and a **second
+  full POR immediately before FTS power-up** still ghosts (`fts-age25-repor`). Every POR
+  reports 34 cmds/0 errors/pos 458/458, backlight `0x7ff`, TE 6 edges. So a panel POR
+  does not clear the warm ghost, panel freshness at sense-on is not the differentiator,
+  and the failure is stochastic.
+- 2026-11-17 shim flags: `SHIM_FTS_PREDELAY_MS` (panel-on age), `SHIM_FTS_EVDELAY_MS`
+  (per-event delay), `SHIM_FTS_REPOR` (second POR after the age delay),
+  `SHIM_FTS_SOFT_RECOVER` (after the first `43 05 30`, wait 600 ms, sense-off/50 ms/
+  sense-on).
+- 2026-11-17 soft re-arm works: with `SHIM_FTS_SOFT_RECOVER` the chip re-armed after the
+  force-cal (`43 05 30` -> water mode -> sense off/on -> `43 05 01`) and stayed sensing
+  for 7.6 s with no second burst (`fts-softrec`, `fts-softrec12`). A panel/rail cycle is
+  not needed. `FT_POLL_MS` is now overridable at compile time for longer windows.
+- 0147 touch: re-arm the scan instead of power-cycling when the controller reports
+  `43 05 30/31` or water-mode enter within 10 s of sense-on (at most 4 times), waiting
+  `cepheustouchrearmms` (default 600) first. `cepheustouchrearm=0` disables it; the 0137
+  power-cycle recovery remains the fallback. This is the first warm-boot recovery that
+  returns the chip to an armed state without a panel/rail cycle; needs a warm XNU test.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)

@@ -20,13 +20,32 @@
  * before the final scan: on, off, 50 ms, on, 350 ms, off, 250 ms, reset,
  * ready, on.  XNU's 0140/0142 cycles only reproduced the first toggle; the
  * third start, after TWRP's DRM blank and panel SET_ON, is still untested.
+ *
+ * -DSHIM_FTS_TWRP_POWER powers the rails in TWRP's order instead: the driver
+ * maps fts,pwr-reg-name="avdd" to L1 and fts,bus-reg-name="vdd" to the GPIO 84
+ * fixed regulator, so Linux enables the analogue rail first, then the bus rail
+ * (with its 4 ms startup delay), and drives reset only afterwards.  XNU and
+ * the default shim do the opposite and hold reset low through the ramp.
+ *
+ * -DSHIM_FTS_PANELPWR (with SHIM_FTS_TEST) puts the panel through TWRP's real
+ * blank/unblank first: dmesg 1.579-1.851 shows the DRM blank dropping the two
+ * panel rails (PM8150 L14 vddio and the disp_vci_vreg switch on GPIO 21, per
+ * dsi_amoled_panel_pwr_external_supply), then the unblank replaying SET_ON and
+ * resetting the controller before the final sense-on.  TWRP's first scan sees
+ * the same calibration events as ours, but the scan after the panel power
+ * cycle is clean, so the DDIC analog state is what poisons the first
+ * calibration.  Built with SHIM_PANEL_INIT/SHIM_PANEL_CYCLE, this calls
+ * panel_reinit() here instead of at shim entry: real DDIC POR, SET_ON replay,
+ * then the FTS power-up and TWRP sequence.
  */
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "ftstest.h"
 #include "log.h"
+#include "panel.h"
 #include "rpmh.h"
+#include "spmi.h"
 #include "util.h"
 
 #define FT_TLMM_SOUTH_PA 0x03d00000u	/* SDA 55 / SCL 56 / IRQ 122 */
@@ -52,7 +71,46 @@
 #define FT_LOW_US	2u
 #define FT_HIGH_US	3u
 
+#ifndef FT_POLL_MS
 #define FT_POLL_MS	6000u		/* how long to watch the first scan */
+#endif
+
+/*
+ * Panel-age test: after panel_reinit() the DDIC is freshly powered, while
+ * under XNU the panel has been driven for ~30 s before the FTS test starts.
+ * Wait this long with the panel lit before powering the touch chip, to see
+ * whether DDIC state (not bus backpressure) is what poisons the calibration.
+ */
+#ifndef SHIM_FTS_PREDELAY_MS
+#define SHIM_FTS_PREDELAY_MS 0
+#endif
+
+/* Repeat the panel POR after the age delay, i.e. right before FTS power-up. */
+#ifndef SHIM_FTS_REPOR
+#define SHIM_FTS_REPOR 0
+#endif
+
+/*
+ * Force-cal recovery test: after the chip reports EVT_TYPE_STATUS_FORCE_CAL
+ * with MS invalid (43 05 30) it stops reporting touches.  Wait for the
+ * water-mode pair to finish, then send sense-off/on again and see whether
+ * the chip re-emits its negative-detect status (43 05 01), i.e. whether the
+ * driver can re-arm it without a panel or rail cycle.
+ */
+#ifndef SHIM_FTS_SOFT_RECOVER
+#define SHIM_FTS_SOFT_RECOVER 0
+#endif
+
+/*
+ * FIFO backpressure test: XNU prints every event synchronously to the serial
+ * console (~6 ms per line at 115200 baud) while the shim logs to a RAM ring.
+ * Delay this long after each logged event to model that stall.  If the chip
+ * force-cals only when events are not drained promptly, this reproduces the
+ * warm-boot 43 05 30 without any panel change.
+ */
+#ifndef SHIM_FTS_EVDELAY_MS
+#define SHIM_FTS_EVDELAY_MS 0
+#endif
 
 /*
  * Optional wait before the rails are touched, with the panel left as ABL
@@ -485,6 +543,18 @@ ft_panel_off(unsigned ms)
 }
 #endif
 
+static void
+ft_l1_log(const char *tag)
+{
+	uint8_t en = 0, set = 0, mode = 0;
+	int re = spmi_read(5, 0x4046, &en);
+	int rs = spmi_read(5, 0x4041, &set);
+	int rm = spmi_read(5, 0x4045, &mode);
+
+	log_printf("fts test: %s pm8150l l1 46=%x%s 41=%x%s 45=%x%s\n", tag,
+	    en, re ? "!" : "", set, rs ? "!" : "", mode, rm ? "!" : "");
+}
+
 void
 fts_test(void)
 {
@@ -493,6 +563,8 @@ fts_test(void)
 	uint8_t sense_on[3] = { 0xa0u, 0x00u, 0x01u };
 	uint8_t sense_off[3] = { 0xa0u, 0x00u, 0x00u };
 	uint8_t sysinfo[3] = { 0xa6u, 0x00u, 0x00u };
+
+	ft_l1_log("entry");
 
 #if SHIM_FTS_PANELOFF_MS > 0
 	ft_panel_off(SHIM_FTS_PANELOFF_MS);
@@ -503,6 +575,37 @@ fts_test(void)
 	delay_ms(SHIM_FTS_DWELL_MS);
 #endif
 
+#ifdef SHIM_FTS_PANELPWR
+	/* TWRP's blank/unblank: real DDIC POR (L14 + VCIE), SET_ON, reset. */
+	log_printf("fts test: panel por before FTS power-up\n");
+	panel_reinit();
+#endif
+
+#if SHIM_FTS_PREDELAY_MS > 0
+	log_printf("fts test: panel-age delay %u ms, panel on\n",
+	    SHIM_FTS_PREDELAY_MS);
+	delay_ms(SHIM_FTS_PREDELAY_MS);
+#endif
+
+#if SHIM_FTS_REPOR
+	log_printf("fts test: panel por again before FTS power-up\n");
+	panel_reinit();
+#endif
+
+#ifdef SHIM_FTS_TWRP_POWER
+	/*
+	 * TWRP/Linux power order: fts_enable_reg() enables info->vdd_reg
+	 * (DT "avdd" = PM8150L L1) first, then info->avdd_reg (DT "vdd" =
+	 * disp_vddio_vreg on GPIO 84, startup-delay-us 4000).  fts_set_gpio()
+	 * then requests reset as an output low.  ABL leaves GPIO 12 as an
+	 * input, so it floats through the rail ramp exactly as in Linux.
+	 */
+	int verr = shim_rpmh_vreg("ldoc1", 1800, 1);
+	delay_ms(1);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
+	delay_ms(4);
+	log_printf("fts test: rails twrp order ldoc1 err=%d vddio=1\n", verr);
+#else
 	/* Reset first, then VDDIO (bus), then AVDD, as in the driver. */
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
@@ -510,6 +613,16 @@ fts_test(void)
 	int verr = shim_rpmh_vreg("ldoc1", 1800, 1);
 	delay_ms(200);
 	log_printf("fts test: rails vddio=1 ldoc1 err=%d\n", verr);
+#endif
+
+#ifdef SHIM_FTS_TWRP_POWER
+	/* TWRP's fts_set_gpio drives reset immediately after the rails. */
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	delay_ms(10);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+	delay_ms(50);
+	ft_l1_log("powered");
+#endif
 
 	/* SDA/SCL open-drain inputs with pull-up; IRQ input. */
 	ft_gpio(FT_TLMM_SOUTH_PA, FT_PIN_SDA, 0, 3, 0, false, false);
@@ -521,11 +634,13 @@ fts_test(void)
 		return;
 	}
 
+#ifndef SHIM_FTS_TWRP_POWER
 	/* Reset low 10 ms, high 50 ms, then wait for ready. */
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
 	delay_ms(10);
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
 	delay_ms(50);
+#endif
 	int rerr = ft_wait_ready(500);
 	log_printf("fts test: ready err=%d idle sda=%u scl=%u\n", rerr,
 	    ft_sda_read(), ft_scl_read());
@@ -537,6 +652,9 @@ fts_test(void)
 	int serr = ft_i2c_read(sysinfo, sizeof(sysinfo), si, sizeof(si));
 	log_printf("fts test: sysinfo err=%d %x %x %x %x %x %x %x %x\n", serr,
 	    si[0], si[1], si[2], si[3], si[4], si[5], si[6], si[7]);
+	log_printf("fts test: sysinfo afe cfg=%x cx=%x panel=%x cfgVer=%x cxVer=%x fw=%x\n",
+	    si[28], si[29], si[30], si[22] | (si[23] << 8),
+	    si[26] | (si[27] << 8), si[16] | (si[17] << 8));
 
 #ifdef SHIM_FTS_TWRPSEQ
 	/*
@@ -581,6 +699,10 @@ fts_test(void)
 	log_printf("fts test: sense on err=%d\n", err);
 
 	unsigned logged = 0;
+#if SHIM_FTS_SOFT_RECOVER
+	unsigned recover_at = 0;
+	int recover_armed = 0, recover_done = 0;
+#endif
 	uint64_t t0 = ticks_now();
 	uint64_t hz = rsr("cntfrq_el0");
 	for (;;) {
@@ -593,8 +715,38 @@ fts_test(void)
 				log_printf("fts test: ev t=%u ", (unsigned)dt);
 				ft_log_ev("", ev);
 				++logged;
+#if SHIM_FTS_EVDELAY_MS > 0
+				delay_ms(SHIM_FTS_EVDELAY_MS);
+#endif
 			}
+#if SHIM_FTS_SOFT_RECOVER
+			/* Arm once on the first force-cal/MS-invalid status. */
+			if (!recover_armed && ev[0] == 0x43u && ev[1] == 0x05u &&
+			    ev[2] == 0x30u) {
+				recover_armed = 1;
+				recover_at = (unsigned)dt + 600u;
+				log_printf("fts test: soft recover armed t=%u\n",
+				    (unsigned)dt);
+			}
+#endif
 		}
+#if SHIM_FTS_SOFT_RECOVER
+		/*
+		 * Let the water-mode pair (43 06 01/00) play out, then try to
+		 * re-arm the chip from software: sense off, 50 ms, sense on.
+		 * A 43 05 01 after this means the controller is sensing again.
+		 */
+		if (recover_armed && !recover_done && (unsigned)dt >= recover_at) {
+			int r;
+
+			recover_done = 1;
+			r = ft_write_buf(sense_off, sizeof(sense_off));
+			log_printf("fts test: soft recover sense off err=%d\n", r);
+			delay_ms(50);
+			r = ft_write_buf(sense_on, sizeof(sense_on));
+			log_printf("fts test: soft recover sense on err=%d\n", r);
+		}
+#endif
 		delay_ms(5);
 	}
 	log_printf("fts test: done, %u events, %u ms\n", logged, FT_POLL_MS);

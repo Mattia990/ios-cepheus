@@ -5,6 +5,78 @@ Last updated **2026-11-17** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Panel POR cannot fix the warm ghost; AFE matches TWRP; soft re-arm test (2026-11-17)
+
+**TWRP source + live DT re-check.** Cloned TeamWin's `android_device_xiaomi_cepheus`
+and `LasagnaTeam/TWRP_Kernel_Cepheus` (`twrp-9.0`) into `work/twrp-src/`.  The panel
+supplies are `vddio` (PM8150 L14) and `vcie` (`disp_vci_vreg`, east TLMM GPIO 21); the
+DT's `vci-supply` (L13) is not used by any ea8076 panel entry.  TWRP's
+`dsi_panel_power_on`: vddio -> 10 ms -> vcie -> reset low 1 ms/high 10 ms; power-off is
+the exact reverse with 10 ms pre/post sleeps.  `touch_vddio_vreg` (north GPIO 84) is the
+FTS VDDIO load switch, not panel VDDIO.
+
+**TWRP's FTS probe/blank sequence** (source + dmesg): probe resets, sense-on `A0 00 01`
+(1.2216 s), sense-off `A0 00 00`, 50 ms (`WAIT_AFTER_SENSEOFF`), sense-on (1.272 s); DRM
+blank senses off (1.579 s); panel SET_ON system-resets at 1.828-1.850 s and the final
+sense-on is at 1.850 s.  Only `43 05 01` appears; no `43 05 30`.  FOD blank sends gesture
+`A2 03 20 00 00 01`, low-power `A0 01`, `C0 02 ...`; unblank resets and senses on.
+
+**AFE and rails match.**  New shim readback: `si[28..30] = cfg/cx/panel = 3/3/3`,
+`si[22..23] = 0x3e`, `si[26..27] = 0x3e`, `si[16..17] = 0x60`; TWRP reports
+`AFE VER: CFG = 03 - CX = 03 - PANEL = 03`, config `0037`, fw `0060`.  Firmware/config
+mismatch is ruled out.  PM8150L L1 SPMI readback (`ft_l1_log`): entry `46=0 41=7 45=2`,
+after the TWRP-order vote `46=80 41=7 45=2`, proving the RPMh vote enables AVDD.
+
+**Shim panel-POR series** (all warm, same phone boot cycle; logs under `logs/runs/`):
+
+- `fts-panelpor.img` (`6a33e04c...`): true L14+VCIE POR + full 34-command SET_ON
+  (34/34, 0 errors, pos 458/458, backlight `0x7ff`), TWRP rail order, quiet drain.
+  Ghost at 6028/6031 ms.  Log: `fts-panelpor/`.
+- `fts-panelpor-poll.img` (`65c9ecec...`): same but continuous polling.  **First run
+  clean (no `43 05 30`), then the same image ghosted on two repeats.**  The clean run is
+  a fluke, not a fix.  Logs: `fts-panelpor-poll/`, `fts-panelpor-poll2/`.
+- `fts-age25.img` (`adc68720...`): POR, then 25 s of panel-on age, fast polling.
+  Ghost at 3677/3878.  Log: `fts-age25/`.
+- `fts-evdelay6.img` (`617da611...`): POR, 6 ms delay per logged event (models XNU's
+  synchronous serial printf) -> ghost at 3476/3695.  Log: `fts-evdelay6/`.
+- `fts-age25-repor.img` (`7dd4ba7d...`): 25 s age, then a **second full POR immediately
+  before FTS power-up** -> still ghost at 3608/3821.  Log: `fts-age25-repor/`.
+
+Every POR reports `init 34 cmds, 0 errors, pos 458/458`, backlight `0x7ff`, `te after
+init 6 edges`, so the panel itself is healthy each time.  **Conclusions:** a panel POR
+before sense-on does not clear the warm ghost; panel age at sense-on is not the
+differentiator (the second POR rules it out); the 6 ms/event stdin stall alone also
+ghosts.  The defect tracks the warm FTS start itself, and the outcome is stochastic
+(identical images clean/ghost across runs).
+
+**New shim flags.** `SHIM_FTS_PREDELAY_MS` (panel-on age), `SHIM_FTS_EVDELAY_MS`
+(per-event delay), `SHIM_FTS_REPOR` (second POR after the age delay),
+`SHIM_FTS_SOFT_RECOVER` (recover in software after the force-cal).
+
+**Soft re-arm works (`fts-softrec.img`, `bf517818...`; `fts-softrec12.img`,
+`0929e62c...`).**  On the first `43 05 30`, the shim waits 600 ms, sends sense-off
+`A0 00 00`, waits 50 ms and senses on `A0 00 01` again.  In both runs the chip came back:
+`43 05 30` at 3958 / 3690 -> (water pair in the 12 s run: `43 06 01` 3797, second
+`43 05 30` 3923, `43 06 00` 3992) -> sense off/on -> `43 1 a0 00` + **`43 05 01`** at
+4350-4363, then **no further events for the remaining 7.6 s** (baseline bursts recur at
+~3.3 s).  Logs: `logs/runs/fts-softrec/`, `logs/runs/fts-softrec12/`.  This is the first
+recovery that returns the controller to an armed, sensing state without a panel or rail
+cycle.
+
+**`xnu/patches/0147-cepheus-fts-force-cal-rearm.patch`** ports that to the FTS thread:
+on `43 05 30/31` or water-mode enter within 10 s of sense-on and at most 4 times, arm a
+`rearm_at = now + cepheustouchrearmms` (default 600 ms) deadline; the poll loop keeps
+draining events until the deadline, then sends sense-off/50 ms/sense-on and refreshes
+`sense_time`.  `cepheustouchrearm=0` disables it; the existing 0137 power-cycle recovery
+remains as the fallback when the re-arm is disabled or its budget is spent.  The patch
+applies cleanly after 0146 (checked with `git apply --check` against a reconstructed
+post-0146 tree).
+
+**Next:** the user builds a kernel with 0147 and tests warm.  Expected: the ~3.3 s ghost
+burst still happens once, then `SWEET FTS: force cal; re-arm 1 after 600 ms` and
+`re-arm 1 off=0 on=0` at ~4.5 s, followed by working touch.  If phantom touches from the
+first burst are a problem, add a HID quarantine until the first re-arm completes.
+
 ### 0145/0146: skip the replay for a stable display; warm FTS calibration still fails (2026-11-16)
 
 **Warm runs of the 0144 kernel** (`e94f1b6f...`, built from `892a586`):

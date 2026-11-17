@@ -628,7 +628,9 @@ void shim_main(uintptr_t dtb)
 	save_log("panel reset held");
 #endif
 #ifdef SHIM_PANEL_INIT
+#ifndef SHIM_FTS_PANELPWR
 	panel_reinit();
+#endif
 	sde_restart();
 	sde_sample("after panel", 8, 20);
 	save_log("panel reinit");

@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -41,8 +41,11 @@
+  * rail cycle, cepheustouchvddio=0 keep the shared panel VDDIO (north GPIO
+  * 84) up and cycle only the touch AVDD + reset,
+  * cepheustouchvideo=1 stop the DSI video engine while that replay runs
+- * and restore it after, and
+- * cepheustouchrecover=0 disable the early force-cal recovery.
++ * and restore it after,
++ * cepheustouchrearm=0 keep the chip silent after a warm-boot force-cal
++ * instead of re-arming the scan, cepheustouchrearmms=N wait N ms first
++ * (default 600), and
++ * cepheustouchrecover=0 disable the early force-cal power-cycle recovery.
+  * Enabled by default after the reset fix was verified on hardware; pass
+  * cepheustouch=0 to disable.
+  */
+@@ -157,10 +160,12 @@
+ 	bool started, dead;
+ 	bool recover, recover_enable;
+ 	bool panel_por, panel_ready, cycle_vddio;
++	bool rearm, rearm_enable;
+ 	int log;
+ 	unsigned sda, scl;
+ 	unsigned recoveries, off_ms, sense_ms, cycle_reset;
+-	uint64_t sense_time;
++	unsigned rearms, rearm_ms;
++	uint64_t sense_time, rearm_at;
+ 	uint32_t active;
+ 	int x[FTS_MAX], y[FTS_MAX];
+ } ft;
+@@ -1332,10 +1337,25 @@
+ 	case FTS_EVT_STATUS:
+ 		/*
+ 		 * Early force-calibration failure or water mode means the chip
+-		 * came up with a bad baseline (warm reboot). Recover while the
+-		 * scan is still new; no real touch is possible this early.
++		 * came up with a bad baseline (warm reboot). Rail and panel
++		 * cycles do not clear it; re-arming the scan does: the shim
++		 * saw 43 05 30 -> water mode -> sense off/50 ms/on -> 43 05 01
++		 * and no further burst. Fall back to the power cycle when the
++		 * re-arm is disabled or its budget is spent.
+ 		 */
+-		if (ft.recover_enable && ft.recoveries < 2u &&
++		if (ft.rearm_enable && ft.rearms < 4u &&
++		    mach_absolute_time() - ft.sense_time <
++		    10ull * 1000ull * 1000ull * FTS_TICKS_PER_US) {
++			if (!ft.rearm &&
++			    ((ev[1] == 0x05u &&
++			    (ev[2] == 0x30u || ev[2] == 0x31u)) ||
++			    (ev[1] == 0x06u && ev[2] == 0x01u))) {
++				ft.rearm = true;
++				ft.rearm_at = mach_absolute_time() +
++				    (uint64_t)ft.rearm_ms *
++				    1000ull * FTS_TICKS_PER_US;
++			}
++		} else if (ft.recover_enable && ft.recoveries < 2u &&
+ 		    mach_absolute_time() - ft.sense_time <
+ 		    5ull * 1000ull * 1000ull * FTS_TICKS_PER_US) {
+ 			if (ev[1] == 0x05u &&
+@@ -1490,6 +1510,16 @@
+ 	    sizeof(cycle_reset));
+ 	ft.cycle_reset = cycle_reset != 0;
+ 	ft.recover_enable = recover_enable != 0;
++	unsigned rearm_enable = 1, rearm_ms = 600;
++	(void)PE_parse_boot_argn("cepheustouchrearm", &rearm_enable,
++	    sizeof(rearm_enable));
++	(void)PE_parse_boot_argn("cepheustouchrearmms", &rearm_ms,
++	    sizeof(rearm_ms));
++	ft.rearm_enable = rearm_enable != 0;
++	if (rearm_ms > 5000u) {
++		rearm_ms = 5000u;
++	}
++	ft.rearm_ms = rearm_ms;
+ 	if (extra_resets > 5u) {
+ 		extra_resets = 5u;
+ 	}
+@@ -1618,6 +1648,22 @@
+ 			}
+ 			if (!any) {
+ 				break;
++			}
++		}
++		if (ft.rearm && !ft.dead &&
++		    mach_absolute_time() >= ft.rearm_at) {
++			ft.rearm = false;
++			ft.rearms++;
++			printf("SWEET FTS: force cal; re-arm %u after %u ms\n",
++			    ft.rearms, ft.rearm_ms);
++			fts_release_all();
++			int oerr = fts_sense_set(0);
++			fts_wait(50);
++			int serr = fts_sense_on();
++			printf("SWEET FTS: re-arm %u off=%d on=%d\n",
++			    ft.rearms, oerr, serr);
++			if (!serr) {
++				ft.sense_time = mach_absolute_time();
+ 			}
+ 		}
+ 		if (ft.recover && !ft.dead) {
