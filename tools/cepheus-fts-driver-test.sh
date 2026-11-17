@@ -32,7 +32,7 @@ frame() { # frame NAME TYPE
 }
 says() { adb shell cat /proc/fts/driver_test > "$out/$1.txt" 2>&1 || true; }
 
-adb wait-for-device
+adb get-state > /dev/null || { echo "no adb device (TWRP + adb needed)" >&2; exit 1; }
 adb shell 'test -e /proc/fts/driver_test' || {
 	echo "/proc/fts/driver_test missing: is this the TWRP FTS 5.2.4 kernel?" >&2
 	exit 1
@@ -57,7 +57,15 @@ dt "14"
 sleep 1
 dt "12"
 dt "01 A0 00 01"
+# fts_chip_powercycle() masks the AP IRQ (fts_disableInterruptNoSync) and
+# never restores it; the ESD path enables it last, after reset + sense-on.
+dt "17 01"
+# getevent buffers its stdout when adb has a pipe, and timeout would kill the
+# buffer unflushed.  -c 1 makes every event its own flushed, timestamped line.
+( adb shell 'end=$(( $(date +%s) + 8 )); while [ $(date +%s) -lt $end ]; do timeout 1 getevent -lt -c 1 /dev/input/event4; done' > "$out/events-during.txt" 2>&1 ) &
+evpid=$!
 sleep 8
+wait $evpid 2>/dev/null || true
 adb shell dmesg > "$out/dmesg-cycle.txt" 2>&1 || true
 frame raw 00
 frame strength 02

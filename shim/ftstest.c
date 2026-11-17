@@ -18,8 +18,10 @@
  *
  * -DSHIM_FTS_TWRPSEQ (with SHIM_FTS_TEST) replays TWRP's whole boot order
  * before the final scan: on, off, 50 ms, on, 350 ms, off, 250 ms, reset,
- * ready, on.  XNU's 0140/0142 cycles only reproduced the first toggle; the
- * third start, after TWRP's DRM blank and panel SET_ON, is still untested.
+ * ready, on.  XNU's 0140/0142 cycles only reproduced the first toggle; with
+ * SHIM_FTS_TWRPSEQ_PANEL the 250 ms gap contains TWRP's real DRM blank and
+ * unblank (panel VCI/vddio drop, SET_ON replay), which is the one part of
+ * its order the plain replay did not have.
  *
  * -DSHIM_FTS_TWRP_POWER powers the rails in TWRP's order instead: the driver
  * maps fts,pwr-reg-name="avdd" to L1 and fts,bus-reg-name="vdd" to the GPIO 84
@@ -735,6 +737,15 @@ fts_test(void)
 	terr = ft_write_buf(sense_off, sizeof(sense_off));
 	log_printf("fts test: twrp seq off2 err=%d\n", terr);
 	delay_ms(250);
+#ifdef SHIM_FTS_TWRPSEQ_PANEL
+	/*
+	 * TWRP's DRM blank (sense-off above) then a 249 ms gap, then the
+	 * unblank: panel rails drop/return and SET_ON runs.  The controller
+	 * reset that follows is TWRP's SET_ON final system reset.
+	 */
+	log_printf("fts test: twrp seq panel reinit\n");
+	panel_reinit();
+#endif
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
 	delay_ms(10);
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);

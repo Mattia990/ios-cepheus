@@ -5,7 +5,7 @@ Last updated **2026-11-17** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Panel emission exonerated; next test runs TWRP's own driver (2026-11-17)
+### Panel emission exonerated; TWRP driver_test and mid-scan panel cycle (2026-11-17)
 
 **Panel emission is not the trigger.** `fts-bldim60.img` (`2ab67032...`), warm: the shim
 brings the panel up fully (VCI, SET_ON, backlight `0x7ff`), sends DCS `0x51 = 0` *before*
@@ -41,30 +41,40 @@ power-off is still the only thing that clears it, yet `twrp-after-xnu` shows tou
 again in TWRP after a failed XNU run. So the remaining difference is not the FTS command
 list, the rails, the panel, or AP-visible entry state.
 
-**Next experiment (no rebuild needed).** From warm TWRP (touch working), drive the 5.2.4
-driver through `/proc/fts/driver_test` with `tools/cepheus-fts-driver-test.sh`:
+**TWRP's own driver cycles cleanly.** `tools/cepheus-fts-driver-test.sh` drove TWRP
+3.5.2's `/proc/fts/driver_test` with the screen awake:
 
-- `baseline OUT`: reads sysinfo and MS raw/filter/strength/baseline frames while touch
-  works (raw frame = 16x34x2 bytes via `FTS_CMD_FRAMEBUFFER_R`). `GETMSFRAME` stops the
-  scan, so the script sends `A0 00 01` again afterwards.
-- `cycle OUT`: `14` (`fts_chip_powercycle`: VDDIO off, AVDD off, reset low, VDDIO on, 1 ms,
-  AVDD on, 5/10 ms, reset high), `12` (`fts_system_reset`), `01 A0 00 01` (sense-on), then
-  an 8 s watch plus frames.
+- `baseline logs/runs/fts-dt-baseline`: sysinfo OK, MS raw/filter/strength/baseline read
+  (16x34 shorts, all four frames distinct; raw mean +283, strength -0.4, baseline -7.7).
+  `GETMSFRAME` stops the scan; the script re-arms `A0 00 01` afterwards.
+- `cycle logs/runs/fts-dt-cycle3`: `14` (power cycle, 20.4 ms: VDDIO off, AVDD off, reset
+  low, VDDIO on, 1 ms, AVDD on, 5/10 ms, reset high), `12` (system reset, 22 ms),
+  `01 A0 00 01`, then `17 01`. `43 05 01` arrived 1 ms later; no `43 05 30` and no contact
+  events in the 8 s watch; frames still read normally. A 15 s `getevent` capture of
+  `/dev/input/event4` then recorded a real swipe (207 `ABS_MT_POSITION_X` events), i.e. the
+  chip is fully functional after the driver's own power cycle.
 
-If `cycle` ghosts, the whole chip bring-up can be bisected inside one TWRP session, with
-TWRP's own IRQ handler logging the events. If it stays clean, the difference is in the boot
-environment rather than the command sequence, and the frame dumps show whether the *raw*
-mutual capacitance is wrong (electrical/physical) or only baseline/strength (firmware
-state). Two extra shim readbacks would close the remaining gaps: probe the chip on I2C
-*before* enabling VDDIO/AVDD (is something keeping it powered?), and read PM8150L L1 `0x46`
-*after* `ft_power_off()` (does the RPMh off vote really land?). Both are now implemented:
-`SHIM_FTS_PREPROBE=1` (build with
-`SHIM_CFLAGS="-DSHIM_FTS_TEST -DSHIM_FTS_PREPROBE ..."`) logs
-`preprobe recover=N ack=0/-2 sda= scl=` before the rails, and `ft_power_off()` always
-records `pm8150l l1 46=...` 10 ms after the off vote. The preprobe must NACK on a real
-cold entry; an ACK there would mean the chip never lost power between boots.
-Payload-less image built and ready: `work/boot/runs/fts-preprobe.img`
-(`d3b92977...`), warm-boot it from TWRP like the other `fts-probe` images.
+Two traps for the next run. Driver_test's `14` masks the AP IRQ (`fts_disableInterruptNoSync`)
+and never restores it; TWRP's ESD path enables it last, so the script sends `17 01` after
+sense-on. And TWRP's screen timeout blanked the panel after ~400 s idle, which put the
+driver in FOD/gesture mode ("Sense OFF by FOD") and invalidated the first `cycle` run; also
+`adb wait-for-device` hangs on TWRP's `recovery` transport, so the script uses `adb get-state`.
+
+**Reading.** This matches `twrp-after-xnu`: the command/rail/reset sequence does not ghost
+a chip that TWRP has already brought up. The one ordering element never replayed is TWRP's
+DRM blank: it senses on at 1.272 s, senses off and drops the panel rails at 1.579 s, the
+unblank replays SET_ON at 1.828 s, and only then resets and senses on again (1.850 s).
+Every shim replay put the panel power change *before* the FTS bring-up, or ran with the
+panel off for the whole scan.
+
+**Next test, `fts-midpanel.img` (`0e469cf1...`).** Payload-less shim built with
+`-DSHIM_FTS_TEST -DSHIM_FTS_TWRPSEQ -DSHIM_FTS_TWRPSEQ_PANEL -DSHIM_PANEL_INIT -DSHIM_PANEL_CYCLE`:
+on1, off1, 50 ms, on2, 350 ms, off2 (TWRP's blank), 250 ms, `panel_reinit()` (VCI/L14 drop
+and SET_ON), then the controller reset and final sense-on, 6 s poll. If it stays clean, the
+panel transition *during* the scan is the missing factor; if it still ghosts, the ordering
+is out too and the AP/PMIC environment is the remaining candidate. `work/boot/runs/fts-preprobe.img`
+(`d3b92977...`, `-DSHIM_FTS_PREPROBE`) answers the related question of whether the chip is
+even unpowered at a warm entry: its address probe runs before VDDIO/AVDD are enabled.
 
 ### 0147 warm no-replay: re-arm works, but the AFE stays silent (2026-11-17)
 

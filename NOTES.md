@@ -342,10 +342,20 @@ Of the ~81 original ios-sweet kernel patches:
   and 5.2.4 has no noise-parameter write, so there is nothing to port from there.
 - TWRP `/proc/fts/driver_test` (fts_proc.c): text mode is space-separated hex bytes.
   `01 A0 00 01` = raw write (sense on), `12` = system reset, `14` = `fts_chip_powercycle`,
-  `15 00` = read sysinfo, `23 <type>` = get MS frame (0 raw, 1 filter, 2 strength,
-  3 baseline; `GETMSFRAME` senses on, waits, senses *off*, flushes the FIFO and reads the
-  frame, so send `01 A0 00 01` afterwards). `tools/cepheus-fts-driver-test.sh
-  baseline|cycle OUTDIR` runs these from TWRP over adb and saves dmesg + frames.
+  `15 00` = read sysinfo, `17 01` = enable the AP IRQ (`14` masks it and never restores it;
+  TWRP's ESD path enables it after sense-on), `23 <type>` = get MS frame (0 raw, 1 filter,
+  2 strength, 3 baseline; `GETMSFRAME` senses on, waits, senses *off*, flushes the FIFO and
+  reads the frame, so send `01 A0 00 01` afterwards).
+  `tools/cepheus-fts-driver-test.sh baseline|cycle OUTDIR` runs these from TWRP over adb
+  and saves dmesg, frames and an 8 s `/dev/input/event4` capture. Result: the driver's own
+  power cycle (20 ms), system reset and sense-on produced `43 05 01` with no `43 05 30`
+  and real touch afterwards, and the frames read normally. `adb wait-for-device` hangs on
+  TWRP's `recovery` transport; use `adb get-state`.
+- 2026-11-17 shim flag: `SHIM_FTS_TWRPSEQ_PANEL` (with `SHIM_FTS_TWRPSEQ` and
+  `SHIM_PANEL_INIT/SHIM_PANEL_CYCLE`) inserts TWRP's DRM blank/unblank between the
+  twrpseq off2 and the controller reset: 250 ms, then `panel_reinit()` (VCI/L14 drop,
+  SET_ON), then reset and sense-on. Every earlier shim test did the panel power change
+  before the FTS bring-up instead.
 
 - ... (one line per patch, filled in as they are created)
 
