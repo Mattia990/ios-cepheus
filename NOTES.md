@@ -311,7 +311,9 @@ Of the ~81 original ios-sweet kernel patches:
 - 2026-11-17 shim flags: `SHIM_FTS_PREDELAY_MS` (panel-on age), `SHIM_FTS_EVDELAY_MS`
   (per-event delay), `SHIM_FTS_REPOR` (second POR after the age delay),
   `SHIM_FTS_SOFT_RECOVER` (after the first `43 05 30`, wait 600 ms, sense-off/50 ms/
-  sense-on).
+  sense-on), `SHIM_FTS_BLDIM_MS` + `SHIM_FTS_BLLEVEL` (DCS `0x51` level around the scan),
+  `SHIM_FTS_PREPROBE` (I2C address probe before the rails; expect a NACK if ABL really
+  left the chip unpowered). `ft_power_off()` now logs PM8150L L1 after the off vote.
 - 2026-11-17 soft re-arm works: with `SHIM_FTS_SOFT_RECOVER` the chip re-armed after the
   force-cal (`43 05 30` -> water mode -> sense off/on -> `43 05 01`) and stayed sensing
   for 7.6 s with no second burst (`fts-softrec`, `fts-softrec12`). A panel/rail cycle is

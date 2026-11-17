@@ -57,7 +57,14 @@ environment rather than the command sequence, and the frame dumps show whether t
 mutual capacitance is wrong (electrical/physical) or only baseline/strength (firmware
 state). Two extra shim readbacks would close the remaining gaps: probe the chip on I2C
 *before* enabling VDDIO/AVDD (is something keeping it powered?), and read PM8150L L1 `0x46`
-*after* `ft_power_off()` (does the RPMh off vote really land?).
+*after* `ft_power_off()` (does the RPMh off vote really land?). Both are now implemented:
+`SHIM_FTS_PREPROBE=1` (build with
+`SHIM_CFLAGS="-DSHIM_FTS_TEST -DSHIM_FTS_PREPROBE ..."`) logs
+`preprobe recover=N ack=0/-2 sda= scl=` before the rails, and `ft_power_off()` always
+records `pm8150l l1 46=...` 10 ms after the off vote. The preprobe must NACK on a real
+cold entry; an ACK there would mean the chip never lost power between boots.
+Payload-less image built and ready: `work/boot/runs/fts-preprobe.img`
+(`d3b92977...`), warm-boot it from TWRP like the other `fts-probe` images.
 
 ### 0147 warm no-replay: re-arm works, but the AFE stays silent (2026-11-17)
 

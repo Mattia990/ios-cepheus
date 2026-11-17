@@ -115,6 +115,17 @@
 #endif
 
 /*
+ * -DSHIM_FTS_PREPROBE probes the controller on I2C before the rails are
+ * enabled.  ABL should leave it unpowered (VDDIO GPIO 84 low, PM8150L L1
+ * disabled), so a NACK is expected; an ACK means something else keeps it
+ * alive, i.e. our "power cycle" never really removes power and the warm
+ * state can survive in the chip.
+ */
+#ifndef SHIM_FTS_PREPROBE
+#define SHIM_FTS_PREPROBE 0
+#endif
+
+/*
  * FIFO backpressure test: XNU prints every event synchronously to the serial
  * console (~6 ms per line at 115200 baud) while the shim logs to a RAM ring.
  * Delay this long after each logged event to model that stall.  If the chip
@@ -534,12 +545,17 @@ ft_quiet_scan(void)
 #endif
 
 /* Leave the rails as ABL did (both off, reset asserted). */
+static void ft_l1_log(const char *tag);
+
 static void
 ft_power_off(void)
 {
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
 	(void)shim_rpmh_vreg("ldoc1", 1800, 0);
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, false);
+	delay_ms(10);
+	/* Read back: is the off vote actually in the PMIC? */
+	ft_l1_log("off");
 }
 
 /* Drop panel VCI and hold the DDIC in reset; it stays off for the FTS test. */
@@ -567,6 +583,27 @@ ft_l1_log(const char *tag)
 	log_printf("fts test: %s pm8150l l1 46=%x%s 41=%x%s 45=%x%s\n", tag,
 	    en, re ? "!" : "", set, rs ? "!" : "", mode, rm ? "!" : "");
 }
+
+/*
+ * Poke the bus before any rail is enabled: ABL should leave the chip
+ * unpowered, so its address must NACK (ft_write_byte -2).  An ACK means the
+ * controller is still powered from the previous boot, i.e. a "power cycle"
+ * that only toggles GPIO 84/L1 would not really remove its power.
+ */
+#if SHIM_FTS_PREPROBE
+static void
+ft_preprobe(void)
+{
+	bool rec = ft_recover();
+	int ack = -1;
+	if (rec && ft_start()) {
+		ack = ft_write_byte((uint8_t)(FT_ADDR << 1));
+		(void)ft_stop();
+	}
+	log_printf("fts test: preprobe recover=%d ack=%d sda=%u scl=%u\n",
+	    rec, ack, ft_sda_read(), ft_scl_read());
+}
+#endif
 
 void
 fts_test(void)
@@ -608,6 +645,10 @@ fts_test(void)
 #if SHIM_FTS_BLDIM_MS > 0
 	/* Panel stays initialized and scanning, but emits nothing. */
 	panel_set_backlight(0);
+#endif
+
+#if SHIM_FTS_PREPROBE
+	ft_preprobe();
 #endif
 
 #ifdef SHIM_FTS_TWRP_POWER
