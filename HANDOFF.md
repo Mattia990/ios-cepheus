@@ -1,11 +1,11 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-16** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-17** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
 
-### 0145/0146: the SET_ON replay kills warm scanout; stop the DSI video engine around it (2026-11-16)
+### 0145/0146: skip the replay for a stable display; warm FTS calibration still fails (2026-11-16)
 
 **Warm runs of the 0144 kernel** (`e94f1b6f...`, built from `892a586`):
 
@@ -30,10 +30,11 @@ Last updated **2026-11-16** (newest work first under "Start here"). Read this fi
   (`sysinfo`, probe, sense-on all OK) but produced **zero touch events**: the AVDD-only
   cycle leaves the controller half-reset and silent.
 
-**Conclusions.** (1) The warm ghost/`43 05 30` correlates with dropping the shared panel
-VDDIO (north TLMM GPIO 84), not with the FTS AVDD state. (2) The 34-command DCS SET_ON
-replay itself kills XNU's live scanout even when the rails are untouched; nothing after
-it revives the panel. (3) An AVDD-only cycle is not enough to reset the FTS controller.
+**0145 conclusion was partly wrong.** `touch-0145-noreplay` used `vddio=0`, so north
+GPIO 84 (the shared VDDIO rail) stayed low from boot and the FTS was never properly
+powered. The clean "no ghost, no touch" result proved only that, not that AVDD alone
+causes the ghost. With `vddio=1`, the warm ghost returns with or without the cycle (0146
+runs below).
 
 **0146 patch.** `xnu/patches/0146-cepheus-fts-panel-video-toggle.patch` (after 0145) adds
 `cepheustouchvideo=1` (default 0, so existing behaviour is unchanged): before the replay
@@ -42,17 +43,66 @@ it saves `DSI_CTRL` (0xae94004) and writes `ctrl & ~7u` to stop the video engine
 `sweet_bl_reassert()` runs as before. Logs: `panel replay video off ctrl %x -> %x` and
 `panel replay video on ctrl %x -> %x`.
 
-**Next test.** Full touch rail cycle (`vddio=1`, `panelpor=0`) + video toggle, so the FTS
-chip gets a real reset while the panel is expected to survive the replay:
+**Warm runs of the 0146 kernel** (`042044ff...`, built from `181838b`; strings
+`panel replay video off/on` and `panel por=%u, vddio=%u` verified):
 
-`tools/cepheus-run.sh touch-0146-video -s 200 -a "cepheustouchlog=1 cepheustouchpanelpor=0 cepheustouchvideo=1"`
+- `touch-0146-video` (`por=0 video=1`): rails 30.25, display on 77.95, `DCS 0x51` 442,
+  replay 78.18-79.92 with `34 cmds, 33 sent, 33 errors`; `video off ctrl 1f5 -> 1f0`,
+  `video on ctrl 1f0 -> 1f5`. Clearing `DSI_CTRL & ~7u` also stops the command DMA, so
+  every replay command failed and the video engine never resumed: the panel froze on the
+  Apple logo while SpringBoard booted underneath (0 fps). A second replay at 272.6-274.5
+  failed the same way. **Unusable as implemented.**
+- `touch-0146-noreplay-full` (`por=0 panel=0`): full VDDIO+AVDD cycle at 30.2, display on
+  54.47, brightness 442 at 54.53; ghost at 34.14 (3 edge contacts), `43 05 30` at 34.44,
+  recovery power cycle 34.44-35.53, then silent. Power off/on 64.01/65.17 restored the
+  screen at 442 and a later wake at 144 s worked. **Full rail cycle with no replay keeps
+  display and wake stable.**
+- `touch-0146-nopwr` (`por=0 panel=0 pwr=0`): rails unchanged 29.68, display on 49.74,
+  brightness 442; ghost at 33.39 (10 contacts), `43 05 30` 33.63, recovery 33.63-34.72,
+  then silent. Power off/on 57.44/58.76 restored the screen. **The rail cycle is not the
+  ghost's cause.**
+- `touch-0146-late` (`delay=45 por=0 panel=0 pwr=0`): display on 49.71; FTS starts 54.69,
+  sense-on 55.43; ghost 58.55 (~3.1 s later), `43 05 30` 58.6, recovery 58.8-59.88; power
+  off/on 70.43/71.13 restored the screen. **Starting after display-on does not help.**
 
-Expected: rails 30 s with `vddio=1`; display on ~50 s; replay bracketed by
-`video off ctrl 1f5 -> 1f0` / `video on ctrl 1f0 -> 1f5`; screen must stay up through
-the replay and power off/on. Then swipe: the ghost may still appear (VDDIO drop) but the
-touch should finally report events. If the display still dies at the replay, stop the
-engine + `DSI_SOFT_RESET`/PHY re-init or replay before display-on instead. Logs:
-`logs/runs/touch-0146-*`.
+**Conclusions.** (1) The 34-command SET_ON replay is the only display killer: with
+`panel=0` the display, brightness and power-key wake survive a full FTS rail cycle. (2)
+`cepheustouchvideo=1` cannot be used: `DSI_CTRL & ~7u` disables command DMA too. (3) The
+warm ghost/`43 05 30` is intrinsic to the FTS warm start, not the rail cycle or start
+time: it appears ~3 s after sense-on in all three configurations. The recovery power
+cycle runs but the chip stays silent afterwards. (4) `touch_vddio_vreg` on GPIO 84 is the
+shared VDDIO rail; dropping it does not kill the panel (display on at 54.5 s after the
+cycle) and is not the ghost's cause.
+
+**`touch-0146-minimal` (2026-11-17).** Same kernel with every optional step off:
+`cepheustouchpanelpor=0 cepheustouchpanel=0 cepheustouchpwr=0 cepheustouchprobe=0
+cepheustouchreset2=0 cepheustouchsensecycle=0 cepheustouchdisplay=0 cepheustouchrecover=0`.
+Entry `reset=0x1/0 vddio=0x1/0 irq=0x1/0 vci=0x3c3/0x3 prst=0x2c3/0x3` at 29.703 s, rails
+unchanged, sysinfo 29.838 s, **one** `a0 00 01` at 29.839 s, `43 05 01` at 29.841 s, ghost
+burst 33.193-33.229 s (same right/top edges), `43 05 30` at 33.454 s, **no recovery sent**,
+no further events. Display on 49.744 s, DCS brightness 442 at 49.809 s; power off/on
+58.842/59.363 s restored 442. Logs: `logs/runs/touch-0146-minimal/`.
+
+**Conclusion: the defect needs nothing from our probe.** One hardware reset, the sysinfo
+read and one sense-on are enough to reproduce the warm ghost and `43 05 30`. Probe replay,
+extra resets, the sense cycle, display reinit, recovery and rail cycling are exonerated as
+causes (they may still matter as fixes).
+
+**Not off-first.** TWRP's probe sequence was re-read from its dmesg: after three probe
+resets it senses on (1.221 s), immediately sends sense-off, waits 50 ms and senses on again
+(1.272 s); the DRM blank then senses off (1.579 s), and the panel SET_ON path system-resets
+and senses on a third time (1.850 s). 0140 already implemented the init-sensing toggle
+exactly (`on, 2 ms, off, 50 ms, on`) and failed warm; 0142 added a reset before the final
+on (`on 350 ms, off 50 ms, reset, ready, on`) and failed too. The only TWRP ordering still
+untested is the **third** scan: ON->OFF(50 ms)->ON->307 ms->OFF->250 ms->reset->ready->ON.
+`shim/ftstest.c` has `SHIM_FTS_TWRPSEQ` to replay that whole sequence before a 6 s quiet
+drain.
+
+**Next.** Warm shim run of `-DSHIM_FTS_TEST -DSHIM_FTS_QUIET -DSHIM_FTS_TWRPSEQ`. If the
+drain has no edge burst and no `43 05 30`, port the sequence to 0147. If it still ghosts,
+FTS command order is exonerated; next test `cepheustouchpwrms=2000` with the full
+VDDIO+AVDD cycle and `panel=0`, then look at the rail ramp and the ABL warm path rather
+than more FTS commands. Logs: `logs/runs/fts-twrpseq/`.
 
 ### 0144 FTS panel POR + brightness reassert: tested warm, superseded by 0145/0146 (2026-11-16)
 

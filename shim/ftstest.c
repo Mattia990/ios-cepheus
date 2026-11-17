@@ -15,6 +15,11 @@
  * the TLMM latches falling edges on the IRQ pin in hardware.  The FIFO is
  * drained only afterwards, so it separates frames the chip generates on its
  * own from frames the host's polling provokes.
+ *
+ * -DSHIM_FTS_TWRPSEQ (with SHIM_FTS_TEST) replays TWRP's whole boot order
+ * before the final scan: on, off, 50 ms, on, 350 ms, off, 250 ms, reset,
+ * ready, on.  XNU's 0140/0142 cycles only reproduced the first toggle; the
+ * third start, after TWRP's DRM blank and panel SET_ON, is still untested.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -532,6 +537,38 @@ fts_test(void)
 	int serr = ft_i2c_read(sysinfo, sizeof(sysinfo), si, sizeof(si));
 	log_printf("fts test: sysinfo err=%d %x %x %x %x %x %x %x %x\n", serr,
 	    si[0], si[1], si[2], si[3], si[4], si[5], si[6], si[7]);
+
+#ifdef SHIM_FTS_TWRPSEQ
+	/*
+	 * TWRP's boot sequence (dmesg 1.135-1.850 s): after the probe resets it
+	 * starts scanning, stops it immediately, waits 50 ms and starts again;
+	 * the DRM blank later stops that scan and the panel SET_ON path resets
+	 * the controller before a third start.  The final start is the one
+	 * ft_quiet_scan() sends below.
+	 */
+	int terr = ft_write_buf(sense_on, sizeof(sense_on));
+	log_printf("fts test: twrp seq on1 err=%d\n", terr);
+	delay_ms(2);
+	terr = ft_write_buf(sense_off, sizeof(sense_off));
+	log_printf("fts test: twrp seq off1 err=%d\n", terr);
+	delay_ms(50);
+	terr = ft_write_buf(sense_on, sizeof(sense_on));
+	log_printf("fts test: twrp seq on2 err=%d\n", terr);
+	delay_ms(350);
+	terr = ft_write_buf(sense_off, sizeof(sense_off));
+	log_printf("fts test: twrp seq off2 err=%d\n", terr);
+	delay_ms(250);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	delay_ms(10);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+	delay_ms(50);
+	terr = ft_wait_ready(500);
+	log_printf("fts test: twrp seq reset ready err=%d\n", terr);
+	if (terr) {
+		ft_power_off();
+		return;
+	}
+#endif
 
 #ifdef SHIM_FTS_QUIET
 	(void)sense_on;

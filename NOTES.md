@@ -274,16 +274,20 @@ Of the ~81 original ios-sweet kernel patches:
   `panel_ready`, and is skipped on power-key wakes; `SweetFramebuffer.cpp` exports
   `sweet_bl_reassert()` to resend the last DCS `0x51` level and clear the stale
   FIFO-pending flag after the replay. `cepheustouchpanelpor=0` keeps VCI/reset powered.
-- 0145 touch: `cepheustouchvddio=0` keeps the shared panel VDDIO (north TLMM GPIO 84)
-  up during the boot/recovery rail cycle and cycles only the touch AVDD (PM8150L L1)
-  plus reset. Warm tests showed the warm ghost/`43 05 30` follows the VDDIO drop, not
-  the AVDD state (`touch-0145-noreplay`: no ghost, display and wake stable), but an
-  AVDD-only cycle leaves the FTS controller half-reset and silent (zero touch events).
+- 0145 touch: `cepheustouchvddio=0` leaves north TLMM GPIO 84 (shared VDDIO) untouched
+  and cycles only the touch AVDD (PM8150L L1) plus reset. The earlier "ghost follows
+  VDDIO" reading was wrong: `touch-0145-noreplay` used `vddio=0`, so GPIO 84 stayed low
+  from boot and the chip was never powered (no ghost, but zero touches). With `vddio=1`
+  the warm ghost/`43 05 30` returns with or without the rail cycle (0146 runs).
 - 0146 touch: `cepheustouchvideo=1` (default 0) stops the DSI video engine around the
   SET_ON replay (`DSI_CTRL` 0xae94004 saved, `ctrl & ~7u`, 20 ms, replay, 50 ms, restore,
-  20 ms, then the brightness reassert). `touch-0145-keepvddio` showed the replay itself
-  kills XNU's live scanout even with VDDIO untouched (black at 50.5 s), so the engine
-  must not be scanning out while the FIFO replays the warm panel init.
+  20 ms, then the brightness reassert). Warm test showed `ctrl & ~7u` also disables the
+  command DMA: all 33 replay commands fail and the engine never resumes (frozen logo, 0
+  fps), so the option is diagnostic only. With `cepheustouchpanel=0` (no replay) the
+  display, brightness and wake survive a full FTS rail cycle, but the FTS still fails its
+  auto-calibration ~3 s after sense-on and reports `43 05 30`. A minimal init (single
+  reset, sysinfo, one `a0 00 01`, every optional step off) reproduces the same ghost, so
+  the warm failure is in the chip's first calibration, not in the probe or rail cycle.
 - ... (one line per patch, filled in as they are created)
 
 ## Step 1 resolved (2026-11-05)
