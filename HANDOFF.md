@@ -5,7 +5,7 @@ Last updated **2026-11-17** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Panel emission exonerated; TWRP driver_test and mid-scan panel cycle (2026-11-17)
+### Panel exonerated; TWRP driver_test, mid-scan panel blank, pre-probe (2026-11-17)
 
 **Panel emission is not the trigger.** `fts-bldim60.img` (`2ab67032...`), warm: the shim
 brings the panel up fully (VCI, SET_ON, backlight `0x7ff`), sends DCS `0x51 = 0` *before*
@@ -67,14 +67,32 @@ unblank replays SET_ON at 1.828 s, and only then resets and senses on again (1.8
 Every shim replay put the panel power change *before* the FTS bring-up, or ran with the
 panel off for the whole scan.
 
-**Next test, `fts-midpanel.img` (`0e469cf1...`).** Payload-less shim built with
-`-DSHIM_FTS_TEST -DSHIM_FTS_TWRPSEQ -DSHIM_FTS_TWRPSEQ_PANEL -DSHIM_PANEL_INIT -DSHIM_PANEL_CYCLE`:
-on1, off1, 50 ms, on2, 350 ms, off2 (TWRP's blank), 250 ms, `panel_reinit()` (VCI/L14 drop
-and SET_ON), then the controller reset and final sense-on, 6 s poll. If it stays clean, the
-panel transition *during* the scan is the missing factor; if it still ghosts, the ordering
-is out too and the AP/PMIC environment is the remaining candidate. `work/boot/runs/fts-preprobe.img`
-(`d3b92977...`, `-DSHIM_FTS_PREPROBE`) answers the related question of whether the chip is
-even unpowered at a warm entry: its address probe runs before VDDIO/AVDD are enabled.
+**Mid-scan panel transition also ghosts.** `fts-midpanel.img` (`0e469cf1...`), warm,
+payload-less shim with `-DSHIM_FTS_TWRPSEQ -DSHIM_FTS_TWRPSEQ_PANEL -DSHIM_PANEL_INIT
+-DSHIM_PANEL_CYCLE`: TWRP's exact ordering - on1, off1, 50 ms, on2, 350 ms, off2 (the DRM
+blank's sense-off), 250 ms, `panel_reinit()` (VCI/L14 off, TE stops, back on, DDIC reset,
+34/34 SET_ON, backlight `0x7ff`), then the controller reset and final sense-on. Ghost
+burst at 3698-3788 ms (20 contacts), `43 05 30` at 4070, water-mode enter/exit at
+4183/4440. Panel ordering and DDIC state are now fully exonerated.
+
+**The controller is genuinely unpowered at a warm entry.** `fts-preprobe.img`
+(`d3b92977...`, `-DSHIM_FTS_PREPROBE`), same warm entry: `preprobe recover=0 ack=-1
+sda=0 scl=0` - with VDDIO/AVDD still off the bus cannot even be raised, and the entry
+dump has GPIO 84 `io=0` (VDDIO off), reset low and PM8150L L1 `46=0 41=7 45=2`. After
+`ft_power_off()`, L1 reads `46=0`, so the RPMh off vote really lands. The same run ghosted
+again (44 events, `43 05 30` at 4895 ms). Together with the 300 s fastboot dwell, this
+rules out retained state inside the touch controller: the poison is on the AP/PMIC side,
+or a difference between the shim's and TWRP's driver *runtime* that has not been isolated.
+
+**What is left.** Every AP-visible entry register (touch pins, RPMh TCS, PM8150L L1, panel
+pins, PON) is byte-identical cold vs warm, and the panel, command order and chip state are
+out. Remaining candidates, in rough order: (1) an always-on domain the dumps do not cover
+(GCC/AOP/RSC, PM8150 SID 0 which the shim cannot read) - dump those at entry on a warm and
+a cold boot; (2) a shim-vs-TWRP runtime difference (the only untested ones are the
+Linux IRQ-driven event drain and the regulators' ramp under the QUP/I2C load, both hard to
+change from the shim); (3) temperature - every "cold" run also let the phone cool, and the
+ghost is stochastic. A cool phone with a warm reset, or a warm phone with a full power-off,
+would separate (3) from the reset type before investing in (1).
 
 ### 0147 warm no-replay: re-arm works, but the AFE stays silent (2026-11-17)
 

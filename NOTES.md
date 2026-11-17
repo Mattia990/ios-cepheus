@@ -355,7 +355,13 @@ Of the ~81 original ios-sweet kernel patches:
   `SHIM_PANEL_INIT/SHIM_PANEL_CYCLE`) inserts TWRP's DRM blank/unblank between the
   twrpseq off2 and the controller reset: 250 ms, then `panel_reinit()` (VCI/L14 drop,
   SET_ON), then reset and sense-on. Every earlier shim test did the panel power change
-  before the FTS bring-up instead.
+  before the FTS bring-up instead. Result (`fts-midpanel`): still ghosts, 20 contacts at
+  3.70 s, `43 05 30` at 4.07 s, water mode 4.18/4.44 s.
+- 2026-11-17 pre-probe (`SHIM_FTS_PREPROBE`, `fts-preprobe`): before VDDIO/AVDD are
+  enabled the I2C bus cannot even be raised (`recover=0 ack=-1 sda=0 scl=0`), and entry
+  GPIO 84 is `io=0` with PM8150L L1 `46=0`; after `ft_power_off()` L1 reads `46=0` again,
+  so the RPMh off vote lands. The chip is unpowered at a warm entry and the same run still
+  ghosts (44 events, `43 05 30` at 4.90 s), so nothing is retained in the controller.
 
 - ... (one line per patch, filled in as they are created)
 
