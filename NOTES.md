@@ -314,10 +314,34 @@ Of the ~81 original ios-sweet kernel patches:
   sense-on), `SHIM_FTS_BLDIM_MS` + `SHIM_FTS_BLLEVEL` (DCS `0x51` level around the scan),
   `SHIM_FTS_PREPROBE` (I2C address probe before the rails; expect a NACK if ABL really
   left the chip unpowered). `ft_power_off()` now logs PM8150L L1 after the off vote.
+- 2026-11-17 DSI-off and APID map: `SHIM_FTS_DSIOFF` runs `dsi_phy_hw_v4_0_disable()` after
+  the panel POR and leaves the PHY off during the scan; the ghost is unchanged
+  (`fts-dsioff`, `3db96611...`), so DSI lane activity is not the trigger.
+  `spmi_dump_map()` prints every mapped APID with owner EE; warm has 345 entries
+  (owners 0:99, 1:14, 2:12, 4:220) and PM8150B SID 3 exposes only APIDs 304-308, so SID 3
+  LDO reads say `no apid` even though the charger blocks exist. `log_ldo_bank()` dumps the
+  full SID 3/5 LDO bank at entry; `ft_l1_log()` now prints the full PM8150L L1 register
+  set at entry/powered/off. A warm reset with the cable unplugged (no VBUS at SBL1) still
+  ghosts (`fts-pmic2-warm-novbus`, 3965/4122 ms), so USB/charger detection is not it.
 - 2026-11-17 soft re-arm works: with `SHIM_FTS_SOFT_RECOVER` the chip re-armed after the
   force-cal (`43 05 30` -> water mode -> sense off/on -> `43 05 01`) and stayed sensing
   for 7.6 s with no second burst (`fts-softrec`, `fts-softrec12`). A panel/rail cycle is
   not needed. `FT_POLL_MS` is now overridable at compile time for longer windows.
+- 2026-11-18 shim warm-order flags: `SHIM_FTS_RESET2=N` (a second hardware reset straight
+  after the `0xa6` sysinfo read, XNU 0125's known-good order; `fts-reset2` still ghosts),
+  `SHIM_FTS_BLANKCMD` (TWRP's DRM-blank commands `A2 03 20 00 00 01`, `A0 01` low-power
+  scan mode, `C0 02 00 00` before the final reset, then `SHIM_FTS_BLANKCMD_MS` = 250),
+  `SHIM_FTS_RETRY_MS` (second full power-cycle bring-up + quiet scan in the same boot),
+  `SHIM_FTS_DUMMYSCAN_MS/_OFF_MS` (one throwaway `a0 00 01` for N ms, then rails off for
+  `_OFF_MS` = 300 and a fresh power-up before the real init). N>=2000 removes the ghost
+  (2000/2500/3000 quiet; 1500 leaves one `43 05 30`; 500 ghosts), but the chip then
+  **reports no real touch at all** (`fts-dummy3-touch`, `fts-latetouch`, `fts-latetouch2`:
+  a 60 s human swipe gives 0 frames and 1 IRQ). Same image on a cold boot reports touch
+  fine, so this is a silent warm chip, not a fix. `SHIM_FTS_LATE_TOUCH_MS=N` is the
+  visible post-display touch window used for those tests. `tools/cepheus-shim-run.sh NAME
+  IMAGE` runs the whole warm loop and prints the event summary. `fts-quiet-dwell90` keeps
+  the rails off for 90 s before power-up and still ghosts, so warm residue on the touch
+  rails is not a time-decay effect.
 - 0147 touch: re-arm the scan instead of power-cycling when the controller reports
   `43 05 30/31` or water-mode enter within 10 s of sense-on (at most 4 times), waiting
   `cepheustouchrearmms` (default 600) first. `cepheustouchrearm=0` disables it; the 0137
@@ -338,8 +362,11 @@ Of the ~81 original ios-sweet kernel patches:
 - 2026-11-17 LineageOS check: `drivers/input/touchscreen/xiaomi/fts_521` is the same ST
   5.2.4 as TWRP (whitespace + Android plumbing only), but cepheus' vendor config selects
   `CONFIG_TOUCHSCREEN_ST_FTS_V521=y`, i.e. `drivers/input/touchscreen/st/fts.c` 4.2.14
-  with DT `fts@49 compatible = "st,fts"`. Its probe path has no warm-boot-specific init
-  and 5.2.4 has no noise-parameter write, so there is nothing to port from there.
+  with DT `fts@49 compatible = "st,fts"`. Its probe path has no warm-boot-specific init.
+  4.2.14 does define `USE_NOISE_PARAM` and has a chip-info/full-init (`0xA5`) path, but
+  firmware 0060 implements none of the commands they need: `C8 01`, `C7 01`, `B8 FF FF`
+  all time out (2 s, scan on/off) and `D0 8000` reads zeros (2026-11-18). Nothing to port.
+  The old claim "5.2.4 has no noise-parameter write" was correct but incomplete.
 - TWRP `/proc/fts/driver_test` (fts_proc.c): text mode is space-separated hex bytes.
   `01 A0 00 01` = raw write (sense on), `12` = system reset, `14` = `fts_chip_powercycle`,
   `15 00` = read sysinfo, `17 01` = enable the AP IRQ (`14` masks it and never restores it;
@@ -362,6 +389,18 @@ Of the ~81 original ios-sweet kernel patches:
   GPIO 84 is `io=0` with PM8150L L1 `46=0`; after `ft_power_off()` L1 reads `46=0` again,
   so the RPMh off vote lands. The chip is unpowered at a warm entry and the same run still
   ghosts (44 events, `43 05 30` at 4.90 s), so nothing is retained in the controller.
+
+- 2026-11-18 PMIC GPIOs (new dump, `log_pmic_gpios()`): the blocks at SID 0/2/4
+  `0xc000+0x100*(n-1)` are the last retained state never compared cold vs warm. The live
+  DT's only always-on GPIO output is `vdd_boost_vreg` on PM8150B GPIO5 (`0xc400`,
+  `regulator-always-on`, no consumer); `pm8150b_gpios 12` (`ext_5v_boost`) is disabled,
+  the rest are inputs. `SHIM_FTS_GPIO5OFF` releases GPIO5 (mode `0x40=0`, enable `0x46`
+  bit 7 cleared, i.e. digital input and master enable off) before the FTS rails;
+  `fts-gpio5.img` (`2300496f...`) also dumps the GPIO blocks at entry. Cold run of
+  `a856c75a...`: the entry diff vs warm is only four FTS-SMPS set points (`1:2f00`,
+  `1:3000`, `5:1d00`, `5:1e00`; raw 0x40), all DVFS leftovers. GPIO register map:
+  `0x04` type (0x10), `0x05` subtype, `0x10` RT input, `0x40` mode, `0x41` vin,
+  `0x42` pull, `0x43` dig-in, `0x45` out ctl, `0x46` enable (bit 7 master).
 
 - ... (one line per patch, filled in as they are created)
 

@@ -108,3 +108,26 @@ int spmi_write(uint32_t sid, uint32_t addr, uint8_t val)
 		log_printf("spmi: write %x:%x apid %u status %x\n", sid, addr, apid, st);
 	return rc;
 }
+
+/*
+ * Dump the arbiter's APID table: every entry that decodes to a PPID, with
+ * its owning EE.  find_apid() silently skips PPIDs that are not mapped, which
+ * is why the PM8150B (SID 3) regulator dump can be empty without any error.
+ * Comparing the table warm vs cold also shows whether a warm reset changes
+ * the map itself (owner EE, stale entries) rather than the peripherals.
+ */
+void spmi_dump_map(const char *tag)
+{
+	if (!napids)
+		return;
+	log_printf("spmi map %s (napids %u):\n", tag, napids);
+	for (uint32_t i = 0; i < napids; i++) {
+		uint32_t map = rd32(CORE_PA + APID_MAP(i));
+		if (!map)
+			continue;
+		uint32_t ppid = (map >> 8) & 0xfff;
+		uint32_t own = rd32(CNFG_PA + OWNER(i)) & 7;
+		log_printf("  apid %3u sid %u per %02x owner %u\n",
+		    i, ppid >> 8, ppid & 0xff, own);
+	}
+}

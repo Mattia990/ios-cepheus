@@ -77,6 +77,11 @@
 #define FT_POLL_MS	6000u		/* how long to watch the first scan */
 #endif
 
+/* How many events to print in the polling scan (the FIFO holds 32). */
+#ifndef FT_LOG_MAX
+#define FT_LOG_MAX	64u
+#endif
+
 /*
  * Panel-age test: after panel_reinit() the DDIC is freshly powered, while
  * under XNU the panel has been driven for ~30 s before the FTS test starts.
@@ -156,6 +161,279 @@
  */
 #ifndef SHIM_FTS_PANELOFF_MS
 #define SHIM_FTS_PANELOFF_MS 0
+#endif
+
+/*
+ * -DSHIM_FTS_RESET2=N adds N hardware resets immediately after the 0xa6
+ * sysinfo read and before any sense command.  This is the exact order that
+ * made warm touch work in XNU (0125, reset2=1: power-up reset, sysinfo,
+ * reset, sense-on) and the one ios-sweet's driver documents as the fix for
+ * the same right/top-edge ghost burst ("a whole row/column of ghost contacts
+ * ... 43 05 30").  The shim's default path has no reset there, and
+ * SHIM_FTS_TWRPSEQ resets only after a sense on/off cycle, so this order has
+ * never been tested from the shim.
+ */
+#ifndef SHIM_FTS_RESET2
+#define SHIM_FTS_RESET2 0
+#endif
+
+/*
+ * -DSHIM_FTS_NOISEPARAM replays what the driver cepheus ships
+ * (drivers/input/touchscreen/st/fts.c 4.2.14, USE_NOISE_PARAM) does on every
+ * resume: read the four noise parameters (C8 01 -> event 17 01 xx xx xx xx),
+ * reset the controller, write them back (C7 01 <4 bytes> -> event 18 01 00),
+ * then sense on.  TWRP's 5.2.4 driver and the XNU driver never send C7/C8.
+ *
+ * NEGATIVE (2026-11-18): firmware 0060 implements neither command.  `C8 01`
+ * times out with scan on and off (2 s poll), and direct TWRP driver_test runs
+ * of `C7 01` time out too, while sysinfo still answers.  4.2.14 also ignores
+ * readNoiseParameters()' return and writes back its static zero buffer, so
+ * this path is inert on Android as well.  Kept for reproducibility only.
+ */
+#ifndef SHIM_FTS_NOISEPARAM
+#define SHIM_FTS_NOISEPARAM 0
+#endif
+
+/*
+ * -DSHIM_FTS_BLANKCMD sends the three commands TWRP's driver writes when DRM
+ * blanks the panel (fts.c fts_mode_handler, FOD path): A2 03 20 00 00 01
+ * (long-press + gesture), A0 01 (scan mode low power, 2-byte form) and
+ * C0 02 00 00 (single-tap only).  It then waits SHIM_FTS_BLANKCMD_MS and
+ * relies on the caller's system reset before sense-on.  TWRP always runs this
+ * between its probe and the final reset; no shim run has replayed it.
+ */
+#ifndef SHIM_FTS_BLANKCMD
+#define SHIM_FTS_BLANKCMD 0
+#endif
+#ifndef SHIM_FTS_BLANKCMD_MS
+#define SHIM_FTS_BLANKCMD_MS 250
+#endif
+
+/*
+ * -DSHIM_FTS_TWRPFULL replays TWRP's exact warm order (fts.c,
+ * CONFIG_FTS_FOD_AREA_REPORT), which gets real touch on a warm boot:
+ *   sense-on -> ~300 ms -> DRM blank: sense-off, A2 03 20 00 00 01,
+ *   A0 01 (low-power scan), C0 02 00 00 (single tap) -> 267 ms ->
+ *   panel reinit (SHIM_FTS_TWRPFULL_PANEL=1) -> system reset -> sense-on.
+ * The earlier BLANKCMD test ran the commands before the first sense-on, which
+ * is not TWRP's order, and TWRPSEQ resets after its own cycle.  The final
+ * sense-on is the normal one in fts_test, followed by the polling scan.
+ */
+#ifndef SHIM_FTS_TWRPFULL
+#define SHIM_FTS_TWRPFULL 0
+#endif
+#ifndef SHIM_FTS_TWRPFULL_ON_MS
+#define SHIM_FTS_TWRPFULL_ON_MS 300
+#endif
+#ifndef SHIM_FTS_TWRPFULL_OFF_MS
+#define SHIM_FTS_TWRPFULL_OFF_MS 267
+#endif
+#ifndef SHIM_FTS_TWRPFULL_PANEL
+#define SHIM_FTS_TWRPFULL_PANEL 1
+#endif
+
+/*
+ * -DSHIM_FTS_RETRY_MS runs a second complete bring-up in the same boot: after
+ * the first quiet scan, the rails are dropped, held off for this many ms, then
+ * brought up and initialized again and scanned again.  It answers whether the
+ * first power-up itself leaves the chip misframed (then run 2 is clean) or
+ * whether the poison lives outside the controller (both runs ghost).
+ */
+#ifndef SHIM_FTS_RETRY_MS
+#define SHIM_FTS_RETRY_MS 0
+#endif
+
+/*
+ * -DSHIM_FTS_PRECYCLE_MS=N brings the touch rails up for N ms and drops them
+ * again (SHIM_FTS_PRECYCLE_OFF_MS, default 200) before the normal bring-up.
+ * `fts-retry` showed that a second power-up in the same boot calibrates
+ * cleanly while the first ghosts, so this tests how little conditioning the
+ * controller needs before its real init.
+ */
+#ifndef SHIM_FTS_PRECYCLE_MS
+#define SHIM_FTS_PRECYCLE_MS 0
+#endif
+#ifndef SHIM_FTS_PRECYCLE_OFF_MS
+#define SHIM_FTS_PRECYCLE_OFF_MS 200
+#endif
+
+/*
+ * -DSHIM_FTS_POWERUP_MS=N waits N ms after the AVDD vote before the first
+ * reset (default 200, the Linux driver's only settle time).  A warm entry
+ * starts from a fully discharged rail while a re-power starts partly charged,
+ * so a longer first settle is the cheap alternative to a second power-up.
+ */
+#ifndef SHIM_FTS_POWERUP_MS
+#define SHIM_FTS_POWERUP_MS 200
+#endif
+
+/*
+ * -DSHIM_FTS_DUMMYSCAN_MS=N runs one throwaway sense-on for N ms after the
+ * first reset, then power-cycles the rails and lets the real init continue.
+ * fts-retry's run 2 was clean after run 1 had scanned for 6 s, but a rail
+ * cycle alone (SHIM_FTS_PRECYCLE_MS) does not help, so the conditioning is
+ * the scan itself (the chip's own failed calibration + force cal).
+ */
+#ifndef SHIM_FTS_DUMMYSCAN_MS
+#define SHIM_FTS_DUMMYSCAN_MS 0
+#endif
+#ifndef SHIM_FTS_DUMMYSCAN_OFF_MS
+#define SHIM_FTS_DUMMYSCAN_OFF_MS 300
+#endif
+
+/*
+ * -DSHIM_FTS_LATE_TOUCH_MS=N runs a second bring-up after the display console
+ * is up and polls the FIFO for N ms.  The early fts_test window starts with
+ * the panel dark, so a person cannot see when to touch; this one shows
+ * "CEPHEUS / shim probe v1" for the whole window.  The second power-up in the
+ * same boot is the conditioned, clean one.
+ */
+#ifndef SHIM_FTS_LATE_TOUCH_MS
+#define SHIM_FTS_LATE_TOUCH_MS 0
+#endif
+
+/*
+ * Panel/DDIC drain before the TWRP-style unblank (with SHIM_FTS_PANELPWR):
+ * hold the DDIC in reset and drop BOTH panel supplies (VCIE on GPIO 21 and
+ * PM8150 LDO14 vddio) for this many ms, then let panel_reinit() bring the
+ * panel back up.  A cold power-on leaves the panel unpowered for minutes; a
+ * warm reset never does, and ABL's display init only resets the DDIC without
+ * a true supply POR.  If the ghost is charge or latch state left in the panel
+ * or its DDIC, this window clears it.
+ */
+#ifndef SHIM_FTS_PANELDRAIN_MS
+#define SHIM_FTS_PANELDRAIN_MS 0
+#endif
+
+/*
+ * DSI-link quiet test: after the panel is initialized, power the DSI0 PHY
+ * down before the FTS rails come up and leave it down for the whole scan.
+ * Every panel experiment so far changed the DDIC's state but left the PHY
+ * driving the link into the flex that runs next to the touch sensor, and a
+ * warm reset never re-initializes it: XNU inherits ABL's live link, while
+ * TWRP's dsi_display_prepare() re-programs the PHY.  If the warm ghost is
+ * lane activity coupling into the FTS calibration, this removes it.
+ */
+#ifndef SHIM_FTS_DSIOFF
+#define SHIM_FTS_DSIOFF 0
+#endif
+
+/*
+ * PMIC GPIO test: release PM8150B (SPMI SID 2) GPIO5 at 0xc400 before the FTS
+ * rails come up.  cepheus's vdd_boost_vreg is a regulator-fixed on that pin
+ * with regulator-always-on and no DT consumer, so Linux/TWRP drives it high
+ * at boot and only a full power-off returns it to its POR default; a warm
+ * reset can carry it into the next boot.  The entry dump in shim.c prints the
+ * pin's state before this runs, so one warm log shows both what ABL left and
+ * whether releasing it clears the ghost.  Mode 0x40 = 0 (digital input) and
+ * enable 0x46 bit 7 = 0 (master enable off) stop the pin driving anything.
+ */
+#ifndef SHIM_FTS_GPIO5OFF
+#define SHIM_FTS_GPIO5OFF 0
+#endif
+
+/*
+ * The opposite of the test above: TWRP's live pinctrl dump shows PM8150B GPIO5
+ * driven as an output HIGH (mode 0x11, vin-1, pull-down, CMOS strength 3,
+ * enable 0x80), because Linux's regulator-always-on vdd_boost_vreg enables it
+ * at boot.  A warm entry into the shim has it back at the PMIC default (input,
+ * 0x40=0, vin-0, strength 1) with only the master enable still set, so a warm
+ * boot never has this rail.  If the touch AFE needs it (Xiaomi's DT gives it
+ * no consumer, which is what an always-on board rail looks like), every warm
+ * calibration would be bad while TWRP's is good.  Drive it exactly as TWRP
+ * does before the FTS rails come up.
+ */
+#ifndef SHIM_FTS_GPIO5ON
+#define SHIM_FTS_GPIO5ON 0
+#endif
+
+#define FT_PM8150B_GPIO5_PA 0xc400u
+
+#define FT_DSI_PHY_PA	0xae94400u
+
+#if SHIM_FTS_DSIOFF
+/* dsi_phy_hw_v4_0_disable(): LPRX off, lanes off, blocks off. */
+static void
+ft_dsi_off(void)
+{
+	uintptr_t phy = FT_DSI_PHY_PA;
+	uint32_t ctrl0 = rd32(phy + 0x24);
+	uint32_t block = rd32(phy + 0xa0);
+	uint32_t lprx = rd32(phy + 0x214);
+
+	log_printf("fts test: dsi off entry ctrl0 %x pll %x rbuf %x vreg %x/%x ctrl3 %x cfg %x/%x st %x\n",
+	    ctrl0, rd32(phy + 0x3c), rd32(phy + 0x1c), rd32(phy + 0x20),
+	    rd32(phy + 0x110), rd32(phy + 0x30), rd32(phy + 0x34),
+	    rd32(phy + 0x38), rd32(phy + 0x140));
+	wr32(phy + 0x214, 0);
+	wr32(phy + 0x24, ctrl0 & ~0x1fu);
+	wr32(phy + 0xa0, 0);
+	wr32(phy + 0x24, 0);
+	__sync_synchronize();
+	delay_ms(1);
+	log_printf("fts test: dsi off lprx %x->%x ctrl0 %x->%x block %x->%x st %x\n",
+	    lprx, rd32(phy + 0x214), ctrl0, rd32(phy + 0x24), block,
+	    rd32(phy + 0xa0), rd32(phy + 0x140));
+}
+#endif
+
+#if SHIM_FTS_GPIO5OFF
+static void
+ft_gpio5_off(void)
+{
+	static const uint16_t regs[] = {
+		0x05, 0x10, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46,
+	};
+	uint8_t mode = 0, en = 0;
+
+	log_printf("fts test: gpio5 before:");
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		uint8_t v = 0;
+		int rc = spmi_read(2, FT_PM8150B_GPIO5_PA + regs[i], &v);
+		log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+	}
+	log_printf("\n");
+	spmi_read(2, FT_PM8150B_GPIO5_PA + 0x40, &mode);
+	spmi_read(2, FT_PM8150B_GPIO5_PA + 0x46, &en);
+	int mrc = spmi_write(2, FT_PM8150B_GPIO5_PA + 0x40, 0);
+	int erc = spmi_write(2, FT_PM8150B_GPIO5_PA + 0x46, en & 0x7fu);
+	delay_ms(1);
+	uint8_t m2 = 0, e2 = 0;
+	spmi_read(2, FT_PM8150B_GPIO5_PA + 0x40, &m2);
+	spmi_read(2, FT_PM8150B_GPIO5_PA + 0x46, &e2);
+	log_printf("fts test: gpio5 off mode %x->%x (%d) en %x->%x (%d)\n",
+	    mode, m2, mrc, en, e2, erc);
+}
+#endif
+
+#if SHIM_FTS_GPIO5ON
+static void
+ft_gpio5_on(void)
+{
+	static const uint16_t regs[] = {
+		0x05, 0x10, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46,
+	};
+	/* TWRP/Linux state: vin-1, pull-down, CMOS strength high, out high. */
+	static const uint8_t want[] = { 0x41, 1, 0x42, 4, 0x45, 3, 0x40, 0x11, 0x46, 0x80 };
+
+	log_printf("fts test: gpio5 before:");
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		uint8_t v = 0;
+		int rc = spmi_read(2, FT_PM8150B_GPIO5_PA + regs[i], &v);
+		log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+	}
+	log_printf("\n");
+	for (unsigned i = 0; i < sizeof(want) / sizeof(want[0]); i += 2)
+		spmi_write(2, FT_PM8150B_GPIO5_PA + want[i], want[i + 1]);
+	delay_ms(5);	/* regulator-fixed startup-delay-us = 4000 */
+	log_printf("fts test: gpio5 on:");
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		uint8_t v = 0;
+		int rc = spmi_read(2, FT_PM8150B_GPIO5_PA + regs[i], &v);
+		log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+	}
+	log_printf("\n");
+}
 #endif
 
 static void
@@ -438,6 +716,67 @@ ft_log_ev(const char *what, const uint8_t *ev)
 	    ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
 }
 
+#if SHIM_FTS_NOISEPARAM
+/*
+ * ftsTool.c readNoiseParameters: C8 01 makes the FW echo event 17 01 with
+ * four noise bytes.  writeNoiseParameters: C7 01 + 4 bytes, event 18 01 00.
+ * The FW keeps these in volatile state, hence the save/restore around reset.
+ */
+static int
+ft_noise_read(uint8_t noise[4])
+{
+	static const uint8_t cmd[2] = { 0xc8u, 0x01u };
+	uint8_t ev[FT_EVENT_SIZE];
+
+	if (ft_write_buf(cmd, sizeof(cmd))) {
+		return -1;
+	}
+	for (unsigned t = 0; t < 500; t += 5) {
+		if (!ft_fifo_read(ev)) {
+			if (ev[0] == 0x17u && ev[1] == 0x01u) {
+				noise[0] = ev[2];
+				noise[1] = ev[3];
+				noise[2] = ev[4];
+				noise[3] = ev[5];
+				return 0;
+			}
+			if (ev[0] != 0x00u) {
+				ft_log_ev("noise pre-read", ev);
+			}
+		}
+		delay_ms(5);
+	}
+	return -1;
+}
+
+static int
+ft_noise_write(const uint8_t noise[4])
+{
+	uint8_t cmd[6] = { 0xc7u, 0x01u, 0, 0, 0, 0 };
+	uint8_t ev[FT_EVENT_SIZE];
+
+	cmd[2] = noise[0];
+	cmd[3] = noise[1];
+	cmd[4] = noise[2];
+	cmd[5] = noise[3];
+	if (ft_write_buf(cmd, sizeof(cmd))) {
+		return -1;
+	}
+	for (unsigned t = 0; t < 500; t += 5) {
+		if (!ft_fifo_read(ev)) {
+			if (ev[0] == 0x18u && ev[1] == 0x01u) {
+				return ev[2] == 0x00u ? 0 : -1;
+			}
+			if (ev[0] != 0x00u) {
+				ft_log_ev("noise pre-write", ev);
+			}
+		}
+		delay_ms(5);
+	}
+	return -1;
+}
+#endif
+
 #ifdef SHIM_FTS_QUIET
 /*
  * TLMM per-pin interrupt registers (pinctrl-sm8150.c: +0x8 intr_cfg, +0xc
@@ -574,16 +913,49 @@ ft_panel_off(unsigned ms)
 }
 #endif
 
+/*
+ * True panel POR: reset asserted, VCIE switch off and the PM8150 LDO14
+ * vddio vote withdrawn, held for `ms`, then restored.  Callers replay the
+ * panel init afterwards (panel_reinit()).
+ */
+#if SHIM_FTS_PANELDRAIN_MS > 0
+static void
+ft_panel_drain(unsigned ms)
+{
+	uintptr_t east = FT_TLMM_EAST_PA;
+	int off, on;
+
+	ft_gpio(FT_TLMM_SOUTH_PA, FT_PIN_PANEL_RST, 0, 0, 0, true, false);
+	ft_gpio(east, FT_PIN_PANEL_VCI, 0, 0, 0, true, false);
+	off = shim_rpmh_vreg("ldoa14", 1800, 0);
+	log_printf("fts test: panel drain %u ms, vci=%u rst=%u ldoa14 off=%d\n",
+	    ms, rd32(east + FT_GPIO_IO(FT_PIN_PANEL_VCI)) & 1u,
+	    rd32(FT_TLMM_SOUTH_PA + FT_GPIO_IO(FT_PIN_PANEL_RST)) & 1u, off);
+	delay_ms(ms);
+	on = shim_rpmh_vreg("ldoa14", 1800, 1);
+	delay_ms(10);
+	ft_gpio(east, FT_PIN_PANEL_VCI, 0, 0, 0, true, true);
+	delay_ms(10);		/* vcie qcom,supply-post-on-sleep = 10 ms */
+	log_printf("fts test: panel drain done, vci=%u ldoa14 on=%d\n",
+	    rd32(east + FT_GPIO_IO(FT_PIN_PANEL_VCI)) & 1u, on);
+}
+#endif
+
 static void
 ft_l1_log(const char *tag)
 {
-	uint8_t en = 0, set = 0, mode = 0;
-	int re = spmi_read(5, 0x4046, &en);
-	int rs = spmi_read(5, 0x4041, &set);
-	int rm = spmi_read(5, 0x4045, &mode);
-
-	log_printf("fts test: %s pm8150l l1 46=%x%s 41=%x%s 45=%x%s\n", tag,
-	    en, re ? "!" : "", set, rs ? "!" : "", mode, rm ? "!" : "");
+	static const uint16_t regs[] = {
+		0x04, 0x05, 0x08, 0x09, 0x0a, 0x0b, 0x40, 0x41, 0x42,
+		0x43, 0x44, 0x45, 0x46, 0x48, 0x4c, 0x53, 0x60, 0x62,
+		0x64, 0x88, 0xa0,
+	};
+	log_printf("fts test: %s pm8150l l1:", tag);
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		uint8_t v = 0;
+		int rc = spmi_read(5, 0x4000 + regs[i], &v);
+		log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+	}
+	log_printf("\n");
 }
 
 /*
@@ -630,6 +1002,9 @@ fts_test(void)
 #ifdef SHIM_FTS_PANELPWR
 	/* TWRP's blank/unblank: real DDIC POR (L14 + VCIE), SET_ON, reset. */
 	log_printf("fts test: panel por before FTS power-up\n");
+#if SHIM_FTS_PANELDRAIN_MS > 0
+	ft_panel_drain(SHIM_FTS_PANELDRAIN_MS);
+#endif
 	panel_reinit();
 #endif
 
@@ -649,8 +1024,40 @@ fts_test(void)
 	panel_set_backlight(0);
 #endif
 
+#if SHIM_FTS_DSIOFF
+	ft_dsi_off();
+#endif
+
+#if SHIM_FTS_GPIO5OFF
+	ft_gpio5_off();
+#endif
+
+#if SHIM_FTS_GPIO5ON
+	ft_gpio5_on();
+#endif
+
 #if SHIM_FTS_PREPROBE
 	ft_preprobe();
+#endif
+
+#if SHIM_FTS_PRECYCLE_MS > 0
+	/*
+	 * Condition the rails before the real bring-up.  fts-retry's run 2 was
+	 * clean after run 1 had powered and scanned, so this isolates how much
+	 * of that (power on, time, power off) the first scan needs.
+	 */
+	{
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
+		delay_ms(20);
+		int pcerr = shim_rpmh_vreg("ldoc1", 1800, 1);
+		delay_ms(SHIM_FTS_PRECYCLE_MS);
+		ft_l1_log("precycle");
+		ft_power_off();
+		delay_ms(SHIM_FTS_PRECYCLE_OFF_MS);
+		log_printf("fts test: precycle %u ms on, %u off, ldoc1 err=%d\n",
+		    SHIM_FTS_PRECYCLE_MS, SHIM_FTS_PRECYCLE_OFF_MS, pcerr);
+	}
 #endif
 
 #ifdef SHIM_FTS_TWRP_POWER
@@ -672,8 +1079,10 @@ fts_test(void)
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
 	delay_ms(50);
 	int verr = shim_rpmh_vreg("ldoc1", 1800, 1);
-	delay_ms(200);
-	log_printf("fts test: rails vddio=1 ldoc1 err=%d\n", verr);
+	delay_ms(SHIM_FTS_POWERUP_MS);
+	log_printf("fts test: rails vddio=1 ldoc1 err=%d settle=%u\n", verr,
+	    SHIM_FTS_POWERUP_MS);
+	ft_l1_log("powered");
 #endif
 
 #ifdef SHIM_FTS_TWRP_POWER
@@ -702,6 +1111,32 @@ fts_test(void)
 	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
 	delay_ms(50);
 #endif
+#if SHIM_FTS_DUMMYSCAN_MS > 0
+	{
+		static const uint8_t d_on[3] = { 0xa0u, 0x00u, 0x01u };
+		static const uint8_t d_off[3] = { 0xa0u, 0x00u, 0x00u };
+		int dr = ft_wait_ready(500);
+		int d1 = ft_write_buf(d_on, sizeof(d_on));
+		delay_ms(SHIM_FTS_DUMMYSCAN_MS);
+		int d2 = ft_write_buf(d_off, sizeof(d_off));
+		log_printf("fts test: dummy scan ready=%d on=%d off=%d %u ms\n",
+		    dr, d1, d2, SHIM_FTS_DUMMYSCAN_MS);
+		ft_power_off();
+		delay_ms(SHIM_FTS_DUMMYSCAN_OFF_MS);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
+		delay_ms(50);
+		int dverr = shim_rpmh_vreg("ldoc1", 1800, 1);
+		delay_ms(SHIM_FTS_POWERUP_MS);
+		log_printf("fts test: dummy rails vddio=1 ldoc1 err=%d\n", dverr);
+		ft_l1_log("powered2");
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		delay_ms(10);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+		delay_ms(50);
+	}
+#endif
+	shim_log_pm8150_ldos("powered");
 	int rerr = ft_wait_ready(500);
 	log_printf("fts test: ready err=%d idle sda=%u scl=%u\n", rerr,
 	    ft_sda_read(), ft_scl_read());
@@ -716,6 +1151,28 @@ fts_test(void)
 	log_printf("fts test: sysinfo afe cfg=%x cx=%x panel=%x cfgVer=%x cxVer=%x fw=%x\n",
 	    si[28], si[29], si[30], si[22] | (si[23] << 8),
 	    si[26] | (si[27] << 8), si[16] | (si[17] << 8));
+
+#if SHIM_FTS_RESET2 > 0
+	/*
+	 * XNU 0125's known-good warm order: reset again right after the 0xa6
+	 * sysinfo read, before any sense command.  Do not put a sense cycle
+	 * between the read and this reset; that is the TWRPSEQ order, which
+	 * still ghosts.
+	 */
+	for (unsigned i = 0; i < SHIM_FTS_RESET2; ++i) {
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		delay_ms(10);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+		delay_ms(50);
+		int prerr = ft_wait_ready(500);
+		log_printf("fts test: post-sysinfo reset %u ready err=%d\n",
+		    i + 1, prerr);
+		if (prerr) {
+			ft_power_off();
+			return;
+		}
+	}
+#endif
 
 #ifdef SHIM_FTS_TWRPSEQ
 	/*
@@ -758,12 +1215,76 @@ fts_test(void)
 	}
 #endif
 
+#if SHIM_FTS_BLANKCMD
+	/*
+	 * TWRP's DRM-blank sequence (fts.c fts_mode_handler, FOD branch) and
+	 * then its unblank reset.  Order in TWRP: A2 03 20 00 00 01,
+	 * A0 01 (low-power scan mode), C0 02 00 00 (single tap only), then
+	 * 267 ms later a system reset and the final sense-on.
+	 */
+	{
+		static const uint8_t gesture[6] = {
+			0xa2u, 0x03u, 0x20u, 0x00u, 0x00u, 0x01u
+		};
+		static const uint8_t lp[2] = { 0xa0u, 0x01u };
+		static const uint8_t single[4] = { 0xc0u, 0x02u, 0x00u, 0x00u };
+		int gr = ft_write_buf(gesture, sizeof(gesture));
+		int lr = ft_write_buf(lp, sizeof(lp));
+		int sr = ft_write_buf(single, sizeof(single));
+		log_printf("fts test: blank cmd err=%d/%d/%d, wait %u ms\n",
+		    gr, lr, sr, SHIM_FTS_BLANKCMD_MS);
+		delay_ms(SHIM_FTS_BLANKCMD_MS);
+	}
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	delay_ms(10);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+	delay_ms(50);
+	{
+		int brerr = ft_wait_ready(500);
+		log_printf("fts test: blank cmd reset ready err=%d\n", brerr);
+		if (brerr) {
+			ft_power_off();
+			return;
+		}
+	}
+#endif
+
 #ifdef SHIM_FTS_QUIET
 	(void)sense_on;
 	(void)sense_off;
 	(void)ev;
 	ft_quiet_scan();
+#if SHIM_FTS_RETRY_MS > 0
+	/*
+	 * Second complete bring-up in the same boot.  If run 1 ghosts and run 2
+	 * is clean, the first power-up leaves the controller misframed; if both
+	 * ghost, the cause is outside the controller.
+	 */
 	ft_power_off();
+	log_printf("fts test: retry drain %u ms\n", SHIM_FTS_RETRY_MS);
+	delay_ms(SHIM_FTS_RETRY_MS);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
+	delay_ms(50);
+	int rverr = shim_rpmh_vreg("ldoc1", 1800, 1);
+	delay_ms(200);
+	log_printf("fts test: retry rails vddio=1 ldoc1 err=%d\n", rverr);
+	ft_l1_log("powered2");
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	delay_ms(10);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+	delay_ms(50);
+	int rready = ft_wait_ready(500);
+	log_printf("fts test: retry ready err=%d\n", rready);
+	if (!rready) {
+		int serr = ft_i2c_read(sysinfo, sizeof(sysinfo), si,
+		    FT_SYSINFO_SIZE);
+		log_printf("fts test: retry sysinfo err=%d sig=%x/%x\n", serr,
+		    si[0], si[1]);
+		ft_quiet_scan();
+	}
+	ft_power_off();
+#endif
 #else
 	int err = ft_write_buf(sense_on, sizeof(sense_on));
 	log_printf("fts test: sense on err=%d\n", err);
@@ -793,7 +1314,7 @@ fts_test(void)
 		}
 #endif
 		if (!ft_fifo_read(ev) && ev[0] != 0x00u) {
-			if (logged < 64u) {
+			if (logged < FT_LOG_MAX) {
 				log_printf("fts test: ev t=%u ", (unsigned)dt);
 				ft_log_ev("", ev);
 				++logged;
@@ -836,6 +1357,131 @@ fts_test(void)
 	log_printf("fts test: done, %u events, %u ms\n", logged, FT_POLL_MS);
 	err = ft_write_buf(sense_off, sizeof(sense_off));
 	log_printf("fts test: sense off err=%d\n", err);
+	ft_power_off();
+#endif
+}
+
+/*
+ * Second bring-up after the display console is up.  A person can see the
+ * screen for the whole poll window; the conditioned second power-up should
+ * report real touches.  Same rails/reset order as the first fts_test.
+ */
+void
+fts_touch_window(void)
+{
+#if SHIM_FTS_LATE_TOUCH_MS > 0
+	static const uint8_t sense_on[3] = { 0xa0u, 0x00u, 0x01u };
+	static const uint8_t sense_off[3] = { 0xa0u, 0x00u, 0x00u };
+	static const uint8_t sysinfo[3] = { 0xa6u, 0x00u, 0x00u };
+	static uint8_t si[FT_SYSINFO_SIZE];
+	uint8_t ev[FT_EVENT_SIZE];
+	unsigned edges = 0, logged = 0;
+	uint64_t hz = rsr("cntfrq_el0"), t0, beat = 10000;
+
+	log_printf("fts test: late window %u ms\n", SHIM_FTS_LATE_TOUCH_MS);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_VDDIO, 0, 0, 0, true, true);
+	delay_ms(50);
+	int verr = shim_rpmh_vreg("ldoc1", 1800, 1);
+	delay_ms(SHIM_FTS_POWERUP_MS);
+	log_printf("fts test: late rails vddio=1 ldoc1 err=%d\n", verr);
+	ft_l1_log("late");
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+	delay_ms(10);
+	ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+	delay_ms(50);
+	ft_gpio(FT_TLMM_SOUTH_PA, FT_PIN_SDA, 0, 3, 0, false, false);
+	ft_gpio(FT_TLMM_SOUTH_PA, FT_PIN_SCL, 0, 3, 0, false, false);
+	ft_gpio(FT_TLMM_SOUTH_PA, FT_PIN_IRQ, 0, 3, 3, false, false);
+	if (!ft_recover()) {
+		log_printf("fts test: late scl stuck low\n");
+		ft_power_off();
+		return;
+	}
+	int rerr = ft_wait_ready(500);
+	log_printf("fts test: late ready err=%d\n", rerr);
+	if (rerr) {
+		ft_power_off();
+		return;
+	}
+	int serr = ft_i2c_read(sysinfo, sizeof(sysinfo), si, FT_SYSINFO_SIZE);
+	log_printf("fts test: late sysinfo err=%d sig=%x/%x\n", serr,
+	    si[0], si[1]);
+
+#if SHIM_FTS_RESET2 > 0
+	/* XNU's known-good order: reset again right after the 0xa6 read. */
+	for (unsigned i = 0; i < SHIM_FTS_RESET2; ++i) {
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		delay_ms(10);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+		delay_ms(50);
+		int rr = ft_wait_ready(500);
+		log_printf("fts test: late post-sysinfo reset %u ready err=%d\n",
+		    i + 1, rr);
+		if (rr) {
+			ft_power_off();
+			return;
+		}
+	}
+#endif
+
+#ifdef SHIM_FTS_QUIET
+	ft_irq_arm();
+#endif
+#if SHIM_FTS_NOISEPARAM
+	{
+		uint8_t noise[4] = { 0, 0, 0, 0 };
+		int nerr = ft_noise_read(noise);
+
+		log_printf("fts test: late noise read err=%d %02x %02x %02x %02x\n",
+		    nerr, noise[0], noise[1], noise[2], noise[3]);
+		/* Android's resume resets between the read and the write. */
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		delay_ms(10);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+		delay_ms(50);
+		int rerr2 = ft_wait_ready(500);
+
+		log_printf("fts test: late noise reset ready=%d\n", rerr2);
+		if (!nerr && !rerr2) {
+			int werr = ft_noise_write(noise);
+
+			log_printf("fts test: late noise write err=%d\n", werr);
+		}
+	}
+#endif
+	int e = ft_write_buf(sense_on, sizeof(sense_on));
+	log_printf("fts test: late sense on err=%d\n", e);
+	t0 = ticks_now();
+	for (;;) {
+		uint64_t dt = (ticks_now() - t0) * 1000u / hz;
+		if (dt >= SHIM_FTS_LATE_TOUCH_MS)
+			break;
+		if (dt >= beat) {
+			log_printf("fts test: late beat t=%u irqs=%u ev=%u\n",
+			    (unsigned)dt, edges, logged);
+			beat += 10000;
+		}
+#ifdef SHIM_FTS_QUIET
+		if (ft_irq_status() & 1u) {
+			++edges;
+			ft_irq_clear();
+		}
+#endif
+		while (!ft_fifo_read(ev) && ev[0] != 0x00u) {
+			if (logged < FT_LOG_MAX) {
+				log_printf("fts test: late ev t=%u ",
+				    (unsigned)dt);
+				ft_log_ev("", ev);
+				++logged;
+			}
+		}
+		delay_ms(5);
+	}
+	log_printf("fts test: late done %u events, %u irqs, %u ms\n",
+	    logged, edges, SHIM_FTS_LATE_TOUCH_MS);
+	e = ft_write_buf(sense_off, sizeof(sense_off));
+	log_printf("fts test: late sense off err=%d\n", e);
 	ft_power_off();
 #endif
 }

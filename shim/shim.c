@@ -224,6 +224,139 @@ static void log_pm8150l_ldo(uint32_t sid, uint32_t base, const char *name)
 }
 
 /*
+ * PM8150 (primary) LDO bank: SPMI SID 1, LDO1..LDO18 at 0x4000..0x5100.
+ * These are the rails an XNU/FTS run can leave voted on across a warm reset
+ * (camera AVDD/digital, panel VCI/VDDIO, UFS, ...).  The shim has always read
+ * the panel L13/L14 at SID 0, which has no LDOs, so the PM8150 side has never
+ * actually been compared cold vs warm.  One compact line per LDO: type,
+ * subtype, range, set point, mode, enable, pull-down, soft start.
+ */
+void shim_log_pm8150_ldos(const char *tag)
+{
+	static const uint16_t regs[] = {
+		0x04, 0x05, 0x40, 0x41, 0x44, 0x45, 0x46, 0x48, 0x4c,
+	};
+	for (unsigned n = 1; n <= 18; n++) {
+		uint32_t base = 0x4000u + (n - 1u) * 0x100u;
+		log_printf("pm8150 ldo%u %s:", n, tag);
+		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+			uint8_t v = 0;
+			int rc = spmi_read(1, base + regs[i], &v);
+			log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+		}
+		log_printf("\n");
+	}
+}
+
+/*
+ * Same layout for a whole SID's LDO bank.  The touch AVDD is PM8150L (SID 5)
+ * L1 and the VDDIO source is one of the other SIDs' LDOs, so the SID 1-only
+ * dump above cannot see the rails that matter.  A block whose first register
+ * has no APID is skipped with one line instead of printing 18 rows of
+ * read-failure markers.
+ */
+static void log_ldo_bank(uint32_t sid, const char *tag)
+{
+	static const uint16_t regs[] = {
+		0x04, 0x05, 0x40, 0x41, 0x44, 0x45, 0x46, 0x48, 0x4c,
+	};
+	for (unsigned n = 1; n <= 18; n++) {
+		uint32_t base = 0x4000u + (n - 1u) * 0x100u;
+		uint8_t v = 0;
+		if (spmi_read(sid, base + 0x04, &v)) {
+			if (n == 1 || n == 18)
+				log_printf("pmic %u ldo%u %s: no apid\n",
+				    sid, n, tag);
+			continue;
+		}
+		log_printf("pmic %u ldo%u %s:", sid, n, tag);
+		for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+			int rc = spmi_read(sid, base + regs[i], &v);
+			log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+		}
+		log_printf("\n");
+	}
+}
+
+/*
+ * SMPS/BOB blocks: the rails the PM8150 LDOs run from.  The regulator
+ * control layout is the same as the LDOs (0x40 range, mode 0x45, enable
+ * 0x46).  Peripheral types: 0x03 BUCK (PM8150 S4-S8), 0x1c FTS (S1-S3),
+ * 0x1d BOB (PM8150L bob and the PM8150 BOBs).  PM8150 is SID 1, PM8150B
+ * SID 3, PM8150L SID 5; the blocks sit on a 0x100 grid from 0x1000 to
+ * 0x3100.  The LDO dump above cannot see these, and a warm reset that only
+ * toggles some always-on SMPS would be invisible in every other entry dump.
+ */
+static void log_pmic_smps_bob(const char *tag)
+{
+	static const uint8_t sids[] = { 1, 3, 5 };
+	static const uint16_t regs[] = {
+		0x04, 0x05, 0x40, 0x41, 0x44, 0x45, 0x46, 0x48, 0x4c,
+	};
+	for (unsigned s = 0; s < sizeof(sids) / sizeof(sids[0]); s++) {
+		uint32_t sid = sids[s];
+		for (uint32_t base = 0x1000; base <= 0x3100; base += 0x100) {
+			uint8_t type = 0, sub = 0;
+			if (spmi_read(sid, base + 0x04, &type) ||
+			    spmi_read(sid, base + 0x05, &sub))
+				continue;
+			if (type != 0x03 && type != 0x1c && type != 0x1d)
+				continue;
+			log_printf("pmic %u:%x %s:", sid, base, tag);
+			for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+				uint8_t v = 0;
+				int rc = spmi_read(sid, base + regs[i], &v);
+				log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+			}
+			log_printf("\n");
+		}
+	}
+}
+
+/*
+ * PMIC GPIO blocks at shim entry.  This is the last retained state that has
+ * never been compared cold vs warm: pinctrl-spmi-gpio peripherals (type 0x10)
+ * sit on a 0x100 grid from 0xc000 on the primary USID of each PMIC.  LMH/
+ * ABL does not drive them on a cold path, but Linux's regulator-fixed
+ * consumers do: cepheus has vdd_boost_vreg on PM8150B GPIO5 with
+ * regulator-always-on and no DT consumer, and touch_vddio_vreg is
+ * regulator-boot-on.  A warm reset from TWRP can therefore carry a rail that
+ * a full power-off returns to its POR default.
+ *   0x04 type, 0x05 subtype, 0x10 RT input status, 0x40 mode,
+ *   0x41 vin, 0x42 pull, 0x43 dig-in, 0x45 out ctl, 0x46 enable
+ *   (bit 7 master enable).
+ * A block whose type register does not read (unmapped APID) is skipped.
+ */
+static void log_pmic_gpios(const char *tag)
+{
+	static const uint32_t sids[] = { 0, 2, 4 };
+	static const uint16_t regs[] = {
+		0x05, 0x10, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46,
+	};
+	for (unsigned s = 0; s < sizeof(sids) / sizeof(sids[0]); s++) {
+		uint32_t sid = sids[s];
+		unsigned shown = 0;
+		for (unsigned n = 1; n <= 12; n++) {
+			uint32_t base = 0xc000u + (n - 1u) * 0x100u;
+			uint8_t type = 0, v = 0;
+			if (spmi_read(sid, base + 0x04, &type))
+				continue;
+			if (type != 0x10)
+				continue;
+			log_printf("pmic %u gpio%u %s:", sid, n, tag);
+			for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+				int rc = spmi_read(sid, base + regs[i], &v);
+				log_printf(" %x=%x%s", regs[i], v, rc ? "!" : "");
+			}
+			log_printf("\n");
+			shown++;
+		}
+		if (!shown)
+			log_printf("pmic %u gpio %s: none\n", sid, tag);
+	}
+}
+
+/*
  * Touch pins at shim entry, before XNU or its driver touches TLMM.
  *   south TLMM: SDA 55, SCL 56, IRQ 122
  *   north TLMM: reset 12, VDDIO 84 (disp_vddio_vreg enable)
@@ -277,7 +410,7 @@ static void log_touch_pins(const char *tag)
  * that state.
  *
  * pinctrl-sm8150: GPIO 6 (panel reset) is on the south tile, GPIO 8 (TE) on
- * the north tile.  VCI/VDDIO are PM8150 LDO13/LDO14 (SID 0, 0x4c00/0x4d00,
+ * the north tile.  VCI/VDDIO are PM8150 LDO13/LDO14 (SID 1, 0x4c00/0x4d00,
  * RPMh-controlled; read-only here).  LAB/IBB are the PM8150L LCDB block
  * (SID 5, 0xec00): 0x46 enable, 0x45 module ready, 0x08/0x0a/0x0b/0x10
  * status, 0x71/0x81 LDO/NCP setpoints, 0x77/0x87 pull-downs, 0x60 touch
@@ -296,8 +429,14 @@ static void log_panel_state(int spmi_ok)
 	log_pin("vci", TLMM_EAST_PA, 21);
 	if (!spmi_ok)
 		return;
-	log_pm8150l_ldo(0, 0x4c00, "pm8150 ldo13 vci");
-	log_pm8150l_ldo(0, 0x4d00, "pm8150 ldo14 vddio");
+	spmi_dump_map("entry");
+	shim_log_pm8150_ldos("entry");
+	log_ldo_bank(3, "entry");
+	log_ldo_bank(5, "entry");
+	log_pmic_smps_bob("entry");
+	log_pmic_gpios("entry");
+	log_pm8150l_ldo(1, 0x4c00, "pm8150 ldo13 vci");
+	log_pm8150l_ldo(1, 0x4d00, "pm8150 ldo14 vddio");
 	log_spmi_regs(5, 0xec00, "pm8150l lcdb lab/ibb", lcdb,
 		      sizeof(lcdb) / sizeof(lcdb[0]));
 	/*
@@ -622,6 +761,11 @@ void shim_main(uintptr_t dtb)
 	sde_autorefresh(1);
 	sde_sample("autorefresh", 16, 20);
 	save_log("display");
+#ifdef SHIM_FTS_TEST
+	/* -DSHIM_FTS_LATE_TOUCH_MS: visible touch window, second bring-up. */
+	fts_touch_window();
+	save_log("late touch");
+#endif
 
 #ifdef SHIM_PANEL_OFF
 	panel_hold_reset();

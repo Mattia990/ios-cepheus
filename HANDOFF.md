@@ -1,9 +1,157 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-17** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-18** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### NEGATIVE: the 4.2.14-only commands are dead code on firmware 0060 (2026-11-18)
+
+**Result.** The driver cepheus actually builds (`drivers/input/touchscreen/st/fts.c`, ST
+4.2.14, `USE_NOISE_PARAM`) has two paths TWRP's 5.2.4 copy lacks, but firmware `0060`
+implements neither, so neither can explain warm boot:
+
+- **Noise save/restore (`C8 01` read -> reset -> `C7 01 <4 bytes>`)**: the shim's
+  `SHIM_FTS_NOISEPARAM` flag (`fts-noise.img`, `b9165c02…`) ran it in the 60 s late window.
+  `late noise read err=-1` (no event), so the write was skipped; the scan then produced only
+  `43 05 01`, 1 IRQ and no touch (warm). Direct TWRP `driver_test`: `01 C8 01` then
+  `11 02 17 01 07 D0` -> `pollForEvent: ERROR 80000007` (2 s, zero events), both with scan
+  on (`01 A0 00 01` first) and scan off; same for `C7 01 00 00 00 00`. Sysinfo still answers
+  (`FW VER 0060`, `CONFIG VER 0037`, `CX VER FFFF`), so the chip is alive and the commands
+  are simply unsupported. 4.2.14 also ignores `readNoiseParameters()`' return and only ever
+  writes back its static zero buffer, so this path is inert even on Android.
+- **Chip info / full init (`B8 FF FF` -> event `13 FF FF` -> `D0 8000` 164 bytes -> `0xA5`)**:
+  `01 B8 FF FF` gets no event (1 s and 2 s polls), and `02 D0 80 00 00 A4 01` returns 164
+  zero bytes. Without chip info the tuning-version and MP-flag preconditions for
+  `FTS_CMD_FULL_INITIALIZATION 0xA5` cannot be met, so the full-init path can never start on
+  this firmware. Do not port it.
+- **Conclusion:** the earlier "LineageOS has nothing new" note stands. The remaining
+  difference from TWRP is still its fuller boot order / display notifier / re-arm, not these
+  commands.
+
+### NEGATIVE: dummy scan + rail cycle silences the ghost but leaves touch dead (2026-11-18)
+
+**Result.** A new flag `SHIM_FTS_DUMMYSCAN_MS=N` (`shim/ftstest.c`) does one throwaway
+power-up/scan (`a0 00 01` for N ms, `a0 00 00`), drops the rails for 300 ms, then runs the
+real bring-up. It removes the warm ghost, but the conditioned chip **does not report real
+touch** — so it is not a fix. The "clean" run 2 of `fts-retry` was almost certainly the same
+silent state; absence of ghost frames is not enough.
+
+- Dose response (quiet 6 s scan, no finger): N=500 (`7d72a13c…`) ghosts; N=1500
+  (`f38666d6…`) leaves one `43 05 30`; **N=2000/2500/3000 (`2ad4c54f…`/`cb9afecf…`/
+  `cdf7541c…`) show only `43 05 01` + the sense-on echo**.
+- Real-touch test, early blind window (`fts-dummy3-touch.img`, `cc9acab0…`, N=3000,
+  `-DFT_POLL_MS=60000`, user swiped for 40 s): **0 touch frames, 2 status events**.
+- New `SHIM_FTS_LATE_TOUCH_MS=N` runs a second bring-up **after** the display console is up
+  and polls for N ms, so the person can see the screen. `fts-latetouch.img` (`8930f2d6…`,
+  N=3000): 0 touch frames in 60 s, only 1 IRQ. `fts-latetouch2.img` (`93a12a56…`, adds
+  `SHIM_FTS_RESET2=1`, XNU's post-sysinfo reset): same, 1 IRQ over 60 s.
+- **Cold control, same image, full power-off (`logs/runs/fts-latetouch2-cold.txt`): real
+  touch works.** 2448 IRQs, 1000 logged events, continuous mid-screen `report`/`move`/
+  `leave` frames (e.g. x=771 y=937; x=740 y=883; x=530 y=1014) for the whole 60 s window.
+  The shim's I2C/event path is fine; the warm chip is what is broken.
+- The cold log also shows `pon spare 0 -> 4`, same as warm, so PON spare does not
+  distinguish the two boots.
+
+**Conclusion.** Rail cycling a warm chip only stops it reporting; the underlying warm-boot
+fault survives. Any candidate fix must be validated with **real touch**, not just a quiet
+FIFO. TWRP's Linux driver still gets real touch on a warm boot, so the fault is recoverable
+in software; the missing piece is in TWRP's fuller init (lockdown/CRC probe, display
+notifier, or re-arm), not in the rail state.
+
+### Post-sysinfo reset replayed from the shim: same ghost (2026-11-18)
+
+**Result.** `work/boot/runs/fts-reset2.img` (`d0aff594…`, `-DSHIM_FTS_TEST -DSHIM_FTS_QUIET
+-DSHIM_FTS_RESET2=1`) ran warm with the exact order that made XNU touch work on 11-09 (0125,
+`touch-on6`): power-up reset, `0xa6` sysinfo, a second hardware reset (`post-sysinfo reset 1
+ready err=0`), then `a0 00 01` with no sense cycle in between. The chip still failed:
+`43 05 31` and two `43 05 30` in the FIFO drain plus the usual 8-contact right-edge/top-row
+burst (`logs/runs/fts-reset2-warm.txt`). The known-good XNU order does not reproduce from the
+shim, so command order alone does not decide the calibration.
+
+**Timeline for reference.** A polling run (`fts-softrec90`) shows the shape plainly: `43 05 01`
+(mutual-negative force cal, benign) at sense-on, silence for ~3.0 s, then 20+ whole-line
+contacts on x=1079 and y≈176, with `43 05 30` only later. Nothing is wrong at sense-on; the
+baseline drifts into the failure.
+
+**TWRP's missing commands.** TWRP's DRM-blank path (`fts_mode_handler`, FOD branch) writes
+`A2 03 20 00 00 01`, then `A0 01` (scan mode LOW_POWER, 2-byte form) and `C0 02 00 00`
+(single tap only): the chip runs its gesture/low-power scan for 267 ms before the unblank reset
+and final `A0 00 01`. The shim's `SHIM_FTS_TWRPSEQ` replays the sense on/off/on pairs but never
+this low-power mode. `fts-blankcmd.img` (`c3bc6486…`, `-DSHIM_FTS_BLANKCMD=1`) adds it before
+the final reset.
+
+**Also new.** `tools/cepheus-shim-run.sh NAME IMAGE` wraps the warm loop (reboot, probe, TWRP,
+log pull, summary) so each test is one command. `SHIM_FTS_RETRY_MS=N`
+(`fts-retry.img`, `d41b88e4…`) does a second full power-cycle bring-up and quiet scan in the
+same boot: if run 2 comes up clean, the first power-up is what misframes the chip; if both
+ghost, the cause is outside the controller.
+
+### PMIC GPIO blocks: the last un-dumped retained state (2026-11-18)
+
+**Cold run of `a856c75a...` done; the entry dump is clean.** Cold boot into fastboot, same
+probe image, log `logs/runs/fts-pmic2-cold.txt`. The whole entry block (arbiter APID map and
+owners, SID 1/3/5 LDO banks, SMPS/BOB, PON, panel rails, touch/panel TLMM) diffs against the
+warm run in exactly four lines: PM8150 `1:2f00`/`1:3000` `40=8` (warm) vs `40=c` (cold) and
+PM8150L `5:1d00`/`5:1e00` `40=20` (warm) vs `40=24` (cold). All four are FTS-SMPS voltage
+set points (0x40), i.e. leftover DVFS state, not a touch or panel rail. Every APID, owner,
+LDO and pin is identical.
+
+**The gap: PMIC GPIOs were never dumped.** Pinctrl-spmi-gpio blocks (SID 0/2/4, `0xc000 +
+0x100*(n-1)`) are not regulators, and no ABL path writes them, but Linux's regulator-fixed
+consumers do. In the live DT the only always-on one is `vdd_boost_vreg` on **PM8150B GPIO5**
+(`0xc400`, `regulator-always-on`, no DT consumer): a full power-off returns it to POR, a
+warm reset from TWRP keeps whatever TWRP left. That is the last candidate that is (a)
+retained across a warm reset, (b) cleared by a battery-off, and (c) invisible to every dump
+so far. The other PMIC GPIO users are inputs or disabled: `pm8150b_gpios 12` is
+`ext_5v_boost` (`status = "disabled"`), `pm8150b_gpios 7` is WPC detect, `pm8150_gpios
+6/9/10` are the volume key and VBUS inputs, `pm8150_gpios 1` is the disabled QBT1000
+finger-detect.
+
+**New image + test.** `log_pmic_gpios()` in `shim/shim.c` dumps type/subtype/RT-status/mode/
+vin/pull/dig-in/out-ctl/enable for every GPIO block on SID 0/2/4 at shim entry; it runs in
+`log_panel_state()` before `fts_test()`, so it records what ABL left. `fts-gpio5.img`
+(`2300496f...`, `-DSHIM_FTS_TEST -DSHIM_FTS_GPIO5OFF`) additionally releases PM8150B GPIO5
+just before the rails: mode `0x40 = 0` (digital input) and enable `0x46` bit 7 cleared,
+logging before/after. One warm run answers both questions: GPIO5's entry state, and whether
+releasing it clears the right/top-edge burst and `43 05 30`. If the GPIOs match cold vs warm,
+the next block is GCC/dispcc always-on (`0xaf03000`) and AOP/RSC entry state.
+
+### DSI link and USB/charger state exonerated; APID map + full rail banks dumped (2026-11-17)
+
+**DSI0 PHY off does not clear the ghost.** `fts-dsioff.img` (`3db96611...`) adds
+`-DSHIM_FTS_DSIOFF`: after the panel POR, `ft_dsi_off()` runs the
+`dsi_phy_hw_v4_0_disable()` sequence (LPRX off, lanes off, blocks off, `ctrl0 = 0`) before
+the FTS rails come up and leaves the PHY off through the scan. The PHY genuinely went down
+(`lprx 3->0`, `ctrl0 7f->0`, `block 1f->0`, `st 7->5`) and the ghost still fired at
+4261/4475 ms (`logs/runs/fts-dsioff-warm.txt`). Lane activity and the live link are not the
+trigger; this was the last display-side block that differs from a cold boot.
+
+**USB/charger state at reset does not matter.** Warm reset performed with the cable
+unplugged (TWRP Reboot -> Bootloader on battery, replugged once fastboot appeared), so SBL1
+saw `vbus_low` and skipped charger/CDP detection: `logs/runs/fts-pmic2-warm-novbus.txt`,
+26 events, `43 05 30` at 3965/4122 ms. The entry register dump is identical to the
+USB-attached warm run except two PM8150 SMPS set-points (`1:2f00`/`1:3000` `40=8` vs
+`40=c`), neither touch-related.
+
+**Entry state, warm.** `a856c75a...` (`-DSHIM_FTS_TEST`) dumps the whole arbiter map plus
+SID 1/3/5 LDO banks and SMPS/BOB. 345 mapped APIDs; owners 0:99, 1:14, 2:12, 4:220.
+PM8150B (SID 3) exposes only APIDs 304-308 (`b0`,`b1`,`b2`,`c0`,`d0`, owner 0); its
+charger/regulator blocks (`0x10`-`0x31`) are absent from the apps-EE map, so SID 3 LDO
+reads report `no apid` (that is a map property, not a failed read). PM8150L L1 (touch AVDD)
+entry: `8=3 42=0 43=0 46=0`; powered: `4=4 5=71 8=84 40=8 41=7 42=8 43=7 44=7 45=2 46=80
+48=0 4c=0 53=43 60=14 62=1 64=1 88=d0 a0=80`; powered-off restores the entry values. Log:
+`logs/runs/fts-pmic2-warm.txt`.
+
+**Still different.** TWRP boots warm and works; the shim reproduces its commands, rails,
+rail order, resets, panel state, DSI state, and entry registers and still ghosts. Remaining
+candidates: PMIC GPIO always-on state (new section above), GCC/AOP/RSC always-on state that
+only a full power-off clears, a non-USB difference in ABL's warm path, and a shim-vs-TWRP
+runtime difference (Linux IRQ-driven drain; regulator ramp under QUP/I2C load).
+
+**New shim instrumentation (uncommitted).** `SHIM_FTS_DSIOFF` + `ft_dsi_off()`,
+`spmi_dump_map()`, `log_ldo_bank()` for SID 3/5, the full L1 register dump in
+`ft_l1_log()` entry/powered/off, `log_pmic_gpios()`, and `SHIM_FTS_GPIO5OFF` + `ft_gpio5_off()`.
 
 ### Panel exonerated; TWRP driver_test, mid-scan panel blank, pre-probe (2026-11-17)
 
@@ -24,8 +172,9 @@ only in Android 13/14 plumbing: `linux/msm_drm_notify.h`, `tp_common`,
 the shipped driver is `drivers/input/touchscreen/st/fts.c` **4.2.14** (with
 `CONFIG_FTS_FOD_AREA_REPORT=y`). Its probe path is `fts_system_reset` -> `readChipInfo` ->
 `fts_interrupt_install` -> delayed `fts_fw_update` -> sense-on, with an ESD/watchdog
-power-cycle recovery; there is no warm-boot-specific init and no noise-parameter write
-(`USE_NOISE_PARAM` does not exist in 5.2.4).
+power-cycle recovery; there is no warm-boot-specific init. It does define `USE_NOISE_PARAM`
+(5.2.4 does not) and reads/writes `C8`/`C7` around the resume reset, but firmware 0060
+implements neither command (see the 2026-11-18 entry above), so that path is inert.
 
 **Status decode correction.** `43 05 01` is `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`,
 "Mutual negative detect Force cal" - a normal status emitted right after sense-on, which
