@@ -24,6 +24,9 @@ images/
 downloads/ipsw/
 research/ipsw-x/
 
+# Xiaomi/Qualcomm GPU firmware (never commit it)
+research/gpu/fw/
+
 # Local development
 .DS_Store
 *.pyc

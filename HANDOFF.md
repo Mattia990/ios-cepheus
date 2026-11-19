@@ -1,9 +1,43 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-18** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-19** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### GPU: the Adreno 640 comes up and presents the panel (2026-11-19)
+
+**First GPU run on cepheus, and it works.** `tools/cepheus-run.sh gpu1 -G
+-k logs/runs/touch-0148-quiet/kernel -s 180 -a "cepheustouchpanel=0 cepheustouchpanelpor=0"`
+booted the A640 path for the first time. The four firmware files came read-only from the
+stock `/vendor/firmware` (TWRP) into `research/gpu/fw/` (gitignored): `a640_gmu.bin`,
+`a630_sqe.fw`, `a640_zap.mdt`, `a640_zap.b02`.
+
+`logs/runs/gpu1/xnu.txt`:
+
+- power was off at entry (`cx_gdsc 222001 gx_gdsc 222001`); `cx gdsc -> f8222000 on`,
+  GMU RCG `80000000 cfg 1`, `gpucc cx_gmu = 4221`;
+- `gmu: 7 firmware blocks loaded`, `init result babeface BOOTED`; HFI start + perf vote
+  499 MHz, OOB `gpu_set` acked, `gx gdsc f8222800`;
+- `zap: auth and reset rc 0 r1 0`; both rings idle, `hwfault 0`;
+- `bring-up done, GPU ready in 294 ms (pool 0x104a00000)`;
+- the panel switched to 4352-byte rows and two 686-page surfaces were mapped;
+- `5s: 300 submits (0 missed), GPU busy 321 ms (6%) ...; present 300/321ms` and
+  `present: 600 frames, avg cache clean 617 us, GPU blit 16 us`;
+- no SMMU fault, no GPU timeout, no fallback to the CPU copy.
+
+SpringBoard booted with the image scaled correctly; the UI stays laggy because
+`sweetgpu=1` only moves present/scale to the GPU while rendering is still on the CPU.
+That run had touch disabled. The `AegirPoster` SIGABRT at 78.5 s is not new: the same
+crash is in `brightness-on1` at 183.2 s.
+
+**Still open: Metal.** `sweetmtl=2` needs SweetMetal2.bundle = `phone/metal2` + the
+metal2vulkan Rust bridge + Turnip. None of them is built, and this Mac has no
+`work/turnip`, `work/metal2vulkan` or `work/m2v-bridge`; it also has no Xcode/iPhoneOS
+SDK (`xcode-select` is the Command Line Tools), no meson/ninja/cmake and no Rust/cargo.
+Building the stack therefore needs the toolchain first: Xcode, Homebrew meson/ninja/cmake,
+rustup 1.98 + the `aarch64-apple-ios` target, Mesa 85fda3b3 + UniXNU's patches and
+metal2vulkan 720ef1ce. Until then the GPU result above is present-only.
 
 ### Warm: TWRP's full order, a quiet calibration, and the early scan all fail (2026-11-18)
 

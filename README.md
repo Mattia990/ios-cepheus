@@ -25,7 +25,7 @@ differences (display panel, touch controller, button GPIO mapping, memory layout
 | CPU | All 8 cores (4x Cortex-A55 + 4x Cortex-A76) at full clock, PSCI |
 | Storage | UFS; the iOS root is an HFS+ image in `userdata`, read/write |
 | Display | The AMOLED command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436); the Adreno 640 scales each frame to fit |
-| GPU / Metal | Metal on Mesa's Turnip Vulkan driver through metal2vulkan (`sweetmtl=2`) |
+| GPU / Metal | A640 present/scale verified (`sweetgpu=1`); Metal on Mesa's Turnip through metal2vulkan (`sweetmtl=2`) still needs the userland build |
 | Touch, buttons | Touch controller TBD; power and volume keys |
 | USB | Ethernet to the Mac: SSH, file server, live kernel log |
 | Wi-Fi | TBD (same WCN3990-class radio as flame, verify) |

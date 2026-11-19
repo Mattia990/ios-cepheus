@@ -17,6 +17,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
+# adb/fastboot live in the platform-tools checkout next to this repo, not in PATH.
+if [ -d "$ROOT/../platform-tools" ]; then
+	PATH="$ROOT/../platform-tools:$PATH"
+	export PATH
+fi
 name=$1; shift
 kernel=$ROOT/work/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
 secs=300 extra="" film=0 grep_re="" poke="" gpu=0
