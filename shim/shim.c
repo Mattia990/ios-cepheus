@@ -367,8 +367,28 @@ static void log_pmic_gpios(const char *tag)
 #define TLMM_SOUTH_PA		0x03d00000UL
 #define TLMM_NORTH_PA		0x03900000UL
 #define TLMM_EAST_PA		0x03500000UL	/* GPIO 21: disp_vci_vreg enable */
+#define TLMM_WEST_PA		0x03100000UL	/* GPIO 125: fp-gpio-pwr */
 #define TLMM_CFG(n)		((uint32_t)(n) * 0x1000u)
 #define TLMM_IO(n)		(TLMM_CFG(n) + 4u)
+
+/*
+ * -DSHIM_FTS_TLMM_ALL dumps every GPIO pad at shim entry.  The per-pin tile
+ * assignment comes from PINGROUP() in pinctrl-sm8150.c; the four tiles are
+ * 0x03100000 (west), 0x03500000 (east), 0x03900000 (north), 0x03d00000
+ * (south), each with a 0x1000 stride per pad.  This is the comparison the
+ * warm-boot work still needs: fingerprint reset 37 / IRQ 120 / power 125,
+ * NFC 90/104 and every other pad ABL does not reset.
+ */
+#ifndef SHIM_FTS_TLMM_ALL
+#define SHIM_FTS_TLMM_ALL 0
+#endif
+/* Narrow the dump when one pad is suspect: -DSHIM_FTS_TLMM_FROM=0 etc. */
+#ifndef SHIM_FTS_TLMM_FROM
+#define SHIM_FTS_TLMM_FROM 0
+#endif
+#ifndef SHIM_FTS_TLMM_TO
+#define SHIM_FTS_TLMM_TO 174
+#endif
 
 /* N none, D down, K keeper, U up -- avoid string-pointer tables. */
 static char pull_char(uint32_t cfg)
@@ -401,6 +421,116 @@ static void log_touch_pins(const char *tag)
 	log_pin("reset", TLMM_NORTH_PA, 12);
 	log_pin("vddio", TLMM_NORTH_PA, 84);
 }
+
+#if SHIM_FTS_TLMM_ALL
+enum { TLMM_T_SOUTH, TLMM_T_NORTH, TLMM_T_EAST, TLMM_T_WEST };
+
+static uintptr_t tlmm_base(unsigned tile)
+{
+	switch (tile) {
+	case TLMM_T_NORTH: return TLMM_NORTH_PA;
+	case TLMM_T_EAST: return TLMM_EAST_PA;
+	case TLMM_T_WEST: return TLMM_WEST_PA;
+	default: return TLMM_SOUTH_PA;
+	}
+}
+
+static char tlmm_tile_char(unsigned tile)
+{
+	switch (tile) {
+	case TLMM_T_NORTH: return 'N';
+	case TLMM_T_EAST: return 'E';
+	case TLMM_T_WEST: return 'W';
+	default: return 'S';
+	}
+}
+
+/* Contiguous runs of one tile, from PINGROUP() in pinctrl-sm8150.c. */
+struct tlmm_run {
+	uint8_t first, last, tile;
+};
+
+/*
+ * Pads without a usable GPIO register.  TWRP's /sys/kernel/debug/gpio
+ * enumerates only 4..125 and 130..174, and the shim dump dies on the very
+ * first read of pad 0 at 0x03d00000 (save at 7706 ms, then no more lines;
+ * the phone resets ~10 s later).  Skip the same eight pads.
+ */
+static const uint8_t tlmm_skip[] = { 0, 1, 2, 3, 126, 127, 128, 129 };
+
+static int tlmm_pad_skipped(unsigned p)
+{
+	for (unsigned i = 0; i < sizeof(tlmm_skip); i++)
+		if (tlmm_skip[i] == p)
+			return 1;
+	return 0;
+}
+
+static const struct tlmm_run tlmm_runs[] = {
+	{   0,   7, TLMM_T_SOUTH },
+	{   8,  20, TLMM_T_NORTH },
+	{  21,  30, TLMM_T_EAST },
+	{  31,  37, TLMM_T_NORTH },
+	{  38,  38, TLMM_T_SOUTH },
+	{  39,  42, TLMM_T_NORTH },
+	{  43,  50, TLMM_T_EAST },
+	{  51,  82, TLMM_T_SOUTH },
+	{  83,  86, TLMM_T_NORTH },
+	{  87,  87, TLMM_T_EAST },
+	{  88,  97, TLMM_T_NORTH },
+	{  98, 101, TLMM_T_SOUTH },
+	{ 102, 104, TLMM_T_NORTH },
+	{ 105, 113, TLMM_T_WEST },
+	{ 114, 124, TLMM_T_SOUTH },
+	{ 125, 125, TLMM_T_WEST },
+	{ 126, 154, TLMM_T_SOUTH },
+	{ 155, 168, TLMM_T_WEST },
+	{ 169, 174, TLMM_T_NORTH },
+};
+
+static void log_all_tlmm(const char *tag)
+{
+	log_printf("all tlmm %s (%u..%u):\n", tag, SHIM_FTS_TLMM_FROM,
+		   SHIM_FTS_TLMM_TO);
+	for (unsigned i = 0; i < sizeof(tlmm_runs) / sizeof(tlmm_runs[0]); i++) {
+		const struct tlmm_run *r = &tlmm_runs[i];
+		uintptr_t base = tlmm_base(r->tile);
+
+		if (r->last < SHIM_FTS_TLMM_FROM || r->first > SHIM_FTS_TLMM_TO)
+			continue;
+		log_printf("  tlmm run %u..%u %c base %lx\n", r->first, r->last,
+			   tlmm_tile_char(r->tile), (unsigned long)base);
+		for (unsigned p = r->first; p <= r->last; p++) {
+			uint32_t cfg, io;
+
+			if (p < SHIM_FTS_TLMM_FROM || p > SHIM_FTS_TLMM_TO)
+				continue;
+			if (tlmm_pad_skipped(p)) {
+				log_printf("  tlmm skip %u\n", p);
+				continue;
+			}
+			/*
+			 * Save *before* each read: if this pad's register
+			 * access hangs or aborts, the saved log ends with
+			 * the "probe N" line and names the culprit.  Every
+			 * pad needs this: an 8-pad checkpoint only narrows
+			 * a bus hang down to eight guesses.
+			 */
+			log_printf("  tlmm probe %u at %lx\n", p,
+				   (unsigned long)(base + TLMM_CFG(p)));
+			save_log("tlmm");
+			cfg = rd32(base + TLMM_CFG(p));
+			io = rd32(base + TLMM_IO(p));
+			log_printf("  tlmm[%u] %c cfg %x (pull %c mux %u %umA "
+			    "%s) io %x\n", p, tlmm_tile_char(r->tile), cfg,
+			    pull_char(cfg), (cfg >> 2) & 0xf,
+			    (((cfg >> 6) & 7) + 1) * 2,
+			    (cfg & 0x200) ? "out" : "in", io);
+		}
+	}
+	save_log("tlmm done");
+}
+#endif
 
 /*
  * Panel state at shim entry. ABL owns the panel on both cold and warm boots
@@ -705,6 +835,26 @@ void shim_main(uintptr_t dtb)
 	ufs_ok = !ufs_init();
 	if (ufs_ok)
 		ramlog_rescue();
+#if SHIM_FTS_TLMM_ALL
+	/*
+	 * Run the full-pad dump only after UFS is up so a fault or hang leaves
+	 * a saved log (the entry dump is still valid: the shim has not touched
+	 * the fingerprint/charger/NFC pads, and warm and cold runs wait the
+	 * same time).
+	 */
+	if (ufs_ok) {
+		save_log("pre-tlmm");
+		/*
+		 * Long bite: the per-pad save does a WRITE(10)+SYNC for
+		 * every pad, so the dump can take tens of seconds.  A hang
+		 * still resets the phone, just later.
+		 */
+		wdt_arm(120);
+		log_all_tlmm("entry");
+		wdt_off();
+		save_log("post-tlmm");
+	}
+#endif
 #ifdef SHIM_SHOWLOG
 	/* Read-only: the shim log on UFS is the previous run's, keep it. */
 	sde_probe();

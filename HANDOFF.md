@@ -5,6 +5,114 @@ Last updated **2026-11-18** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Warm: TWRP's full order, a quiet calibration, and the early scan all fail (2026-11-18)
+
+**TWRP's exact probe → DRM blank → unblank order is not enough.** `fts-twrpfull.img`
+(`8ef4cadc…`, `SHIM_FTS_TWRPFULL=1`, `SHIM_FTS_LATE_TOUCH_MS=60000`) replays the whole TWRP
+order in the late window: sense-on, 2 ms, sense-off, 50 ms, sense-on (`fts_init_sensing`),
+300 ms, sense-off + `A2 03 20 00 00 01` + `A0 01` + `C0 02 00 00` (the DRM blank), 267 ms,
+`panel_reinit()`, reset, sense-on. Every write returned 0 and the reset ready check passed.
+The late window still reported only `43 05 01` + the sense-on echo and **0 touch events in
+60 s** (`logs/runs/fts-twrpfull-warm.txt`). The blank-command order is not the difference.
+
+**A quiet late calibration does not help.** `fts-calquiet.img` (`da6f9d61…`,
+`SHIM_FTS_CALQUIET_MS=6000`) left the bus idle for 6 s after the late sense-on, then polled:
+still 2 events / 0 touch events over 60 s (`logs/runs/fts-calquiet-warm.txt`). The early
+scan in the same boot had already failed once (edge burst 3642-3706 ms, `43 05 30` at 3894,
+`21` at 4001, `30` at 4126), so this does not by itself rule out polling as the trigger.
+
+**The early polling scan fails too.** `fts-early60.img` (`166095b2…`, `FT_POLL_MS=60000`, no
+display init yet) produced the same right-edge/top-row burst at 3661-3776 ms, `43 05 30` at
+4258 ms, then silence (`logs/runs/fts-early60-warm.txt`). The failure is not specific to the
+post-display bring-up. Note that the `fts-latetouch2` "clean" early window was a *quiet* scan
+(no FIFO reads), so its 1 IRQ / 2 events mean the chip was silent, not that it calibrated.
+
+**`43 05 30` is not the killer.** TWRP's own warm dmesg has the same status sequence:
+`01` at 1.28-1.87 s, `21` at 2.50 s, `30` at 5.11 s after real taps at 4.95/5.02 s, and touch
+then works (1340 samples at 148.5-184.0 s). Warm TWRP can emit `30` and keep scanning; the
+shim's failure is the silence after it. The edge burst is the chip's response to contacts
+(real grip/palm or injected), not a unique ghost signature.
+
+### Warm control re-read; rescan, GPIO5 and panel drain negative (2026-11-18)
+
+**TWRP gets the same status event and keeps working.** Reading the full warm TWRP control
+instead of only its summary lines changes one conclusion: `43 05 30` is not what kills the
+chip. `logs/runs/twrp-warm-now/dmesg.txt` is the same boot as
+`logs/runs/twrp-now-touch2.txt` (the first captured input event at 148.498903 matches the
+dmesg press at 148.498991): a press/release pair at 4.946/5.022 s is followed by
+`MS invalid Mutual Strength soft Force cal = 30` at 5.108 s, and the capture then has 1340
+`ABS_MT_POSITION_X` samples of coherent touch from 148.5 to 184.0 s. The current live warm
+session is cleaner still: only `43 05 01` at sense-on, real presses at 61.4/116.4 s and
+`43 05 31` at 163.8 s. So warm TWRP can emit `43 05 30` and keep scanning; the shim's
+failure is the silence **after** the status, not the status itself. This corrects the
+earlier "TWRP never reports `43 05 30`" note, which came from grepping the spaced hex form.
+
+**Pre-emptive rescan leaves the chip silent.** `fts-rescan.img` (`05f55887...`,
+`SHIM_FTS_LATE_RESET_MS=1000`, `SHIM_FTS_LATE_TOUCH_MS=60000`, `SHIM_FTS_RESET2=1`): full
+late power-up, sysinfo, reset, sense-on, then a second reset at t=1005 ms right after the
+first two events; ready/sysinfo/sense-on all OK. The remaining 59 s contain exactly
+`43 05 01` + the sense-on echo and 2 IRQs - no right/top burst and no touch
+(`logs/runs/fts-rescan-warm.txt`, first session). Resetting before the burst does not
+condition the chip; it produces the same silent state as the dummy scan.
+
+**PM8150B GPIO5 is not it.** `logs/runs/fts-gpio5-warm.txt` entry: `pmic 2 gpio5`
+(PM8150B, SID 2) `5=11 10=0 40=0 41=0 42=4 43=0 45=1 46=80` - mode already 0, master
+enable set. `SHIM_FTS_GPIO5OFF` clears `46` bit 7 before the FTS rails (`off mode 0->0 (0)
+en 80->0 (0)`), and the run still produced 27 events, `43 05 31` and two `43 05 30` at
+5213/5451 ms. The always-on `vdd_boost_vreg` is exonerated with the other PMIC GPIOs.
+
+**A 30 s panel drain is not it either.** `logs/runs/fts-drain-warm.txt`: before FTS
+power-up the shim held VCI off, DDIC reset low and RPMh L14 off for 30 s (`panel drain
+30000 ms, vci=0 rst=0 ldoa14 off=0`), then brought both back. The ghost still fired at
+877-897 ms and 3755-4002 ms, with two `43 05 30` at 4272/4423 ms. DDIC/POR residue on the
+panel rails is not the source.
+
+**Nov 9 recheck.** The saved `touch-on6` kernel (`logs/runs/touch-on6-recheck`, same
+kernel and `cmdline`, no shim log) booted SpringBoard warm and reported zero touch through
+repeated swipes and a display off/on. The 11-09 `touch-on6`/`on7` runs were therefore
+almost certainly cold-boot successes; the old "warm touch works" claim does not hold.
+
+**Next.** Dump all four TLMM tiles at shim entry, warm vs cold, before touching anything:
+the shim has only ever compared its own pins (12/21/55/56/84/122). The unexamined pins are
+the fingerprint `goodix` reset 37 (north), IRQ 120 (south) and `fp-gpio-pwr` 125 (west), the
+IDT wireless-charger interrupt 90 / enable 104 (north), NFC 41/42 (north), 47 (east) and
+113 (west), and the rest of the 176 pads. If those match, the remaining always-on domains
+are GCC/dispcc, AOP/RSC, or the QUP-vs-bit-bang I2C runtime.
+
+**TLMM dump, first attempt.** `-DSHIM_FTS_TLMM_ALL` with a save before every read
+(`logs/runs/fts-tlmm3-warm.txt`): `tlmm probe 0 at 3d00000`, `--- saved (tlmm) at 7706 ms`,
+then nothing. The first read of **pad 0** at `0x03d00000` stalls; the phone resets ~10 s later
+(not the 120 s watchdog). TWRP's live `/sys/kernel/debug/gpio` enumerates only pads **4..125
+and 130..174**, i.e. 0-3 and 126-129 have no usable GPIO register, so the dump now skips those
+eight (`fts-tlmm5.img`, `a8f2b053…`, `tools/cepheus-shim-cold-run.sh`). A cold run of the
+image before the skip was wired repeated the pad-0 death (UFS up at 37909 ms), so the cold
+comparison is still owed. The same TWRP tree also gives a live warm pin snapshot in
+`logs/runs/twrp-pinctrl-warm/` (`gpio`, `pinmux-pins`, `pins`; `pinconf-pins` is empty
+because the downstream driver has no pinconf_get).
+
+**Warm dump works.** `logs/runs/fts-tlmm5-warm.txt`: 167 pads in 3.3 s (`pre-tlmm` 7730 ms,
+`tlmm done` 11020 ms), then the normal probe flow and `done, resetting` at 11899 ms. Warm
+entry state of every pad of interest is the same default: touch 12/55/56/84/122, fingerprint
+37/120/125, IDT 90/104 and NFC 41/42/47/113 are all `cfg 1` (pull-down, mux 0/gpio, 2 mA,
+input, `io 0`). Only display VCI GPIO 21 is driven (`cfg 3c3`, 16 mA, output high).
+
+**Cold dump matches exactly.** `logs/runs/fts-tlmm5-cold.txt` (full power-off, same image;
+`pre-tlmm` 20044 ms because cold UFS init is slower, `tlmm done` 23144 ms): 167 pads, and
+`tools/cepheus-tlmm-diff.py` reports **0 of 167 differ**, `io` included. The only difference
+between the two dump blocks is the per-pad `saved (tlmm)` timestamps. No TLMM pad state is
+retained across a warm reset. The remaining state axes are the always-on blocks
+(GCC/dispcc/AOP/RSC) and the I2C runtime: TWRP uses QUP SE17 (GSI/DMA), while both the shim
+and the XNU driver bit-bang the same two pads.
+
+**The quiet early scan is not proof of a clean calibration.** `fts-latetouch2` warm and cold
+both start with the same 6 s **quiet** early scan (`fts_test()` runs before
+`ufs_init()`/`sde_probe()`, while ABL's splash is on): `quiet done 1 irqs`, drain is
+`43 05 01` + `43 01 a0`, no `43 05 30`, `st=0 io=1`. But that scan never reads the FIFO, so
+"1 IRQ / 2 events" means the chip was silent, not healthy. The early **polling** scan
+(`fts-early60`, top) is what shows the warm chip failing ~3.6 s after sense-on, before the
+shim's display path. The first divergence in the same-image pair is still the late window:
+warm is 2 events / 1 IRQ over 60 s, cold is 1000 events / 2448 IRQs.
+
 ### NEGATIVE: the 4.2.14-only commands are dead code on firmware 0060 (2026-11-18)
 
 **Result.** The driver cepheus actually builds (`drivers/input/touchscreen/st/fts.c`, ST

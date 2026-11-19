@@ -32,8 +32,14 @@ print(f'rescue: last {n} of {total} bytes')
 PY
 	rm -f "$out.raw"
 elif [ "$what" = shim ]; then
-	tr -d '\000' < "$out.raw" > "$out"
-	rm -f "$out.raw"
+	tr -d '\000' < "$out.raw" > "$out.raw.txt"
+	# The scratch area is reused, so if this run's log is shorter than the
+	# previous one, stale text from an older run follows it.  A completed run
+	# ends with "--- saved (done)"; stop there so summaries and event counts
+	# do not pick up the previous run's touches.  An incomplete run has no
+	# marker and is kept whole.
+	awk '{ print } /^--- saved \(done\)/ { exit }' "$out.raw.txt" > "$out"
+	rm -f "$out.raw" "$out.raw.txt"
 	wc -c "$out"
 else
 	mv "$out.raw" "$out"

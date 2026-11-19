@@ -401,6 +401,56 @@ Of the ~81 original ios-sweet kernel patches:
   `1:3000`, `5:1d00`, `5:1e00`; raw 0x40), all DVFS leftovers. GPIO register map:
   `0x04` type (0x10), `0x05` subtype, `0x10` RT input, `0x40` mode, `0x41` vin,
   `0x42` pull, `0x43` dig-in, `0x45` out ctl, `0x46` enable (bit 7 master).
+- 2026-11-18 result: PM8150B GPIO5 entry `5=11 10=0 40=0 41=0 42=4 43=0 45=1 46=80`
+  (mode already input, master enable set); clearing enable still ghosts 27 events with
+  `43 05 31` + two `43 05 30` at 5213/5451 ms (`fts-gpio5-warm`). Not the trigger.
+- 2026-11-18 panel-drain control: VCI off + DDIC reset low + RPMh L14 off for 30 s before
+  FTS power-up still ghosts (events at 877-897 and 3755-4002 ms, two `43 05 30` at
+  4272/4423 ms; `fts-drain-warm`). DDIC/POR residue is not the trigger.
+- 2026-11-18 `SHIM_FTS_LATE_RESET_MS=N` resets while the chip is scanning (TWRP's
+  fw-update `fts_system_reset` 1 s after sense-on); at N=1000 the warm chip emits only
+  `43 05 01` + the sense-on echo and 2 IRQs in 60 s, i.e. silent exactly like the dummy
+  scan (`fts-rescan-warm`, first session). A reset before the burst is not a fix.
+- 2026-11-18 TWRP control re-read: the warm TWRP boot that produced
+  `twrp-now-touch2` also has `43 05 30` at 5.108 s (after a 4.95/5.02 s press/release
+  pair) and still reports real touch at 148-184 s. `43 05 30` therefore does not by itself
+  mean the chip is dead; the shim's chip goes silent after it. The old "TWRP never emits
+  `43 05 30`" note was a grep artifact (`30 00` in dmesg vs `43 05 30` in shim logs).
+- 2026-11-18 TLMM tile map (from `work/fts/pinctrl-sm8150.c` `PINGROUP` entries; bases
+  west 0x03100000, east 0x03500000, north 0x03900000, south 0x03d00000): touch pins
+  55/56/122 south, 12/84 north, 21 east; fingerprint `goodix` reset 37 north, IRQ 120
+  south, `fp-gpio-pwr` 125 west; IDT wireless-charger interrupt 90 / enable 104 north;
+  NFC 41/42 north, 47 east, 113 west. A full 176-pad entry dump is the next warm-vs-cold
+  comparison.
+- 2026-11-18 TLMM pads **0-3 and 126-129 have no usable GPIO register**: reading pad 0 at
+  `0x03d00000` stalls the shim (save at 7706 ms, phone resets ~10 s later, no exception).
+  TWRP's `/sys/kernel/debug/gpio` on the same hardware lists only 4..125 and 130..174.
+  The full dump skips those eight. TWRP's live pin snapshot: `logs/runs/twrp-pinctrl-warm/`
+  (`gpio` has direction/drive/pull/level; `pinconf-pins` is empty because the downstream
+  pinctrl driver does not implement pinconf_get; `pinmux-pins` names the owning devices).
+- 2026-11-18 **TLMM warm vs cold: 0 of 167 pads differ** (`fts-tlmm5-warm` vs
+  `fts-tlmm5-cold`, `tools/cepheus-tlmm-diff.py`). Touch 12/55/56/84/122, fingerprint
+  37/120/125, IDT 90/104 and NFC 41/42/47/113 are all `cfg 1` / pull-down / input / `io 0`
+  at both entries; only VCI GPIO 21 is driven high. Pad state is not retained warm.
+- 2026-11-18 **the early scan is not a clean control**: the `fts-latetouch2` early window is
+  **quiet** (no FIFO reads), so its `43 05 01` + `43 01 a0` and 1 IRQ mean the chip was
+  silent. The early **polling** scan (`fts-early60`, `166095b2…`) produces the edge burst +
+  `43 05 30` at ~4.3 s and then silence, before any display init. The failure is not specific
+  to the post-display bring-up.
+- 2026-11-18 **`43 05 30` is not fatal**: TWRP warm emits `01` at 1.28-1.87 s, `21` at 2.50 s
+  and `30` at 5.11 s after real taps, then reports coherent touch for 1340 samples
+  (148.5-184.0 s). The shim's failure is the silence after the force-cal, not the status.
+- 2026-11-18 TWRP's full probe → DRM blank → unblank order replayed in the late window
+  (`fts-twrpfull`, `8ef4cadc…`) still gives 0 touch events in 60 s; the blank-command order
+  is not the difference. A 6 s quiet late calibration (`fts-calquiet`, `da6f9d61…`) also
+  gives 0 touch events.
+- 2026-11-18 TWRP's event handler reads the FIFO **only when the IRQ asserts**; the shim
+  reads an empty FIFO every 5 ms. `SHIM_FTS_IRQDRIVEN=1` tests that difference.
+- 2026-11-18 Nov 9 recheck: the saved `touch-on6` kernel (`logs/runs/touch-on6-recheck`)
+  boots SpringBoard warm with zero touch despite swipes and display off/on, so `touch-on6`/
+  `on7` were almost certainly cold-boot successes.
+- 2026-11-18 (uncommitted when this was written) `SHIM_FTS_LATE_RESET_MS` in
+  `shim/ftstest.c`; committed with these notes.
 
 - ... (one line per patch, filled in as they are created)
 

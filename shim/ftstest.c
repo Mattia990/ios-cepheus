@@ -233,6 +233,31 @@
 #endif
 
 /*
+ * -DSHIM_FTS_CALQUIET_MS=N leaves the I2C bus completely idle for N ms after
+ * the late sense-on, before the poll loop starts.  TWRP waits on the IRQ and
+ * does not touch the bus while the chip runs its ~3 s calibration; every
+ * shim scan that polled the FIFO every 5 ms ghosted or went silent, while
+ * the one quiet (IRQ-only) scan came up clean.  This separates "the chip
+ * fails by itself" from "the host's bit-bang traffic breaks the calibration".
+ */
+#ifndef SHIM_FTS_CALQUIET_MS
+#define SHIM_FTS_CALQUIET_MS 0
+#endif
+
+/*
+ * -DSHIM_FTS_IRQDRIVEN=1 makes the late window read the FIFO only when the
+ * controller's IRQ line asserts (a latched falling edge, or a line that is
+ * still low), exactly like TWRP's threaded handler, instead of reading an
+ * empty FIFO every 5 ms.  Every warm shim scan that polled the empty FIFO
+ * went silent ~3.6 s after sense-on; this separates the chip's own state from
+ * the bit-bang traffic.  The FIFO read errors are logged too, so a silent
+ * window cannot hide a failing read.
+ */
+#ifndef SHIM_FTS_IRQDRIVEN
+#define SHIM_FTS_IRQDRIVEN 0
+#endif
+
+/*
  * -DSHIM_FTS_RETRY_MS runs a second complete bring-up in the same boot: after
  * the first quiet scan, the rails are dropped, held off for this many ms, then
  * brought up and initialized again and scanned again.  It answers whether the
@@ -290,6 +315,22 @@
  */
 #ifndef SHIM_FTS_LATE_TOUCH_MS
 #define SHIM_FTS_LATE_TOUCH_MS 0
+#endif
+
+/*
+ * -DSHIM_FTS_LATE_RESET_MS=N replays TWRP's second init: N ms after the first
+ * sense-on, pulse the reset line *while the chip is scanning* (no sense-off),
+ * wait for controller-ready, read sysinfo, then sense-on again.  This is what
+ * TWRP does from fts_fw_update_auto: EXP_FN_WORK_DELAY_MS=1000 after probe,
+ * fts_fw_update() calls fts_system_reset() and then fts_init_sensing()
+ * (sense-on + setScanMode(ACTIVE,0) / 50 ms / (ACTIVE,1)).  XNU's reset2 and
+ * the shim's SHIM_FTS_RESET2 both reset *before* the first sense-on, and
+ * SHIM_FTS_TWRPSEQ senses off first, so this post-scan reset has never been
+ * tested.  The only behavioural difference between TWRP and XNU/shim may be
+ * that TWRP's warm chip is reset once more after it has calibrated.
+ */
+#ifndef SHIM_FTS_LATE_RESET_MS
+#define SHIM_FTS_LATE_RESET_MS 0
 #endif
 
 /*
@@ -777,7 +818,7 @@ ft_noise_write(const uint8_t noise[4])
 }
 #endif
 
-#ifdef SHIM_FTS_QUIET
+#if defined(SHIM_FTS_QUIET) || SHIM_FTS_IRQDRIVEN
 /*
  * TLMM per-pin interrupt registers (pinctrl-sm8150.c: +0x8 intr_cfg, +0xc
  * intr_status).  Falling edge: detection 2<<2, polarity 1<<1, RAW_STATUS_EN
@@ -1375,7 +1416,7 @@ fts_touch_window(void)
 	static const uint8_t sysinfo[3] = { 0xa6u, 0x00u, 0x00u };
 	static uint8_t si[FT_SYSINFO_SIZE];
 	uint8_t ev[FT_EVENT_SIZE];
-	unsigned edges = 0, logged = 0;
+	unsigned edges = 0, logged = 0, total = 0, readerrs = 0;
 	uint64_t hz = rsr("cntfrq_el0"), t0, beat = 10000;
 
 	log_printf("fts test: late window %u ms\n", SHIM_FTS_LATE_TOUCH_MS);
@@ -1450,36 +1491,161 @@ fts_touch_window(void)
 		}
 	}
 #endif
+#if SHIM_FTS_TWRPFULL
+	/*
+	 * TWRP's full probe -> DRM blank -> unblank order, in one sequence:
+	 *   sense-on, 2 ms, sense-off, 50 ms, sense-on (fts_init_sensing's
+	 *   CONFIG_FTS_FOD_AREA_REPORT block), then 300 ms later the DRM blank
+	 *   stops the scan and sends gesture + low-power + single-tap, 267 ms,
+	 *   then the unblank's panel reinit, system reset and final sense-on
+	 *   (the caller's sense_on below).
+	 * fts-midpanel replayed this without the three blank commands and
+	 * fts-blankcmd ran them before the first sense-on; neither is TWRP's
+	 * order.
+	 */
+	{
+		static const uint8_t gesture[6] = {
+			0xa2u, 0x03u, 0x20u, 0x00u, 0x00u, 0x01u
+		};
+		static const uint8_t lp[2] = { 0xa0u, 0x01u };
+		static const uint8_t single[4] = { 0xc0u, 0x02u, 0x00u, 0x00u };
+		int e1, e2, e3, e4, e5, e6, e7;
+
+		e1 = ft_write_buf(sense_on, sizeof(sense_on));
+		delay_ms(2);
+		e2 = ft_write_buf(sense_off, sizeof(sense_off));
+		delay_ms(50);
+		e3 = ft_write_buf(sense_on, sizeof(sense_on));
+		delay_ms(SHIM_FTS_TWRPFULL_ON_MS);
+		e4 = ft_write_buf(sense_off, sizeof(sense_off));
+		e5 = ft_write_buf(gesture, sizeof(gesture));
+		e6 = ft_write_buf(lp, sizeof(lp));
+		e7 = ft_write_buf(single, sizeof(single));
+		log_printf("fts test: twrpfull on/off/on %d/%d/%d blank %d/%d/%d/%d\n",
+		    e1, e2, e3, e4, e5, e6, e7);
+		delay_ms(SHIM_FTS_TWRPFULL_OFF_MS);
+#if SHIM_FTS_TWRPFULL_PANEL
+		log_printf("fts test: twrpfull panel reinit\n");
+		panel_reinit();
+#endif
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, false);
+		delay_ms(10);
+		ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3, true, true);
+		delay_ms(50);
+		int trerr = ft_wait_ready(500);
+		log_printf("fts test: twrpfull reset ready err=%d\n", trerr);
+		if (trerr) {
+			ft_power_off();
+			return;
+		}
+	}
+#endif
+#if SHIM_FTS_IRQDRIVEN
+	ft_irq_arm();
+	log_printf("fts test: late irq arm cfg=%x st=%x io=%x\n",
+	    rd32(FT_TLMM_SOUTH_PA + FT_GPIO_INTR_CFG(FT_PIN_IRQ)),
+	    ft_irq_status(), ft_irq_level());
+#endif
 	int e = ft_write_buf(sense_on, sizeof(sense_on));
 	log_printf("fts test: late sense on err=%d\n", e);
+#if SHIM_FTS_CALQUIET_MS > 0
+	log_printf("fts test: late calibration quiet %u ms\n",
+	    SHIM_FTS_CALQUIET_MS);
+	delay_ms(SHIM_FTS_CALQUIET_MS);
+#endif
 	t0 = ticks_now();
+#if SHIM_FTS_LATE_RESET_MS > 0
+	int reset_done = 0;
+#endif
 	for (;;) {
 		uint64_t dt = (ticks_now() - t0) * 1000u / hz;
 		if (dt >= SHIM_FTS_LATE_TOUCH_MS)
 			break;
+#if SHIM_FTS_LATE_RESET_MS > 0
+		if (!reset_done && dt >= SHIM_FTS_LATE_RESET_MS) {
+			int rr, sr, se;
+
+			reset_done = 1;
+			log_printf("fts test: late rescan reset t=%u\n",
+			    (unsigned)dt);
+			ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3,
+			    true, false);
+			delay_ms(10);
+			ft_gpio(FT_TLMM_NORTH_PA, FT_PIN_RESET, 0, 3, 3,
+			    true, true);
+			delay_ms(50);
+			rr = ft_wait_ready(500);
+			log_printf("fts test: late rescan ready err=%d\n", rr);
+			if (!rr) {
+				sr = ft_i2c_read(sysinfo, sizeof(sysinfo), si,
+				    FT_SYSINFO_SIZE);
+				log_printf("fts test: late rescan sysinfo err=%d "
+				    "sig=%x/%x\n", sr, si[0], si[1]);
+				se = ft_write_buf(sense_on, sizeof(sense_on));
+				log_printf("fts test: late rescan sense on "
+				    "err=%d\n", se);
+			}
+			/* Count post-reset touch separately from the burst. */
+			logged = 0;
+		}
+#endif
 		if (dt >= beat) {
-			log_printf("fts test: late beat t=%u irqs=%u ev=%u\n",
-			    (unsigned)dt, edges, logged);
+			log_printf("fts test: late beat t=%u irqs=%u ev=%u "
+			    "io=%u err=%u\n", (unsigned)dt, edges, total,
+			    ft_irq_level(), readerrs);
 			beat += 10000;
 		}
-#ifdef SHIM_FTS_QUIET
+#if SHIM_FTS_IRQDRIVEN
+		{
+			bool have = (ft_irq_status() & 1u) != 0;
+
+			if (have)
+				ft_irq_clear();
+			else if (!ft_irq_level())
+				have = true;	/* line still asserted */
+			if (!have) {
+				delay_ms(1);
+				continue;
+			}
+			++edges;
+		}
+#elif defined(SHIM_FTS_QUIET)
 		if (ft_irq_status() & 1u) {
 			++edges;
 			ft_irq_clear();
 		}
 #endif
-		while (!ft_fifo_read(ev) && ev[0] != 0x00u) {
+		for (;;) {
+			int r = ft_fifo_read(ev);
+
+			if (r) {
+				if (readerrs < 8u) {
+					log_printf("fts test: late fifo err t=%u "
+					    "err=%d\n", (unsigned)dt, r);
+				}
+				++readerrs;
+				break;
+			}
+			if (ev[0] == 0x00u)
+				break;
 			if (logged < FT_LOG_MAX) {
 				log_printf("fts test: late ev t=%u ",
 				    (unsigned)dt);
 				ft_log_ev("", ev);
 				++logged;
 			}
+			++total;
 		}
+#if SHIM_FTS_IRQDRIVEN
+		delay_ms(1);
+#else
 		delay_ms(5);
+#endif
 	}
 	log_printf("fts test: late done %u events, %u irqs, %u ms\n",
-	    logged, edges, SHIM_FTS_LATE_TOUCH_MS);
+	    total, edges, SHIM_FTS_LATE_TOUCH_MS);
+	if (readerrs)
+		log_printf("fts test: late fifo errors %u\n", readerrs);
 	e = ft_write_buf(sense_off, sizeof(sense_off));
 	log_printf("fts test: late sense off err=%d\n", e);
 	ft_power_off();
