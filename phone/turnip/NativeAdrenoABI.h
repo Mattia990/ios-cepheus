@@ -9,7 +9,13 @@
  * methods. All fields are little endian; both participants are ARM64. Every
  * array is inside one fixed record so a caller cannot pass a length that
  * disagrees with the storage. Unknown versions, methods and flags are refused
- * rather than ignored. */
+ * rather than ignored.
+ *
+ * This is the ABI the kernel's SweetAccelerator v2 client serves (xnu patch
+ * 0115): version 1, up to 16 IBs per submit. The pinned Turnip backend also
+ * names ABI v2's optional priority and note calls; they are declared below so
+ * it compiles, but the v1 client refuses them and Turnip treats both as hints.
+ * OwnedCoherent is likewise never set, so BO CPU maps stay write-combined. */
 enum {
     NativeAdrenoAbiVersion = 1,
     NativeAdrenoAbiMaxBuffers = 16,
@@ -30,6 +36,8 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
+    NativeAdrenoMethodSetPriority = 17, /* ABI v2; the v1 client refuses it */
+    NativeAdrenoMethodNote = 18,        /* ABI v2; the v1 client refuses it */
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -41,7 +49,9 @@ struct NativeAdrenoAbiParams {
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1,     /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsOwnedCoherent = 2,  /* ABI v2: BOs are IO-coherent; the v1 client never sets this */
+    NativeAdrenoParamsMemoryPressure = 4  /* ABI v2: the system could not give the last BO its memory */
 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
@@ -114,6 +124,20 @@ struct NativeAdrenoAbiBoCpuUnmap {
     uint32_t token;               /* exactly the token returned by map */
     uint32_t reserved;            /* zero */
 };
+/* ABI v2 (optional): the GPU priorities the process's Metal queues asked for. The v1 client refuses
+ * NativeAdrenoMethodSetPriority, so these values never leave Turnip's cache. */
+struct NativeAdrenoAbiPriority {
+    uint32_t foreground;          /* 0..5, 3 refused */
+    uint32_t background;          /* 0..5 */
+};
+/* ABI v2 (optional): a diagnostic note for the kernel's log. The v1 client refuses
+ * NativeAdrenoMethodNote; tu_darwin_note() then returns false. */
+enum { NativeAdrenoNoteWords = 30, NativeAdrenoNotePass = 1, NativeAdrenoNotePipeline = 2 };
+struct NativeAdrenoAbiNote {
+    uint32_t kind;
+    uint32_t count;               /* words used, <= NativeAdrenoNoteWords */
+    uint32_t words[NativeAdrenoNoteWords];
+};
 struct NativeAdrenoAbiQueue {
     uint64_t queue;               /* zero for create, an open id for close */
 };
@@ -155,6 +179,8 @@ static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");
+static_assert(sizeof(NativeAdrenoAbiPriority) == 8, "ABI priority layout");
+static_assert(sizeof(NativeAdrenoAbiNote) == 128, "ABI note layout");
 static_assert(sizeof(NativeAdrenoAbiQueue) == 8, "ABI queue layout");
 static_assert(sizeof(NativeAdrenoAbiQueueReply) == 8, "ABI queue reply layout");
 static_assert(sizeof(NativeAdrenoAbiMetadata) == 80, "ABI metadata layout");

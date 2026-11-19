@@ -53,7 +53,15 @@ case-insensitive, so Mesa's `#include <endian.h>` resolved to it; it has no
 `tools/build-turnip-ios.sh` now passes `-DUTIL_ARCH_LITTLE_ENDIAN=1`,
 `-DUTIL_ARCH_BIG_ENDIAN=0`, `-DHAVE_DLFCN_H` and `-D_DARWIN_C_SOURCE` in the iOS cross
 file; the workflow also probes the SDK and prints the configure/build logs on failure.
-The rerun is pending. Unzip the artifact at the repository root so
+The rerun got past the SDK headers and failed in Turnip's first object: the pinned
+backend (`tu_knl_darwin.cc`) names ABI v2's optional
+`NativeAdrenoMethodSetPriority`/`NativeAdrenoMethodNote`, `NativeAdrenoAbiPriority`,
+`NativeAdrenoAbiNote`, `NativeAdrenoNoteWords` and `NativeAdrenoParamsOwnedCoherent`,
+while `phone/turnip/NativeAdrenoABI.h` and kernel patch 0115 still serve ABI v1.
+The header now declares those v2-only names as optional hints but keeps the wire
+version at 1 and 16 IBs per submit, so the existing v1 test kernel can be reused:
+the kernel refuses priority/notes and Turnip treats them as hints. The next rerun
+is pending. Unzip the artifact at the repository root so
 `phone/metal2/out/SweetMetal2.bundle` lands where `tools/cepheus-metal2-install.sh`
 expects it.
 
