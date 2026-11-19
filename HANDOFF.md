@@ -5,6 +5,61 @@ Last updated **2026-11-19** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### GPU: Metal draws SpringBoard on the A640 (2026-11-19)
+
+**The CI-built Metal stack works on the phone.** Run `metal2`
+(`tools/cepheus-run.sh metal2 -G -k logs/runs/touch-0148-quiet/kernel -s 900 -a
+"sweetmtl=2 sweetusb=2 cepheustouchpanel=0 cepheustouchpanelpor=0"`; the existing
+ABI v1 test kernel, no rebuild needed). `SweetMetal2.bundle` was installed in
+`/System/Library/Extensions/` over the kernel file server (`tools/cepheus-files.py`,
+TCP 2223; keep the on-phone copy and the local one in `phone/metal2/out/` in sync) and
+the four GPU firmware files came from `research/gpu/fw/` (`-G` → `sweetgpu=1`).
+
+Two on-phone files are required before the first boot:
+
+- `/var/local/mtl2-clients` = `* -chronod` (the plugin gives backboardd a device
+  always; SpringBoard must be listed or the unlock swipe does nothing; chronod stays
+  on the CPU path, as on ios-flame);
+- `/var/local/m2v-cache/` mode 777 (Turnip's shader cache; on this ticket `/var/local`
+  itself was missing on the first boot, and backboardd's `mkdir` then failed with
+  `PermissionDenied`, so the frontend refused the device and the UI silently stayed
+  on the CPU).
+
+`logs/runs/metal2/mtl2-latest.log` and `xnu.txt`:
+
+- `MTL2[57 backboardd]: device Turnip Adreno (TM) 640 in 1142 ms
+  (cache /var/local/m2v-cache/backboardd)`; SpringBoard's device in 2124 ms;
+  both loaded `libvulkan_freedreno` (non-zero base) and adopted
+  `MTLTextureImplementation`; `_MTLDevice is 528 bytes`;
+- `chronod: not listed` as intended;
+- kernel side: ~550 submits per 5 s, `0 missed`, GPU busy 19 % (7–41 %), mean submit
+  1.7–4.2 ms, `present: 4500 frames, avg cache clean ~515 us, GPU blit ~13 us` —
+  300 frames per 5 s = 60 fps, pool 85–97 MB;
+- no `vkpipe` failure (`failed=0`), only one
+  `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` warning; nothing in the
+  plugin's problem list beyond the "no device answer" hints (gpuCoreCount,
+  maxVertexAmplificationCount, …) that the frontend logs and falls back on.
+
+Icon artwork and text render through Turnip (different from the CPU path in several
+places); the phone warms up during the first boot because 71 pipelines ≈ 5.3 s of
+on-phone compilation plus continuous 60 fps presenting. With `/var/local/m2v-cache`
+populated the next boot is expected to be cooler; this was not measured yet.
+
+The first Metal boot (`metal1`) is the negative control: backboardd was refused
+(`ShaderCache ... PermissionDenied`) and SpringBoard/PosterBoard/chronod were all
+"not listed", so the UI stayed on the CPU even though the plugin had loaded.
+
+**Open:** (1) a USB-side `SWEET USB: busERR ... SMMU cb fsr 400 far 0x154fe6f0aaaba`
+line appears every ~5 s in `metal2`; USB and the file server keep working and the GPU
+path reports no fault, so this is tracked separately. (2) dropbear did not start this
+boot (port 22 closed, `kex_exchange_identification` reset through FlameBridge); the
+on-phone key was updated over the file server instead. Check
+`/var/local/dropbear.log` on the next SSH-capable boot. (3) `FlameBridge` did not
+pick up `tools/flamebridge/ports.txt` (only the 2222 default forward was listening);
+set `CEPH_FILES_HOST=192.168.7.2` to bypass it meanwhile. The run was ended early
+(`tools/cepheus-cmd.py reboot`) to stop the heat; the runner then does its rescue
+boot and leaves the phone in TWRP.
+
 ### GPU: the Adreno 640 comes up and presents the panel (2026-11-19)
 
 **First GPU run on cepheus, and it works.** `tools/cepheus-run.sh gpu1 -G
