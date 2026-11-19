@@ -1,0 +1,20 @@
+diff --git a/src/util/u_endian.h b/src/util/u_endian.h
+index fd78642..663e76f 100644
+--- a/src/util/u_endian.h
++++ b/src/util/u_endian.h
+@@ -27,6 +27,15 @@
+ #ifndef U_ENDIAN_H
+ #define U_ENDIAN_H
+ 
++/*
++ * The iOS SDK ships CarbonCore's Endian.h. On the case-insensitive
++ * filesystems macOS uses, <endian.h> resolves to it, and it does not
++ * define __BYTE_ORDER. Darwin has machine/endian.h, so use that branch.
++ */
++#if defined(__APPLE__)
++#undef HAVE_ENDIAN_H
++#endif
++
+ #ifdef HAVE_ENDIAN_H
+ #include <endian.h>
+ 

@@ -44,8 +44,16 @@ metal2vulkan 720ef1ce. Until then the GPU result above is present-only.
 patch series (pinned to UniXNU `8542980d`) and `phone/metal2/bridge/patches`, builds
 Turnip, the bridge and `SweetMetal2.bundle`, and uploads `sweetmetal2-ios16` with the
 bundle and `m2vtest`/`vktest`. All 24 Mesa patches and all 8 bridge patches apply cleanly
-to the pins above (checked locally on 2026-11-19). It has not run yet: the workflow needs
-pushing and a manual dispatch. Unzip the artifact at the repository root so
+to the pins above (checked locally on 2026-11-19).
+
+The first CI run (2026-11-19, Xcode 16.4 / iPhoneOS18.5 SDK) failed in Turnip's first
+compile. The SDK ships CarbonCore `Endian.h`, and the runner's filesystem is
+case-insensitive, so Mesa's `#include <endian.h>` resolved to it; it has no
+`__BYTE_ORDER`, leaving `UTIL_ARCH_*` unset and hiding every `PIPE_FORMAT_*` alias.
+`tools/build-turnip-ios.sh` now passes `-DUTIL_ARCH_LITTLE_ENDIAN=1`,
+`-DUTIL_ARCH_BIG_ENDIAN=0`, `-DHAVE_DLFCN_H` and `-D_DARWIN_C_SOURCE` in the iOS cross
+file; the workflow also probes the SDK and prints the configure/build logs on failure.
+The rerun is pending. Unzip the artifact at the repository root so
 `phone/metal2/out/SweetMetal2.bundle` lands where `tools/cepheus-metal2-install.sh`
 expects it.
 

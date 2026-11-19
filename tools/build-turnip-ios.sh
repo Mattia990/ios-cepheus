@@ -22,6 +22,13 @@ if [ "$target" = ios ]; then
 	sdk=$(xcrun --sdk iphoneos --show-sdk-path)
 	cross=$T/ios16.cross
 	flags="'-target', 'arm64-apple-ios16.0', '-isysroot', '$sdk', '-fstack-protector-strong'"
+	# The iOS SDK ships CarbonCore's Endian.h, and the runner's filesystem is
+	# case-insensitive, so Mesa's <endian.h> finds Endian.h instead of
+	# machine/endian.h. CI applies tools/patches/mesa-ios-endian.patch to stop
+	# that include; state the target endianness here too so a local build
+	# without the patch still works. HAVE_DLFCN_H is likewise set because the
+	# SDK header check is unreliable under the cross compiler.
+	defs="'-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0', '-DHAVE_DLFCN_H', '-D_DARWIN_C_SOURCE'"
 	cat > "$cross" <<EOF
 [binaries]
 c = '$(xcrun --sdk iphoneos --find clang)'
@@ -38,9 +45,9 @@ endian = 'little'
 [properties]
 needs_exe_wrapper = true
 [built-in options]
-c_args = [$flags]
-cpp_args = [$flags]
-objc_args = [$flags]
+c_args = [$flags, $defs]
+cpp_args = [$flags, $defs]
+objc_args = [$flags, $defs]
 c_link_args = [$flags]
 cpp_link_args = [$flags]
 objc_link_args = [$flags]
