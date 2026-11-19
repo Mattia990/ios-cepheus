@@ -39,6 +39,16 @@ Building the stack therefore needs the toolchain first: Xcode, Homebrew meson/ni
 rustup 1.98 + the `aarch64-apple-ios` target, Mesa 85fda3b3 + UniXNU's patches and
 metal2vulkan 720ef1ce. Until then the GPU result above is present-only.
 
+**Build path chosen: GitHub Actions.** `.github/workflows/userland.yml` is a manual
+`workflow_dispatch` job that installs the toolchain on `macos-15`, applies UniXNU's Mesa
+patch series (pinned to UniXNU `8542980d`) and `phone/metal2/bridge/patches`, builds
+Turnip, the bridge and `SweetMetal2.bundle`, and uploads `sweetmetal2-ios16` with the
+bundle and `m2vtest`/`vktest`. All 24 Mesa patches and all 8 bridge patches apply cleanly
+to the pins above (checked locally on 2026-11-19). It has not run yet: the workflow needs
+pushing and a manual dispatch. Unzip the artifact at the repository root so
+`phone/metal2/out/SweetMetal2.bundle` lands where `tools/cepheus-metal2-install.sh`
+expects it.
+
 ### Warm: TWRP's full order, a quiet calibration, and the early scan all fail (2026-11-18)
 
 **TWRP's exact probe → DRM blank → unblank order is not enough.** `fts-twrpfull.img`

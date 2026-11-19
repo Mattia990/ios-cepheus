@@ -11,7 +11,8 @@ SRC=$ROOT/work/metal2vulkan
 OUT=$ROOT/work/m2v-bridge
 target=${1:-ios}
 mkdir -p "$OUT"
-LLVM_AS=/opt/homebrew/opt/llvm/bin/llvm-as
+LLVM_AS="$(brew --prefix llvm)/bin/llvm-as"
+[ -x "$LLVM_AS" ] || { echo "llvm-as not found (brew install llvm)" >&2; exit 1; }
 "$LLVM_AS" -o "$OUT/runtime_examples.air" "$SRC/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$OUT/function_constant.air" "$SRC/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
 cat > "$OUT/Cargo.toml" <<EOF

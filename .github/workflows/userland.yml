@@ -1,0 +1,146 @@
+name: userland
+
+# SweetMetal2 (metal2vulkan + Turnip) for iOS 16 arm64.
+#
+# This runs on a macOS runner because the kernel CI already covers XNU and the
+# userland needs an iPhoneOS SDK, which the development Mac does not have.
+# Dispatch it by hand, then copy the artifact's phone/metal2/out/ into the
+# checkout and install with tools/cepheus-metal2-install.sh.
+#
+# Sources are pinned exactly as ios-flame's Metal bring-up used them:
+#   Mesa 85fda3b3 + UniXNU's Mesa patch series (their adreno-compiler-inputs.json)
+#   metal2vulkan 720ef1ce + phone/metal2/bridge/patches
+# The bundle is a build artifact and is never committed or released.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  metal2:
+    # macos-15 has Xcode 15/16 and rustup; the iOS 16 deployment target comes
+    # from work/userland/bin/ios-cc, not from the runner's default SDK.
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MESA_SHA: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+      UNIXNU_SHA: 8542980d02b4d2cc5c32ee3542de1760b2562aac
+      METAL2VULKAN_SHA: 720ef1ce9ae2a2068999a8675717418b9416283e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          brew install bison flex llvm glslang
+          python3 -m venv work/turnip/venv
+          work/turnip/venv/bin/pip install --upgrade pip
+          work/turnip/venv/bin/pip install meson ninja mako pyyaml packaging
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup target add aarch64-apple-ios --toolchain 1.98.0
+
+      - name: iOS compiler wrapper
+        run: |
+          set -euxo pipefail
+          mkdir -p work/userland/bin
+          cat > work/userland/bin/ios-cc <<'EOF'
+          #!/bin/sh
+          exec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"
+          EOF
+          chmod +x work/userland/bin/ios-cc
+          work/userland/bin/ios-cc --version | head -1
+
+      - name: Fetch Mesa, UniXNU patches and metal2vulkan
+        run: |
+          set -euo pipefail
+
+          # Mesa at UniXNU's pin. Try the Chromium mirror first (fast), then
+          # freedesktop's GitLab; both accept a fetch by full commit id.
+          git init -q work/turnip/mesa
+          git -C work/turnip/mesa remote add origin https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa
+          if ! git -C work/turnip/mesa fetch --depth 1 origin "$MESA_SHA"; then
+            git -C work/turnip/mesa remote set-url origin https://gitlab.freedesktop.org/mesa/mesa
+            git -C work/turnip/mesa fetch --depth 1 origin "$MESA_SHA"
+          fi
+          git -C work/turnip/mesa checkout -q --detach FETCH_HEAD
+
+          # UniXNU's Mesa patch series, in the order their own input manifest
+          # gives (patches/mesa/* are fetched one by one; no full checkout).
+          mkdir -p work/unixnu
+          curl -fsSL "https://raw.githubusercontent.com/UniXNU/UniXNU/$UNIXNU_SHA/scripts/data/adreno-compiler-inputs.json" \
+            -o work/unixnu/inputs.json
+          python3 - <<'PY' > work/unixnu/mesa-patches.txt
+          import json
+          with open("work/unixnu/inputs.json") as f:
+              print("\n".join(json.load(f)["patches"]))
+          PY
+          while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            name=$(basename "$p")
+            curl -fsSL "https://raw.githubusercontent.com/UniXNU/UniXNU/$UNIXNU_SHA/$p" -o "work/unixnu/$name"
+            git -C work/turnip/mesa apply "$PWD/work/unixnu/$name"
+          done < work/unixnu/mesa-patches.txt
+          echo "applied $(wc -l < work/unixnu/mesa-patches.txt) Mesa patches"
+
+          # metal2vulkan plus the bridge patches that carry our kernel's
+          # 8 MB memory blocks and padded writers (phone/metal2/bridge/patches).
+          git init -q work/metal2vulkan
+          git -C work/metal2vulkan remote add origin https://github.com/steelbrain/metal2vulkan.git
+          git -C work/metal2vulkan fetch --depth 1 origin "$METAL2VULKAN_SHA"
+          git -C work/metal2vulkan checkout -q --detach FETCH_HEAD
+          for p in phone/metal2/bridge/patches/*.patch; do
+            git -C work/metal2vulkan apply "$PWD/$p"
+          done
+
+      - name: Build Turnip
+        run: tools/build-turnip-ios.sh
+
+      - name: Build metal2vulkan bridge
+        run: tools/build-m2v-bridge.sh
+
+      - name: Build SweetMetal2.bundle
+        run: phone/metal2/build.sh
+
+      - name: Build on-device Turnip test
+        run: phone/turnip/build.sh
+
+      - name: Check artifacts
+        run: |
+          set -euo pipefail
+          B=phone/metal2/out/SweetMetal2.bundle
+          for f in SweetMetal2 libvulkan_freedreno.dylib Info.plist _CodeSignature/CodeResources; do
+            test -s "$B/$f" || { echo "missing $B/$f" >&2; exit 1; }
+          done
+          echo "--- weak imports in SweetMetal2 (must be absent from iOS 16)"
+          nm -m "$B/SweetMetal2" | grep "weak external" | grep -v "dynamically looked up" || true
+          echo "--- weak imports in Turnip"
+          nm -m "$B/libvulkan_freedreno.dylib" | grep "weak external" || true
+          echo "--- sizes"
+          du -sh "$B" "$B/libvulkan_freedreno.dylib" phone/turnip/out/* work/m2v-bridge/ios/*.a
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweetmetal2-ios16
+          # Unzip at the repository root: the paths are kept relative to it, so
+          # phone/metal2/out/SweetMetal2.bundle lands where the install script
+          # expects it.
+          path: |
+            phone/metal2/out/SweetMetal2.bundle
+            phone/metal2/out/m2vtest
+            phone/turnip/out/
+            work/m2v-bridge/ios/libnative_metal_bridge.a
+            work/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: userland-logs
+          path: |
+            work/turnip/configure-ios.log
+            work/turnip/build-ios.log
+            work/m2v-bridge/build-ios.log
+          if-no-files-found: warn

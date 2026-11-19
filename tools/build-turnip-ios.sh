@@ -10,7 +10,8 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 T=$ROOT/work/turnip
 target=${1:-ios}
-export PATH=$T/venv/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH
+BREW=$(brew --prefix)
+export PATH="$T/venv/bin:$BREW/opt/bison/bin:$BREW/opt/flex/bin:$PATH"
 opts="-Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=darwin -Dtu-darwin-abi-dir=$ROOT/phone/turnip
  -Dplatforms=macos -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled
  -Dllvm=disabled -Dshared-glapi=disabled -Dxmlconfig=disabled -Dshader-cache=disabled -Dtools= -Dbuild-tests=false
