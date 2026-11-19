@@ -5,6 +5,42 @@ Last updated **2026-11-19** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### WiFi: the port is staged, wland is the last piece (2026-11-19)
+
+The kernel side of ios-flame's WiFi (patch 0123, from ios-topaz/darwin-redwood) is
+already in the test kernel and in the ADT: `logs/runs/metal3/xnu.txt` has
+`cepheus wlan: /dev/wlan ready (major 20)` at 29.9 s and `exec wifid` at 32.3 s, and
+`work/boot/cepheus-hi.adt` contains `cepheus,wcn3990`. `tools/mkadt.py` publishes that
+`wlan` node because com.apple.wifid's `_LimitLoadToDeviceTree` needs it; the kernel's
+`bsd/dev/cepheus_wlan.c` + `iokit/Kernel/arm/RedwoodWLAN.cpp` provide en0 and the
+Apple80211 requests.
+
+What is missing is userland: `phone/wifi` (wland, the WCN3990 driver from flame, via
+`bsd/dev/cepheus_wlan.c`'s `/dev/wlan`) is not built or installed. The phone's own
+modem partition confirms the same chip family as flame: `wlanmdsp.mbn` reports
+`WLAN.HL.3.0.c2` (WCN3990) and ships 33 `bdwlan.*` variants plus `bdwlan.bin`. The
+modem image (`modem.mdt` + bNN), `modemr.jsn`, `modemuw.jsn`, `wlanmdsp.mbn` and
+`bdwlan-cepheus.bin` (= stock `bdwlan.bin`; `wlfw.c` looks for the cepheus name) are
+extracted into `work/wifi/fw/modem/`, and the rmtfs partition copies (`modemst1`,
+`modemst2`, `fsg`, `fsc`) into `work/wifi/fw/rmtfs/` — both gitignored, the rmtfs
+images carry the IMEI and stay phone-only. `tools/cepheus-wifi-fw-extract.sh`
+reproduces the extraction from TWRP.
+
+New tooling (2026-11-19):
+- `.github/workflows/wlan.yml` builds `phone/wifi` on macos-15 with the iPhoneOS SDK
+  (`workflow_dispatch`, artifact `wland-ios16`); this Mac has no iOS SDK.
+- `tools/cepheus-wifi-install.sh` uploads `wland` to `/var/local/bin`, the firmware to
+  `/var/local/fw/modem`, the rmtfs images to `/var/local/fw/rmtfs`, an optional
+  `--conf` file to `/var/local/wlan.conf` (mode 600, never in the repo), and adds the
+  `org.iosonpixel.wland` launchd job (`wland auto`, once per boot, log
+  `/var/local/wland.log`, off with `/var/local/wland.off` or `sweetwifi=0`).
+
+Next: dispatch the wlan workflow, put the artifact at `phone/wifi/out/wland`, boot
+iOS (the file server must be up), run the installer, reboot, and join the network from
+Settings (cold boot has touch). Then watch `/var/local/wland.log` and record the result.
+Open: the BDF choice (`bdwlan.bin` first; the bXX variants are untested), and the WLAN
+SMMU stream 0x640 is flame's value — cepheus' stock DT was not checked.
+
 ### GPU: cold Metal boot, and real apps get A640 devices (2026-11-19)
 
 Run `metal3` is the same command as `metal2` with `-s 240`. The phone had been
