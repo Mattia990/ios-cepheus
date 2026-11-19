@@ -1,0 +1,47 @@
+name: wlan
+
+# wland, the WCN3990 driver that runs in userland on the phone (phone/wifi).
+#
+# Like the Metal stack it needs an iPhoneOS SDK, which the development Mac does
+# not have. Dispatch it by hand, then copy the artifact's wland into
+# phone/wifi/out/ and install with tools/cepheus-wifi-install.sh.
+#
+# The firmware (modem.mdt/bNN, wlanmdsp.mbn, the BDF) is NOT built here: it is
+# taken from the phone's own modem partition and stays on the phone.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  wland:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: iOS compiler wrapper
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          mkdir -p work/userland/bin
+          cat > work/userland/bin/ios-cc <<'EOF'
+          #!/bin/sh
+          exec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"
+          EOF
+          chmod +x work/userland/bin/ios-cc
+          work/userland/bin/ios-cc --version | head -1
+
+      - name: Build wland
+        run: |
+          set -euxo pipefail
+          phone/wifi/build.sh
+          file phone/wifi/out/wland
+          lipo -info phone/wifi/out/wland
+          codesign -dv phone/wifi/out/wland 2>&1 | head -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wland-ios16
+          path: phone/wifi/out/wland
+          if-no-files-found: error
