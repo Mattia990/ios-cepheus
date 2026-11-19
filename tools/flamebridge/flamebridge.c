@@ -7,9 +7,12 @@
  * silently). This bundle has the key, so macOS asks once; connections to
  * 127.0.0.1 are never blocked.
  *
- * TCP forwards come from ports.txt next to the app ("LOCAL REMOTE" per
- * line; default 2222 -> 22) so the app never needs rebuilding: a rebuild
- * changes its code signature and macOS may forget the permission.
+ * TCP forwards: the built-in defaults below (SSH 2222 -> 22, the file
+ * server 2223, lockdown 62078) can be replaced by ports.txt next to the app
+ * ("LOCAL REMOTE" per line) so the app never needs rebuilding: a rebuild
+ * changes its code signature and macOS may forget the permission. Keep the
+ * defaults complete: macOS can deny the app access to ports.txt (TCC on
+ * ~/Documents), and a launchd-started app then sees only the defaults.
  *   UDP 127.0.0.1:5142 -> 192.168.7.2:5141 (command server, unicast)
  *
  * Log: /tmp/flamebridge.log. Start: open tools/flamebridge/FlameBridge.app
@@ -41,6 +44,16 @@ static FILE *open_ports_file(void)
 		char *s = strrchr(path, '/');
 		if (s)
 			*s = 0;
+	}
+	/*
+	 * macOS TCC protects ~/Documents, ~/Desktop and ~/Downloads: a launchd-started
+	 * app that opens a file there can block on a permission prompt that never gets
+	 * answered, so it would start no forwards at all. The built-in default set is
+	 * complete for this checkout, so skip the file instead of risking that.
+	 */
+	if (strstr(path, "/Documents/") || strstr(path, "/Desktop/") || strstr(path, "/Downloads/")) {
+		errno = 0;
+		return NULL;
 	}
 	strlcat(path, "/ports.txt", sizeof(path));
 	return fopen(path, "r");
@@ -150,8 +163,8 @@ int main(void)
 		lg("probe: %s (%d)\n", strerror(errno), errno);
 	else
 		lg("probe: sent to %s:%d\n", PHONE, 9);
-	static struct fwd fwds[32] = { { 2222, 22 } };
-	unsigned nf = 1;
+	static struct fwd fwds[32] = { { 2222, 22 }, { 2223, 2223 }, { 62078, 62078 } };
+	unsigned nf = 3;
 	FILE *pf = open_ports_file();
 	if (pf) {
 		nf = 0;
@@ -163,6 +176,9 @@ int main(void)
 				fwds[nf++].rport = r;
 			}
 		fclose(pf);
+	} else {
+		lg("ports.txt: %s (%d); using the built-in forwards\n",
+		    errno ? strerror(errno) : "skipped in a TCC-protected folder", errno);
 	}
 	pthread_t t;
 	for (unsigned i = 0; i < nf; i++) {
