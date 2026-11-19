@@ -5,6 +5,30 @@ Last updated **2026-11-19** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### GPU: cold Metal boot, and real apps get A640 devices (2026-11-19)
+
+Run `metal3` is the same command as `metal2` with `-s 240`. The phone had been
+power-cycled in fastboot, so this was a cold boot and **touch works**: the
+`cepheustouchpanel=0 cepheustouchpanelpor=0` args only skip the panel SET_ON replay and
+keep VCI/reset powered (patch 0144); they do not disable the touchscreen. `SWEET FTS`
+read `sysinfo fw=0060 chip0=3639 ... res=2339x1079` at 50.5 s and the UI accepted input,
+which is the expected cold-boot behaviour from the touch work.
+
+Devices this boot: backboardd 1062 ms, SpringBoard 2793 ms,
+`com.apple.WebKit.GPU` 418 ms, MobileSafari 2163 ms, MobileSMS 993 ms, each with its own
+`/var/local/m2v-cache/<process>`; chronod still excluded. GPU 206–300 submits per 5 s,
+`0 missed`, busy 25–30 %, pool peak 306 MB, 2100 frames presented; `SWEET FB` drops to
+0 swaps once the screen is idle (4 clients), so present is event-driven, not a fixed
+60 fps loop. Safari and Messages were actually browsed on the GPU.
+
+One bridge gap surfaced: `MTL2[342 MobileSMS]: MISSING NBCommandBuffer
+-presentDrawable:`. Nothing else failed in this log.
+
+The cold/warm shader-cache comparison was not made: the telemetry marker was removed to
+cut the heat after `metal2`, so there are no `vkpipe` counters here, and the device-init
+times above do not include Turnip's lazy pipeline compiles. Logs: `logs/runs/metal3/`
+(`xnu.txt`, `shim.txt`, `mtl2-latest.log`).
+
 ### GPU: Metal draws SpringBoard on the A640 (2026-11-19)
 
 **The CI-built Metal stack works on the phone.** Run `metal2`
