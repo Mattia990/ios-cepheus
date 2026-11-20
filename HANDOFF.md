@@ -35,20 +35,35 @@ stub.
 Open: SSH is over USB only for now; Wi-Fi is up but not joined because
 `/var/local/wlan.conf` is missing (see the Wi-Fi section).
 
-### WiFi: radio up, but wlan.conf is missing (2026-11-20)
+### WiFi: Settings join works; internet and SSH over Wi-Fi (2026-11-20)
 
 Cold boot `wifi12-cold.img` (`cepheusreboot=1200 sweetmtl=2 sweetusb=2
-cepheustouchpanel=0 cepheustouchpanelpor=0`) with SSH installed. `wland` is
-alive and the modem/WLAN firmware came up: `WLFW ... FW READY`, `mission mode
-on`, HTC/WMI, then scans every ~15 s (10-11 networks, e.g. `TP-Link_3355_5G`).
-`radio: stats: state 0, tx 0 ...` and no `net: will join` line: `/var/local/
-wlan.conf` is absent (no backup either), so `read_conf()` returned before
-setting `conf_ssid`. `wifid` is running and `bridge: scan done` reaches it;
-`netsvc` still publishes only `ue0` (USB) because `en0` is not joined.
+cepheustouchpanel=0 cepheustouchpanelpor=0`) with SSH installed. `wland`
+brought up the modem/WLAN firmware (`FW READY`, `mission mode on`, HTC/WMI)
+and scanned every ~15 s. Joining `TP-Link_3355_5G` from the Settings app then
+worked through the Apple80211 path:
 
-Next: recreate `/var/local/wlan.conf` on the phone (`ssid=...`, `psk=...`,
-mode 600), reboot into fastboot and boot the image again; `wland` reads it at
-startup. Then check the L2 join, `en0`, DHCP/configd and the grey icon.
+```
+bridge: join 'TP-Link_3355_5G' (PMK) -> 0
+radio: join: auth reply status 0
+radio: join: assoc reply status 0 aid 19
+radio: *** joined 'TP-Link_3355_5G' ***
+bridge: link up 'TP-Link_3355_5G'
+radio: stats: state 5, tx 2995 ... rx 3437 ...
+```
+
+`en0` became the primary interface with the manual service `CB3347B7...`
+(`192.168.1.100/24`, router `192.168.1.1`, DNS `8.8.8.8`/`8.8.4.4`).
+`nettest` on the phone resolved `apple.com` to `17.253.144.10`, connected to
+TCP 80 and got `HTTP 200`; `ssh -i work/userland/ssh/id_ed25519
+root@192.168.1.100` also works. So Wi-Fi is fully usable at L3, and no
+`wlan.conf` is needed when Settings supplies the credentials.
+
+Open: automatic DHCP. `preferences.plist` still has two DHCP services
+(`E2805781...`, `65C6796F...`) plus the active manual `CB3347B7...`, and no
+`PrimaryService`/`ServiceOrder`; configd keeps the manual service. The status
+bar icon may still be grey, and the `Preferences` crash/16.7.16 Apple80211
+layouts are unchanged.
 
 ### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
 
