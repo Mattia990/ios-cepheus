@@ -5,6 +5,26 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### SSH: CI build for dropbear, dash and toybox (2026-11-20)
+
+SSH was gone because `/var/local/bin/{dropbearmulti,dash,toybox}` were no longer on the
+phone, and this Mac has no iPhoneOS SDK. `.github/workflows/ssh.yml` (commit `a5fabad`)
+builds dropbear 2024.86, dash 0.5.12, toybox 0.8.12 (best-effort) and `phone/tools` for
+iOS 16 arm64; `tools/cepheus-install-ssh.sh` installs the artifact over the file server.
+
+The first run failed in dropbear's bundled libtommath with
+`./tommath_class.h:1322:10: fatal error: 'dbmalloc.h' file not found`. `CFLAGS` passed on
+the `make` command line overrides libtommath's `CFLAGS += -I../ -I../src`, so the include
+path to dropbear's `src/dbmalloc.h` disappeared. The workflow no longer passes `CFLAGS`
+to `make`; `configure` already puts `-O2` in the Makefile. A native build of the same
+tree with that make line succeeds, and dash's cross-configure path
+(`--host=aarch64-apple-darwin`) was checked locally.
+
+Pending: push and dispatch `ssh`; unzip `ssh-ios16` at the repository root; then
+`CEPH_FILES_HOST=192.168.1.100 tools/cepheus-install-ssh.sh`, reboot, and
+`ssh -i work/userland/ssh/id_ed25519 root@192.168.1.100`. The phone was at
+`192.168.1.100` when this was written.
+
 ### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
 
 `wifi7` (cold boot, race-uploaded `wland`) got the modem and WLAN firmware up: Settings

@@ -114,8 +114,11 @@ jobs:
             $OPENPTY_FLAGS \
             CFLAGS="-O2"
 
+          # Do not pass CFLAGS on the make command line: libtommath adds its
+          # include paths with CFLAGS +=, which a command-line CFLAGS would
+          # suppress (the failure is "dbmalloc.h file not found").
           make -j"$(sysctl -n hw.ncpu)" \
-            CC="$IOS_CC" CFLAGS="-O2" \
+            CC="$IOS_CC" \
             PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" \
             MULTI=1 SCPPROGRESS=1
 
