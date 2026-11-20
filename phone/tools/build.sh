@@ -24,8 +24,11 @@ build() {	# NAME SOURCE [FLAGS...]
 	fi
 }
 for c in membw pstack psx; do build $c $c.c; done
-for m in expt exq nettest openapp oslog prefs runmigrator; do build $m $m.m -fobjc-arc -framework Foundation; done
+for m in nettest openapp oslog prefs; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 build netsvc netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
+# One-off probes. runmigrator needs com.apple.migrationpluginwrapper's entitlements
+# at runtime (not in git); a failed probe should not hide the tools above.
+for m in expt exq runmigrator; do build $m $m.m -fobjc-arc -framework Foundation || echo "skipped $m"; done
 ls -l out

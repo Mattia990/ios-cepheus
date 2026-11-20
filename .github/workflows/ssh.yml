@@ -1,0 +1,195 @@
+name: ssh
+
+# dropbear + dash + toybox, and the on-phone tools, for iOS 16 arm64.
+#
+# Like wland and SweetMetal2 this needs an iPhoneOS SDK, which the development
+# Mac does not have. Dispatch it by hand, download the artifact, and unzip it
+# at the repository root: work/userland/stage/ and phone/tools/out/ land where
+# tools/cepheus-install-ssh.sh expects them. Then install over the file server
+# and reboot.
+#
+# Sources are pinned by version and SHA-256. Dropbear is built with pubkey auth
+# only (the key in work/userland/ssh), without utmp/wtmp/lastlog/syslog/shadow,
+# and with the /dev/ptmx pty path when the SDK has no openpty(). Toybox uses
+# its macOS config, the closest tested subset to iOS.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ssh:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      DROPBEAR_VERSION: 2024.86
+      DROPBEAR_SHA256: e78936dffc395f2e0db099321d6be659190966b99712b55c530dd0a1822e0a5e
+      DASH_VERSION: 0.5.12
+      DASH_SHA256: 6a474ac46e8b0b32916c4c60df694c82058d3297d8b385b74508030ca4a8f28a
+      TOYBOX_VERSION: 0.8.12
+      TOYBOX_SHA256: ad88a921133ae2231d9f2df875ec0bd42af4429145caea7d7db9e02208a6fd2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          # toybox's make.sh needs GNU sed and GNU readlink.
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install gnu-sed coreutils || true
+          mkdir -p work/userland/bin work/userland/stage work/userland/src
+          cat > work/userland/bin/ios-cc <<'EOF'
+          #!/bin/sh
+          exec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"
+          EOF
+          chmod +x work/userland/bin/ios-cc
+          work/userland/bin/ios-cc --version | head -1
+          echo "IOS_CC=$PWD/work/userland/bin/ios-cc" >> "$GITHUB_ENV"
+
+      - name: Fetch sources
+        run: |
+          set -euxo pipefail
+          cd work/userland/src
+          curl -fsSLO "https://matt.ucc.asn.au/dropbear/releases/dropbear-$DROPBEAR_VERSION.tar.bz2"
+          echo "$DROPBEAR_SHA256  dropbear-$DROPBEAR_VERSION.tar.bz2" | shasum -a 256 -c -
+          curl -fsSLO "http://gondor.apana.org.au/~herbert/dash/files/dash-$DASH_VERSION.tar.gz"
+          echo "$DASH_SHA256  dash-$DASH_VERSION.tar.gz" | shasum -a 256 -c -
+          curl -fsSLO "https://landley.net/toybox/downloads/toybox-$TOYBOX_VERSION.tar.gz"
+          echo "$TOYBOX_SHA256  toybox-$TOYBOX_VERSION.tar.gz" | shasum -a 256 -c -
+          tar xf "dropbear-$DROPBEAR_VERSION.tar.bz2"
+          tar xf "dash-$DASH_VERSION.tar.gz"
+          tar xf "toybox-$TOYBOX_VERSION.tar.gz"
+
+      - name: Build dropbear
+        run: |
+          set -euxo pipefail
+          cd "work/userland/src/dropbear-$DROPBEAR_VERSION"
+
+          # openpty() lives in libutil on macOS; iOS may not have it. Configure
+          # cannot test /dev/ptmx while cross-compiling, so pick the fallback
+          # explicitly when the SDK has no openpty().
+          cat > /tmp/openpty.c <<'EOF'
+          #include <sys/ioctl.h>
+          #include <termios.h>
+          extern int openpty(int *, int *, char *, struct termios *, struct winsize *);
+          int main(void) { return openpty(0, 0, 0, 0, 0); }
+          EOF
+          PTMX=""
+          if "$IOS_CC" /tmp/openpty.c -o /tmp/openpty 2>/dev/null || \
+             "$IOS_CC" /tmp/openpty.c -lutil -o /tmp/openpty 2>/dev/null; then
+            echo "openpty: available"
+            OPENPTY_FLAGS=""
+          else
+            echo "openpty: not available; using /dev/ptmx"
+            OPENPTY_FLAGS="--disable-openpty"
+            PTMX="#define USE_DEV_PTMX 1"
+          fi
+
+          # Pubkey auth only: the install script copies work/userland/ssh/id_ed25519.pub
+          # to /var/root/.ssh/authorized_keys. This avoids crypt() and PAM.
+          cat > localoptions.h <<EOF
+          #define DROPBEAR_SVR_PASSWORD_AUTH 0
+          #define DROPBEAR_CLI_PASSWORD_AUTH 0
+          #define DROPBEAR_SVR_PAM_AUTH 0
+          #define DROPBEAR_SVR_PUBKEY_AUTH 1
+          #define DROPBEAR_CLI_PUBKEY_AUTH 1
+          $PTMX
+          EOF
+
+          CC="$IOS_CC" ./configure \
+            --host=aarch64-apple-darwin \
+            --enable-bundled-libtom \
+            --disable-zlib \
+            --disable-syslog \
+            --disable-shadow \
+            --disable-lastlog \
+            --disable-utmp \
+            --disable-utmpx \
+            --disable-wtmp \
+            --disable-wtmpx \
+            --disable-pututline \
+            --disable-pututxline \
+            --disable-loginfunc \
+            --disable-pam \
+            $OPENPTY_FLAGS \
+            CFLAGS="-O2"
+
+          make -j"$(sysctl -n hw.ncpu)" \
+            CC="$IOS_CC" CFLAGS="-O2" \
+            PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" \
+            MULTI=1 SCPPROGRESS=1
+
+          file dropbearmulti
+          lipo -info dropbearmulti
+          codesign -f -s - dropbearmulti
+          cp dropbearmulti ../../stage/dropbearmulti
+
+      - name: Build dash
+        run: |
+          set -euxo pipefail
+          cd "work/userland/src/dash-$DASH_VERSION"
+          CC="$IOS_CC" ./configure --host=aarch64-apple-darwin CFLAGS="-O2"
+          make -j"$(sysctl -n hw.ncpu)" CC="$IOS_CC"
+          file src/dash
+          lipo -info src/dash
+          codesign -f -s - src/dash
+          cp src/dash ../../stage/dash
+
+      - name: Build toybox
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          export PATH="$(brew --prefix gnu-sed)/libexec/gnubin:$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          cd "work/userland/src/toybox-$TOYBOX_VERSION"
+          make macos_defconfig
+          make -j"$(sysctl -n hw.ncpu)" CC="$IOS_CC" CFLAGS="-O2"
+          file toybox
+          lipo -info toybox
+          codesign -f -s - toybox
+          cp toybox ../../stage/toybox
+
+      - name: Build on-phone tools
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          phone/tools/build.sh
+          ls -l phone/tools/out
+
+      - name: Check artifacts
+        run: |
+          set -euxo pipefail
+          for f in work/userland/stage/dropbearmulti work/userland/stage/dash; do
+            test -s "$f"
+            file "$f"
+            lipo -info "$f"
+            codesign -dv "$f" 2>&1 | head -5
+          done
+          if [ -s work/userland/stage/toybox ]; then
+            file work/userland/stage/toybox
+            lipo -info work/userland/stage/toybox
+            codesign -dv work/userland/stage/toybox 2>&1 | head -5
+          else
+            echo "warning: toybox was not built; SSH will have dash and /bin/ps only" >&2
+          fi
+          ls -l work/userland/stage phone/tools/out || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-ios16
+          # Unzip at the repository root: the paths are kept relative to it.
+          path: |
+            work/userland/stage/
+            phone/tools/out/
+          if-no-files-found: warn
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-logs
+          path: |
+            work/userland/src/dropbear-*/config.log
+            work/userland/src/dash-*/config.log
+            work/userland/src/toybox-*/generated/build.sh
+          if-no-files-found: warn
