@@ -40,15 +40,15 @@ Open: SSH is over USB only for now; Wi-Fi is up but not joined because
 Cold boot `wifi12-cold.img` (`cepheusreboot=1200 sweetmtl=2 sweetusb=2
 cepheustouchpanel=0 cepheustouchpanelpor=0`) with SSH installed. `wland`
 brought up the modem/WLAN firmware (`FW READY`, `mission mode on`, HTC/WMI)
-and scanned every ~15 s. Joining `TP-Link_3355_5G` from the Settings app then
+and scanned every ~15 s. Joining `<ssid>` from the Settings app then
 worked through the Apple80211 path:
 
 ```
-bridge: join 'TP-Link_3355_5G' (PMK) -> 0
+bridge: join '<ssid>' (PMK) -> 0
 radio: join: auth reply status 0
 radio: join: assoc reply status 0 aid 19
-radio: *** joined 'TP-Link_3355_5G' ***
-bridge: link up 'TP-Link_3355_5G'
+radio: *** joined '<ssid>' ***
+bridge: link up '<ssid>'
 radio: stats: state 5, tx 2995 ... rx 3437 ...
 ```
 
@@ -68,12 +68,12 @@ layouts are unchanged.
 ### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
 
 `wifi7` (cold boot, race-uploaded `wland`) got the modem and WLAN firmware up: Settings
-scanned 8-17 networks and a join to `TP-Link_3355_5G` completed at L2:
+scanned 8-17 networks and a join to `<ssid>` completed at L2:
 
 ```
 radio: join: auth reply status 0
 radio: join: assoc reply status 0 aid 19
-radio: *** joined 'TP-Link_3355_5G' ***
+radio: *** joined '<ssid>' ***
 bridge: link up
 ```
 
