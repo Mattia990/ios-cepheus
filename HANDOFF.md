@@ -20,7 +20,12 @@ to `make`; `configure` already puts `-O2` in the Makefile. A native build of the
 tree with that make line succeeds, and dash's cross-configure path
 (`--host=aarch64-apple-darwin`) was checked locally.
 
-Pending: push and dispatch `ssh`; unzip `ssh-ios16` at the repository root; then
+The next run (`beaab50`) built and signed `dropbearmulti` and `dash`, and all
+`phone/tools` binaries. The optional toybox step failed: toybox's macOS code includes
+`<sys/disk.h>`, which the iOS SDK does not have. The `ssh-ios16` artifact was uploaded
+anyway (267,163 bytes, artifact 14619539596); toybox is not needed for SSH.
+
+Pending: download `ssh-ios16` from the run and unzip it at the repository root; then
 `CEPH_FILES_HOST=192.168.1.100 tools/cepheus-install-ssh.sh`, reboot, and
 `ssh -i work/userland/ssh/id_ed25519 root@192.168.1.100`. The phone was at
 `192.168.1.100` when this was written.
