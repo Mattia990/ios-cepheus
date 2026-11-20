@@ -75,16 +75,23 @@ interaction with the 0148 kernel, so the backlight alone is not proven.
 Differences to isolate: `sweetbl=0`, the 0149/0150 battery backend, and
 `sweetrtcoff`.
 
-Next image is ready: `work/boot/runs/daemons-off-bl0/daemons-off-bl0.img`
-(kernel 0150, same rootfs/firmware, `sweetbl=0`; SHA-256 starts
-`a16280078f`). Boot it, open Preferences and swipe for ~20 s, and compare
-the same `SWEET FB`/`SWEET GPU` counters. If it is still slow, A/B the
-0148 `metal2` kernel with the same cmdline to check for a 0149/0150
-regression; that image is also ready at
+The `sweetbl=0` control (`work/boot/runs/daemons-off-bl0/daemons-off-bl0.img`,
+SHA-256 starts `a16280078f`) booted at 22:06 with **no `SWEET BL` lines
+at all**, so the fake backlight was completely absent. It is still slow:
+the boot buckets ran 14-26 fps, Safari launched at 21.6 fps, and twelve
+injected short swipes plus three 1.5 s vertical swipes held **25-26 fps**.
+The GPU was not the limit: it presented 125 frames in 5 s while the
+renderer submitted 250-340, present calls took ~1 ms, and the GPU was
+3-6% busy. Total CPU was ~15% (`kernel_task` 11%); `vmd`/`dasd` stayed
+gone. So the fake backlight is **not** the frame-pacing cause.
+
+The exact `metal2` image that reached 58 fps on 2026-11-19 was booted
+again at 22:13 on the current rootfs (`logs/runs/metal2-recheck/`) to
+separate a 0149/0150 regression from a phone-state change. A 0148
+kernel with the current cmdline is also staged at
 `work/boot/runs/daemons-off-bl0-0148/daemons-off-bl0-0148.img`
-(SHA-256 starts `cdb7393e`). The phone was off/disconnected at 22:03
-and the pack was last seen at 37%; wall-charge before the next cold
-boot.
+(SHA-256 starts `cdb7393e`). The pack was last seen at 37%; the PC port
+does not charge it.
 
 ### Battery: 0149 booted; 0150 fixes the charging flag (2026-11-20)
 
