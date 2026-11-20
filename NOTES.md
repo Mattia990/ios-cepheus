@@ -350,6 +350,14 @@ Of the ~81 original ios-sweet kernel patches:
   the re-arm returns the chip to `43 05 01` and suppresses the second force cal, but the
   AFE reports no contacts at all, so `43 05 01` is a normal post-sense-on status, not
   proof that the chip is scanning for fingers.
+- 0148 wifi: give the status bar a real signal level. The Apple80211 link event now
+  fills `snr`/`noise` from the joined BSS RSSI (`rssi + 95` and a `-95` dBm noise floor,
+  the same assumption as `phone/wifi/radio.c`), and `GET NOISE` (type 17) answers with
+  the same 52-byte `apple80211_noise_data` layout as `GET RSSI` instead of
+  `EOPNOTSUPP`. `wifid` asks for both on link-up; with `noise=0` its SNR was negative
+  and SpringBoard drew one arc. `sta_state()` also refreshes the joined BSS RSSI from
+  `cepheus_wlan_link_bss()` now, so `GET RSSI` and later link events report the signal
+  as heard rather than the join-time copy. Patch written; not yet built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

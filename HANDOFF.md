@@ -5,6 +5,88 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### WiFi: keepalive and fallback both verified on a cold boot (2026-11-20)
+
+Cold-booted `work/boot/runs/wifi12-cold.img` with the new `wland`
+(231,072 bytes, commit `d527dd1`, keepalive + fallback). There is no
+`/var/local/wlan.conf`, so the network was joined manually from Settings.
+The join completed 33.7 s after `wland` started and the radio reached
+`state 5`.
+
+Keepalive: `radio: keepalive: 1 sent` at 93.7 s, exactly 60 s after the
+join. The counter logs only every fifth frame, so one line is expected.
+The link stayed `state 5` through 300.9 s associated, past the 231 s point
+where the AP had previously sent its inactivity deauth; there was no
+deauth or link-loss event and RX/TX kept moving. That is the keepalive
+fix working.
+
+Fallback: sent `SIGUSR1` to `wland` at 338.6 s. It logged
+`join: link lost (asked)` and `bridge: link down`, and `wifid` did not
+rejoin. At 358.6 s `wland` logged
+`bridge: wifid has not rejoined in 20 s: joining again`, rejoined at
+359.0 s, and logged `bridge: fallback join joined`. The radio returned to
+`state 5`, `en0` kept its DHCP lease, and `nettest` got an HTTPS `200`
+from apple.com. So the fallback path works and does not fight `wifid`
+when `wifid` acts first.
+
+Status-bar icon: the fallback link-down/up made it white (the initial
+join alone left it grey), so the colour was a stale status update, not
+DHCP or the `IEEE80211` service type. A respring then showed one of the
+three signal arcs, so the remaining problem is the signal level. The
+Apple80211 link event carries the right dBm (`rssi=-54`) but leaves
+`snr`/`noise` at zero, and `wifid`'s `GET NOISE` (type 17) returns
+`EOPNOTSUPP`; `phone/wifi/radio.c` derives RSSI as firmware SNR over a
+`-95` dBm floor, so patch 0148 fills `snr = rssi + 95`, sets
+`noise = -95` in the link event, and implements `GET NOISE` with the
+same 52-byte layout as `GET RSSI`; `sta_state()` also refreshes the RSSI from the
+BSS wland is hearing, instead of the join-time copy. Not built yet. SpringBoard still
+lacks `com.apple.private.corewifi.bssid`/`...wifi-info` and its
+`GET BSSID` is refused, but that is not what greys the icon. Next:
+build/boot with 0148, join manually, and check for three arcs; in the
+live `wifid` log, expect `LinkChangeStatus ... rssi=-54 noise=-95` and
+`GET NOISE ... return 0`, not `-3903`. Also open: auto-join (a manual
+Settings join is still needed after each boot), the `wland` prefetch
+fix, and the toybox `<sys/disk.h>` build failure.
+
+### WiFi: killing configd took L3 down; cold boot recovered it (2026-11-20)
+
+To test whether the grey status-bar icon was caused by the active Wi-Fi
+service being typed `Ethernet`, `CB3347B7.../Interface/Type` in
+`preferences.plist` was changed to `IEEE80211` and configd (`pid 35`) was
+killed with `SIGTERM` to apply it. That was a mistake: the USB gadget stayed
+enumerated, but the phone sent no packets at all, lost its USB and LAN
+addresses, and answered neither IPv6 link-local pings nor the kernel
+command server on UDP 5141. configd did not come back on its own.
+
+A cold boot of `work/boot/runs/wifi12-cold.img` restored it. `configd` is
+`pid 35` again, USB `ue0` has its address back (service
+`5EE7C0DE...`), and configd rewrote the plist
+(1752 bytes) keeping `CB3347B7.../Interface/Type = IEEE80211`, so the new
+service definition parses.
+
+After a manual join from Settings, configd selected a DHCP service
+(`4120C2A2...`), and `en0` got a `/24` lease from
+the router, with the router's name servers. SSH to that address works, and
+`nettest` got an HTTPS `HTTP 200` from apple.com. So the
+`Type=IEEE80211` service change fixed the automatic DHCP/primary-service
+selection; if only the manual service was keeping the address before, that
+is now gone.
+
+The status-bar icon was still grey at this point; the newer section above
+has the follow-up. `wifid` does send SpringBoard the network-name,
+access-point, link-change and join-status events. SpringBoard's request
+for the access point's address is refused with `PROCESS NOT ALLOWED FOR
+REQUEST TYPE` (`Preferences` is allowed), but that denial is not what
+keeps the icon grey.
+
+Do not kill configd to apply a preferences change. Reboot, or use
+`scutil`/`prefs` so configd owns the update. The new `wland`
+(231,072 bytes, SHA-256 `0c7cfa6f...`, with `radio: keepalive` and
+`bridge: fallback join`) is installed; it takes effect on the next boot.
+
+Open: the signal-level/icon work above and whether the DHCP service
+persists across a link drop/rejoin. Keepalive and fallback are verified.
+
 ### SSH: restored; dash had a weak strchrnul import (2026-11-20)
 
 SSH is back on the phone over USB. `.github/workflows/ssh.yml` builds dropbear
@@ -22,9 +104,10 @@ The first working dropbear exposed two bugs:
   `system.c`) and fails the build if any weak imports remain. Rebuilt dash:
   SHA-256 `80348063...`, no weak imports, `_strchrnul` defined locally.
 
-Installed over `CEPH_FILES_HOST=192.168.7.2`; `/bin/sh` is a symlink to the new
-dash, and the installer now removes it before relinking so upgrades work.
-Verified with `ssh -i work/userland/ssh/id_ed25519 root@192.168.7.2 'echo SSH_OK'`.
+Installed over the phone's USB file-server address; `/bin/sh` is a symlink to
+the new dash, and the installer now removes it before relinking so upgrades
+work. Verified with `ssh -i work/userland/ssh/id_ed25519` to the phone's USB
+address.
 
 The root image is very minimal: `/bin/ps` and `/bin/df` exist, but there is no
 `ls`, `cat`, `kill`, `sleep`, `date`, `launchctl` or `chmod`; toybox would fill
@@ -53,16 +136,18 @@ radio: stats: state 5, tx 2995 ... rx 3437 ...
 ```
 
 `en0` became the primary interface with the manual service `CB3347B7...`
-(`192.168.1.100/24`, router `192.168.1.1`, DNS `8.8.8.8`/`8.8.4.4`).
-`nettest` on the phone resolved `apple.com` to `17.253.144.10`, connected to
-TCP 80 and got `HTTP 200`; `ssh -i work/userland/ssh/id_ed25519
-root@192.168.1.100` also works. So Wi-Fi is fully usable at L3, and no
+(a `/24` address, the router, and the configured name servers).
+`nettest` on the phone resolved `apple.com`, connected to TCP 80 and got
+`HTTP 200`; `ssh -i work/userland/ssh/id_ed25519` to the phone's LAN
+address also works. So Wi-Fi is fully usable at L3, and no
 `wlan.conf` is needed when Settings supplies the credentials.
 
-Open: automatic DHCP. `preferences.plist` still has two DHCP services
-(`E2805781...`, `65C6796F...`) plus the active manual `CB3347B7...`, and no
-`PrimaryService`/`ServiceOrder`; configd keeps the manual service. The status
-bar icon may still be grey, and the `Preferences` crash/16.7.16 Apple80211
+At the time, open: automatic DHCP. `preferences.plist` still had two DHCP
+services (`E2805781...`, `65C6796F...`) plus the active manual
+`CB3347B7...`, and no `PrimaryService`/`ServiceOrder`; configd kept the
+manual service. This was later fixed by the `Type=IEEE80211` change in the
+newer section. The status bar icon was still grey then; the newer section
+has the signal-level follow-up. The `Preferences` crash/16.7.16 Apple80211
 layouts are unchanged.
 
 ### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
@@ -193,7 +278,7 @@ modem image (`modem.mdt` + bNN), `modemr.jsn`, `modemuw.jsn`, `wlanmdsp.mbn` and
 `bdwlan-cepheus.bin` (= stock `bdwlan.bin`; `wlfw.c` looks for the cepheus name) are
 extracted into `work/wifi/fw/modem/`, and the rmtfs partition copies (`modemst1`,
 `modemst2`, `fsg`, `fsc`) into `work/wifi/fw/rmtfs/` — both gitignored, the rmtfs
-images carry the IMEI and stay phone-only. `tools/cepheus-wifi-fw-extract.sh`
+images carry device identifiers and stay phone-only. `tools/cepheus-wifi-fw-extract.sh`
 reproduces the extraction from TWRP.
 
 New tooling (2026-11-19):
@@ -286,7 +371,7 @@ boot (port 22 closed, `kex_exchange_identification` reset through FlameBridge); 
 on-phone key was updated over the file server instead. Check
 `/var/local/dropbear.log` on the next SSH-capable boot. (3) `FlameBridge` did not
 pick up `tools/flamebridge/ports.txt` (only the 2222 default forward was listening);
-set `CEPH_FILES_HOST=192.168.7.2` to bypass it meanwhile. The run was ended early
+set `CEPH_FILES_HOST` to the phone's USB address to bypass it meanwhile. The run was ended early
 (`tools/cepheus-cmd.py reboot`) to stop the heat; the runner then does its rescue
 boot and leaves the phone in TWRP.
 

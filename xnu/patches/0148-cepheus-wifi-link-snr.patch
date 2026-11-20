@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/cepheus_sta.c b/bsd/dev/cepheus_sta.c
+--- a/bsd/dev/cepheus_sta.c
++++ b/bsd/dev/cepheus_sta.c
+@@ -149,6 +149,12 @@
+ 				state->bss.elements_length = t.elements_length < REDWOOD_STA_ELEMENTS_MOST ? t.elements_length : REDWOOD_STA_ELEMENTS_MOST;
+ 				memcpy(state->bss.elements, t.elements, state->bss.elements_length);
+ 			}
++		} else {
++			/* the copy above is from the join; wland keeps hearing the AP, so take the signal as it is now */
++			struct cepheus_wlan_bss t;
++			if (cepheus_wlan_link_bss(&t) && memcmp(t.bssid, state->bss.bssid, 6) == 0 && t.rssi < 0) {
++				state->bss.rssi = t.rssi;
++			}
+ 		}
+ 	}
+ 	state->last_error = sta_last_error;
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -433,6 +433,16 @@
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 17: {                              /* the noise floor: the same shape as RSSI, in dBm */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { -95 }, .all = -95,
++			     .each_ext = { -95 }, .all_ext = -95 };
++
++		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+@@ -648,6 +658,11 @@
+ 		if (state != NULL) {
+ 			redwood_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1 && state->bss.rssi < 0) {
++				/* radio.c hears SNR over a -95 dBm floor: give the icon the same noise figure */
++				link.snr = (uint16_t)(state->bss.rssi + 95);
++				link.noise = (uint16_t)(int16_t)-95;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
