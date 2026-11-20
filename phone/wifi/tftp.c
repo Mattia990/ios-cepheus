@@ -34,9 +34,43 @@ static struct xfer {
 } xf[TFTP_XFERS];
 int tftp_verbose = 0;
 
+/*
+ * The modem reads wlanmdsp.mbn over TFTP with a 200 ms timeout. The first
+ * cold read of the 4 MB file can take longer than that: the client times out,
+ * and on a cold boot the modem has ended in ERR-FATAL before WLFW is up.
+ * Read it once before the service is registered, so the transfer is served
+ * from the buffer cache.
+ */
+static void prefetch_fw(void)
+{
+	char p[256];
+	snprintf(p, sizeof(p), FW_DIR "/wlanmdsp.mbn");
+	int fd = open(p, O_RDONLY);
+	if (fd < 0)
+		return;
+	char *b = malloc(65536);
+	if (!b) {
+		close(fd);
+		return;
+	}
+	uint64_t t0 = link_ms();
+	size_t total = 0;
+	for (;;) {
+		ssize_t r = read(fd, b, 65536);
+		if (r <= 0)
+			break;
+		total += (size_t)r;
+	}
+	free(b);
+	close(fd);
+	printf("tftp: prefetched %s (%zu bytes, %llu ms)\n", p, total,
+	       (unsigned long long)(link_ms() - t0));
+}
+
 int tftp_init(void)
 {
 	mkdir(RW_DIR, 0755);
+	prefetch_fw();
 	if (qrtr_new_server(TFTP_SERVICE, 1, 0, TFTP_PORT))
 		return -1;
 	printf("tftp: serving at %u:%x\n", QRTR_NODE_APPS, TFTP_PORT);
