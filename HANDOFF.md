@@ -5,6 +5,33 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### UI: exact metal2 image is still ~28 fps; the lag is longstanding (2026-11-20)
+
+Re-booted `work/boot/runs/metal2.img` (the exact 2026-11-19 image whose
+log showed 58 fps; SHA-256 starts `6d70ec73`) on the current rootfs. A
+1200-step 12 s vertical swipe at t=971 held **28.0-28.8 fps** for the
+first 10 s (the page then stopped moving), 136-144 presents per 5 s. In
+Preferences, launch plus a swipe gave **29.2-34.0 fps**. Backboardd
+telemetry showed about 3 submits per presented frame, commits 23-29 ms
+apart, commit-to-complete 10-11 ms, and the GPU 31-37% busy. `psx` during
+a long swipe read backboardd 115.6%, Preferences 8.8%, SpringBoard 5.2%.
+This rules out 0148-vs-0150, the 0149/0150 battery backend, `sweetbl=0`,
+and `sweetrtcoff` as the frame-pacing cause. The user confirms it is not
+a regression: "It isn't a regression, i always saw it and feel it
+laggy". The old 58 fps buckets alternate with ~23 fps and contain no
+`SWEET CMD` swipe records, so they were an idle animation, not touch
+interaction. Treat ~28 fps as the longstanding baseline.
+
+Also verified: `/System/Library/Extensions/SweetMetal2.bundle/{SweetMetal2,
+libvulkan_freedreno.dylib}` are byte-identical to `phone/metal2/out`
+(SHA-256 `74df7865...` and `441a16d4...`), so the `nm`/pstack symbols
+match the running build.
+
+Next: wall-charge and cool the phone before trusting more timings (the
+pack was 37% at 3.146 V on the non-charging PC port), then decide whether
+the ~25 ms frame is CPU-side submit cost or a compositor-wide 30 fps
+cadence.
+
 ### Battery: 0150 booted; vmd + dasd/coreduetd cause the heat (2026-11-20)
 
 Booted `work/boot/runs/battery-0150/battery-0150.img` (kernel SHA-256
@@ -69,11 +96,11 @@ but presentation is paced/blocked.
 
 The fake `AppleARMBacklight` is active on this boot (`sweetbl` default
 1): `SWEET BL: setProperties backlight-level = 8128`, then DCS `0x51`
-at display-on. However, the earlier `metal2` run also published
-`AppleARMBacklight` (at 15.5 s) and still reached **58 fps** under real
-interaction with the 0148 kernel, so the backlight alone is not proven.
-Differences to isolate: `sweetbl=0`, the 0149/0150 battery backend, and
-`sweetrtcoff`.
+at display-on. The earlier `metal2` run also published
+`AppleARMBacklight` (at 15.5 s), but its **58 fps** buckets were an idle
+animation (no `SWEET CMD` swipe records), not touch interaction; see the
+exact-image recheck above. `sweetbl=0`, the 0149/0150 battery backend,
+and `sweetrtcoff` are therefore all ruled out as the pacing cause.
 
 The `sweetbl=0` control (`work/boot/runs/daemons-off-bl0/daemons-off-bl0.img`,
 SHA-256 starts `a16280078f`) booted at 22:06 with **no `SWEET BL` lines
