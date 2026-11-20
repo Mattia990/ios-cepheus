@@ -1,0 +1,524 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 6a121c5..d97eb8a 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -4,7 +4,9 @@
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+- * Also the PM8150 RTC (peripheral 0x60) for the time of day (SweetPlatformExpert.cpp).
++ * Also the PM8150 RTC (peripheral 0x60) for the time of day
++ * (SweetPlatformExpert.cpp) and the PM8150B (USID 2) FG-gen4/charger
++ * registers for the cepheus battery backend (SweetBattery.cpp).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -19,6 +21,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
+ #define SP_NO_APID 0xffffu
++#define SP_USID_PM8150B 2u
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+@@ -87,11 +90,25 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks and the RTC (0x60); keys retain their own lanes. */
++	/* Restrict access to the battery blocks, the RTC (0x60) and the
++	 * PM8150B charger/fuel gauge (USID 2); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {
++	if (!sp_ready || !out || addr > 0xffffu) {
++		return -1;
++	}
++	if (sid == 0) {
++		if (peripheral != 0x10 && peripheral != 0x11 &&
++		    peripheral != 0x12 && peripheral != 0x13 &&
++		    peripheral != 0x48 && peripheral != 0x60) {
++			return -1;
++		}
++	} else if (sid == SP_USID_PM8150B) {
++		/* CHGR/DCDC/BATIF/USBIN and FG batt-soc/batt-info. */
++		if (!((peripheral >= 0x10 && peripheral <= 0x13) ||
++		    peripheral == 0x40 || peripheral == 0x41)) {
++			return -1;
++		}
++	} else {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..65bccdf 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,5 +1,8 @@
+ /*
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
++ * cepheus: read-only PM8150B FG-gen4 + SMB5 polling every 30 seconds; the
++ * fuel gauge reports its own SOC, so the percentage is the firmware's, not a
++ * voltage estimate. cepheusbattery=0 turns the probe off.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
+@@ -16,6 +19,29 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
++/* PM8150B (SPMI USID 2) FG-gen4 and SMB5 registers, from the vendor fg-reg.h
++ * and smb5-reg.h. Every access below is an SPMI observer read. */
++#define PM8150B_USID         2
++#define FG_BATT_SOC_SUBTYPE  0x4005
++#define FG_MONOTONIC_SOC     0x4009
++#define FG_MONOTONIC_SOC_CP  0x400a
++#define FG_BATT_SOC_RT_STS   0x4010
++#define FG_SOC_READY         0x02
++#define FG_BATT_INFO_SUBTYPE 0x4105
++#define FG_BATT_SYS_BATT     0x4107
++#define FG_BATT_MISSING_HW   0x04
++#define FG_BATT_TEMP_LSB     0x4150
++#define FG_BATT_TEMP_MSB     0x4151
++#define FG_BATT_VBATT_LSB    0x41a0
++#define FG_BATT_VBATT_CP     0x41a6
++#define FG_BATT_IBATT_LSB    0x41a2
++#define FG_BATT_IBATT_CP     0x41a8
++#define SMB5_CHARGER_STATUS  0x1006
++#define SMB5_CHARGER_ERROR   0x1007
++#define SMB5_CHARGER_TEMP    0x100d
++#define SMB5_POWER_PATH      0x110b
++#define SMB5_USBIN_STATUS    0x1310
++
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+ public:
+@@ -26,16 +52,26 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fCepheus, fHaveSample;
++	unsigned fDesignMah;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	    bool capable, bool charging, bool full, bool measured, bool currentValid,
++	    bool socEstimated, int tempCenti, bool tempValid);
+ 	void poll(void);
++	void pollCepheus(void);
++	bool probeCepheus(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
++	static bool readByte(unsigned sid, unsigned address, uint8_t *value);
++	static bool readWord(unsigned sid, unsigned address, uint16_t *value);
++	static bool readShadowByte(unsigned sid, unsigned address, unsigned shadow,
++	    uint8_t *value);
++	static bool readShadowWord(unsigned sid, unsigned address, unsigned shadow,
++	    uint16_t *value);
++	static unsigned scaleMsoc(unsigned raw);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -51,7 +87,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fCepheus = fHaveSample = false;
++	fDesignMah = 5020;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -99,19 +136,21 @@ SweetBattery::putBool(const char *key, bool value)
+ 
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++    bool capable, bool charging, bool full, bool measured, bool currentValid,
++    bool socEstimated, int tempCenti, bool tempValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units; powerd computes C*100/M. */
++	const unsigned capacity = (fDesignMah * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(fDesignMah);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+-	setAtWarnLevel(false);
+-	/* An uncalibrated voltage curve must not assert a critical shutdown. */
+-	setAtCriticalLevel(false);
++	setAtWarnLevel(measured && !socEstimated && percent <= 20);
++	/* Only the calibrated fuel-gauge SOC may assert a critical shutdown; a
++	 * voltage estimate or sag must not. */
++	setAtCriticalLevel(measured && !socEstimated && percent <= 2);
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+@@ -119,15 +158,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", fDesignMah);
++	putNumber("DesignCapacity", fDesignMah);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C. */
++	putNumber("Temperature", (UInt32)tempCenti);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+-	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatterySOCEstimated", socEstimated);
++	putBool("SweetBatteryTemperatureEstimated", !tempValid);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +176,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, fDesignMah, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -151,26 +190,33 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		legacy->release();
+ 	}
+ 	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
+-	int mode = measured ? 1 : 0;
++	int mode = measured ? (fCepheus ? 2 : 1) : 0;
+ 	if (mode != fLastMode) {
+-		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++		const char *backend = fCepheus ? "PM8150B FG-gen4" :
++		    (measured ? "PM6150 / estimated SOC" : "static fallback");
++		IOLog("SWEET BATTERY: %s, %u%% %umV %dmA external=%d charging=%d temp=%d\n",
++		    backend, percent, mv, ma, external, charging, tempCenti);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
++bool
++SweetBattery::readByte(unsigned sid, unsigned address, uint8_t *value)
++{
++	return sweet_spmi_read(sid, address, value) == 0;
++}
++
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::readWord(unsigned sid, unsigned address, uint16_t *value)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (!readByte(sid, address, &lo) ||
++		    !readByte(sid, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -183,6 +229,47 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
++/* FG-gen4 keeps a second copy of each sample register (the _CP register);
++ * use it for the torn-read check the vendor driver performs. */
++bool
++SweetBattery::readShadowByte(unsigned sid, unsigned address, unsigned shadow,
++    uint8_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t first, second;
++		if (!readByte(sid, address, &first) ||
++		    !readByte(sid, shadow, &second)) {
++			return false;
++		}
++		if (first == second) {
++			*value = first;
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
++SweetBattery::readShadowWord(unsigned sid, unsigned address, unsigned shadow,
++    uint16_t *value)
++{
++	for (unsigned attempt = 0; attempt < 4; ++attempt) {
++		uint8_t lo, hi, shadowLo, shadowHi;
++		if (!readByte(sid, address, &lo) ||
++		    !readByte(sid, address + 1, &hi) ||
++		    !readByte(sid, shadow, &shadowLo) ||
++		    !readByte(sid, shadow + 1, &shadowHi)) {
++			return false;
++		}
++		if (lo != shadowLo || hi != shadowHi) {
++			continue;
++		}
++		*value = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
++		return true;
++	}
++	return false;
++}
++
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -203,15 +290,181 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* fg_get_msoc: 0 and 255 are the endpoints; 1..254 scale to 1..99. */
++unsigned
++SweetBattery::scaleMsoc(unsigned raw)
++{
++	if (raw >= 255) {
++		return 100;
++	}
++	if (raw == 0) {
++		return 0;
++	}
++	return ((raw - 1) * 98 + 126) / 253 + 1;
++}
++
++bool
++SweetBattery::probeCepheus(void)
++{
++	uint8_t subtype;
++	/* PM8150B is SPMI USID 2. Require both FG-gen4 subtypes so an
++	 * unrelated or stale APID cannot masquerade as the fuel gauge. */
++	if (!readByte(PM8150B_USID, FG_BATT_SOC_SUBTYPE, &subtype)) {
++		IOLog("SWEET BATTERY: PM8150B batt-soc read failed (USID 2)\n");
++		return false;
++	}
++	if (subtype != 0x10) {
++		IOLog("SWEET BATTERY: PM8150B batt-soc subtype %#x, expected 0x10\n",
++		    (unsigned)subtype);
++		return false;
++	}
++	if (!readByte(PM8150B_USID, FG_BATT_INFO_SUBTYPE, &subtype)) {
++		IOLog("SWEET BATTERY: PM8150B batt-info read failed\n");
++		return false;
++	}
++	if (subtype != 0x11) {
++		IOLog("SWEET BATTERY: PM8150B batt-info subtype %#x, expected 0x11\n",
++		    (unsigned)subtype);
++		return false;
++	}
++	return true;
++}
++
++void
++SweetBattery::pollCepheus(void)
++{
++	uint8_t subtype, missing, msoc = 0;
++	uint16_t rawVoltage = 0, rawCurrent = 0;
++	unsigned mv = 0;
++	int tempCenti = 2500;
++	unsigned rawTempOut = 0;
++	bool socValid, voltageValid, currentValid, tempValid;
++
++	/* The fuel-gauge algorithm runs on the PMIC; this only observes it. */
++	bool hardware = readByte(PM8150B_USID, FG_BATT_SOC_SUBTYPE, &subtype) &&
++	    subtype == 0x10 &&
++	    readByte(PM8150B_USID, FG_BATT_INFO_SUBTYPE, &subtype) &&
++	    subtype == 0x11 &&
++	    readByte(PM8150B_USID, FG_BATT_SYS_BATT, &missing) &&
++	    !(missing & FG_BATT_MISSING_HW);
++	if (!hardware) {
++		fHaveSample = false;
++		publish(100, 4200, 0, true, true, false, true, false, false,
++		    false, 2500, false);
++		return;
++	}
++	socValid = false;
++	uint8_t socReady = 0;
++	bool socFlag = readByte(PM8150B_USID, FG_BATT_SOC_RT_STS, &socReady) &&
++	    (socReady & FG_SOC_READY);
++	bool msocRead = readShadowByte(PM8150B_USID, FG_MONOTONIC_SOC,
++	    FG_MONOTONIC_SOC_CP, &msoc);
++	socValid = socFlag && msocRead;
++	voltageValid = readShadowWord(PM8150B_USID, FG_BATT_VBATT_LSB,
++	    FG_BATT_VBATT_CP, &rawVoltage);
++	if (voltageValid) {
++		unsigned sample = (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u);
++		if (sample >= 2800 && sample <= 4600) {
++			mv = sample;
++		} else {
++			voltageValid = false;
++		}
++	}
++	/* A transient read failure keeps the last good sample (30 s old); only a
++	 * missing PMIC or the first failed probe publishes the 100% fallback. */
++	if (!socValid && !voltageValid) {
++		if (!fHaveSample) {
++			publish(100, 4200, 0, true, true, false, true, false, false,
++			    false, 2500, false);
++		}
++		return;
++	}
++
++	currentValid = readShadowWord(PM8150B_USID, FG_BATT_IBATT_LSB,
++	    FG_BATT_IBATT_CP, &rawCurrent);
++	int ma = 0;
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ?
++		    (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* FG negative while charging; IOPMPowerSource positive while charging. */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++
++	tempValid = false;
++	uint8_t tempLsb, tempMsb;
++	if (readByte(PM8150B_USID, FG_BATT_TEMP_LSB, &tempLsb) &&
++	    readByte(PM8150B_USID, FG_BATT_TEMP_MSB, &tempMsb)) {
++		/* 0.25 K/LSB on the FG-gen3/4 BATT_INFO block; the gen4 SRAM
++		 * copy is 0.25 C/LSB. Accept a plausible reading from either
++		 * encoding, rejecting uninitialised zero. */
++		int rawTemp = ((int)(tempMsb & 0x07u) << 8) | tempLsb;
++		rawTempOut = (unsigned)rawTemp;
++		int kelvin = rawTemp * 25 - 27315;
++		int celsiusRaw = (rawTemp & 0x400) ? rawTemp - 2048 : rawTemp;
++		int celsius = celsiusRaw * 25;
++		if (rawTemp != 0 && kelvin >= -2000 && kelvin <= 8000) {
++			tempCenti = kelvin;
++			tempValid = true;
++		} else if (rawTemp != 0 && celsius >= -2000 && celsius <= 8000) {
++			tempCenti = celsius;
++			tempValid = true;
++		}
++	}
++
++	bool external = false, capable = false, charging = false, full = false;
++	uint8_t usbin = 0, path = 0, charger = 0, error = 0, thermal = 0;
++	bool usbValid = readByte(PM8150B_USID, SMB5_USBIN_STATUS, &usbin);
++	bool pathValid = readByte(PM8150B_USID, SMB5_POWER_PATH, &path);
++	bool statusValid = readByte(PM8150B_USID, SMB5_CHARGER_STATUS, &charger);
++	bool errorValid = readByte(PM8150B_USID, SMB5_CHARGER_ERROR, &error);
++	bool thermalValid = readByte(PM8150B_USID, SMB5_CHARGER_TEMP, &thermal);
++	if (usbValid) {
++		external = (usbin & 0x10u) != 0;
++	} else if (pathValid) {
++		external = (path & 0x10u) != 0;
++	}
++	capable = external && pathValid && (path & 0x10u) && (path & 1u) &&
++	    !(path & 0x40u);
++	if (statusValid) {
++		unsigned state = charger & 7u;
++		bool inhibit = (errorValid && (error & 0x02u)) ||
++		    (thermalValid && (thermal & 0x0cu));
++		charging = capable && state >= 1 && state <= 4 && !inhibit;
++		/* Inhibit (0) does not by itself establish full capacity. */
++		full = external && state == 5 &&
++		    !(errorValid && (error & 0x02u));
++	}
++	unsigned percent = socValid ? scaleMsoc(msoc) : estimatePercent(mv);
++	/* Raw values for bring-up: compare with TWRP/vendor sysfs. */
++	putNumber("SweetBatteryRawMSOC", msoc);
++	putNumber("SweetBatteryRawVBATT", rawVoltage);
++	putNumber("SweetBatteryRawIBATT", rawCurrent);
++	putNumber("SweetBatteryRawTemp", rawTempOut);
++	putNumber("SweetBatterySocReady", socValid);
++	putNumber("SweetBatteryChargerState", statusValid ? (charger & 7u) : 0xffu);
++	if (!fHaveSample) {
++		IOLog("SWEET BATTERY: FG sample msoc=%u ready=%d percent=%u vbatt=%u mV ibatt=%d mA temp=%d charger=%#x\n",
++		    (unsigned)msoc, socValid, percent, mv, ma, tempCenti,
++		    (unsigned)charger);
++	}
++	fHaveSample = true;
++	publish(full ? 100 : percent, mv, ma, external, capable, charging, full,
++	    true, currentValid, !socValid, tempCenti, tempValid);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fCepheus) {
++		pollCepheus();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+ 	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+ 	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
++	    readWord(0, 0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+ 	    !sweet_spmi_read(0, 0x1310, &usb) &&
+ 	    !sweet_spmi_read(0, 0x110b, &path) &&
+ 	    !sweet_spmi_read(0, 0x1006, &charger) &&
+@@ -221,7 +474,8 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
++		publish(100, 4200, 0, true, true, false, true, false, false,
++		    false, 2500, false);
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
+@@ -235,7 +489,7 @@ SweetBattery::poll(void)
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+ 	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
++	    (subtype == 3 || subtype == 4) && readWord(0, 0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+ 		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+@@ -243,7 +497,7 @@ SweetBattery::poll(void)
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+ 	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	    charging, full, true, currentValid, true, 2500, false);
+ }
+ 
+ void
+@@ -262,9 +516,26 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++	/* cepheus: PM8150B FG-gen4 is self-describing; no boot-arg needed.
++	 * cepheusbattery=0 keeps the static fallback for A/B comparison. */
++	int cepheus = 1;
++	bool cepheusArg = PE_parse_boot_argn("cepheusbattery", &cepheus,
++	    sizeof(cepheus));
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	bool spmi = sweet_spmi_init() == 0;
++	bool wantCepheus = !cepheusArg || cepheus != 0;
++	if (spmi && wantCepheus && probeCepheus()) {
++		fCepheus = true;
++		fReal = true;
++		/* cepheus packs a 3300 mAh cell (batterydata-F1-*-3300mah). */
++		fDesignMah = 3300;
++	} else {
++		if (spmi && wantCepheus) {
++			IOLog("SWEET BATTERY: PM8150B FG-gen4 probe failed\n");
++		}
++		fReal = spmi && real == 1;
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

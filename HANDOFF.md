@@ -5,6 +5,49 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Battery: cepheus PM8150B FG-gen4 backend written as patch 0149 (2026-11-20)
+
+The live battery is still the static fallback (`SweetBatteryFallback=Yes`,
+`CurrentCapacity/MaxCapacity=5020/5020`, external, not charging). The
+boot cmdline has no `sweetbattery=1`, but that is not the root cause:
+`SweetBattery` only implements the PM6150 QG path, and cepheus is a
+PM8150B with FG-gen4. Patch `0149-cepheus-fg-gen4-battery.patch` adds a
+read-only cepheus backend:
+
+- `SweetBattery::start()` probes SPMI USID 2 for the FG-gen4 subtypes
+  (`BATT_SOC` 0x10 at 0x4005, `BATT_INFO` 0x11 at 0x4105). On cepheus it
+  selects the new backend automatically; no boot arg is needed.
+  `cepheusbattery=0` disables it and keeps the static fallback for A/B.
+- SOC is the fuel gauge's own monotonic value (0x4009, matching copy at
+  0x400a), scaled 0/255 to 0/100 with the vendor formula, not a voltage
+  curve. Voltage is 0x41a0/0x41a1 (little-endian, x122070/1000 uV) and
+  current 0x41a2/0x41a3 (little-endian signed, x488281/1000 uA, sign
+  flipped to the `IOPMPowerSource` positive-while-charging convention).
+  Both use the vendor `_CP` shadow copies for the torn-read check.
+- Charger state comes from SMB5: `BATTERY_CHARGER_STATUS_1` 0x1006
+  (1-4 charging, 5 terminated/full), power path 0x110b, USB plugin
+  0x1310, and the error/JEITA gates at 0x1007/0x100d.
+- `sweet_spmi_read()` now accepts USID 2 peripherals 0x10-0x13 and
+  0x40/0x41; every access is still an observer read, no PMIC writes.
+- Cepheus' cell is 3300 mAh (`batterydata-F1-*-3300mah`), so the backend
+  publishes that as the design capacity instead of sweet's 5020.
+- Temperature comes from `BATT_INFO` 0x4150/0x4151. The gen3 driver
+  documents this block as 0.25 K/LSB while gen4's SRAM copy is Celsius,
+  so the decoder accepts a plausible reading from either encoding and
+  falls back to 25.0 C marked estimated.
+- Bring-up properties: `SweetBatteryRawMSOC`, `RawVBATT`, `RawIBATT`,
+  `RawTemp`, `SocReady`, `ChargerState`.
+
+Patch applies cleanly after 0062+0099 (the only earlier patches that
+touch these files) and was round-tripped against a reconstructed
+post-0099 tree. Not built or booted yet. Next: build the kernel with
+0123+0148+0149, boot, and check `SWEET BATTERY: PM8150B FG-gen4, ...`
+plus `ioreg -c IOPMPowerSource`; compare the percentage with TWRP
+(previous 92%, 25.5 C) and test charging/discharging with the cable.
+The main unknown is whether EE0's SPMI observer has readable APIDs for
+USID 2; if not, the log stays at `static fallback` and we need another
+access path.
+
 ### WiFi: keepalive and fallback both verified on a cold boot (2026-11-20)
 
 Cold-booted `work/boot/runs/wifi12-cold.img` with the new `wland`

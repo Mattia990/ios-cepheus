@@ -358,6 +358,21 @@ Of the ~81 original ios-sweet kernel patches:
   and SpringBoard drew one arc. `sta_state()` also refreshes the joined BSS RSSI from
   `cepheus_wlan_link_bss()` now, so `GET RSSI` and later link events report the signal
   as heard rather than the join-time copy. Patch written; not yet built or tested.
+- 0149 battery: cepheus PM8150B FG-gen4 backend. `SweetBattery` probes SPMI USID 2
+  (FG subtypes 0x10/0x11) and, when found, publishes the fuel gauge's own monotonic
+  SOC (0x4009/copy 0x400a, 0/255 scaled to 0/100), VBATT (0x41a0, LE, x122070/1000 uV)
+  and IBATT (0x41a2, LE signed, x488281/1000 uA, sign flipped for IOPMPowerSource),
+  plus SMB5 charger state (0x1006), power path (0x110b), USB plugin (0x1310) and the
+  error/JEITA gates (0x1007/0x100d). All reads stay on the existing observer; the SPMI
+  filter now accepts USID 2 peripherals 0x10-0x13 and 0x40/0x41. Read-only, no PMIC
+  writes; `cepheusbattery=0` disables it and keeps the static fallback. `sweetbattery=1`
+  still selects the PM6150 path on sweet. The cepheus design capacity is 3300 mAh
+  (`batterydata-F1-*-3300mah`), not sweet's 5020. Temperature is read from `BATT_INFO`
+  0x4150/0x4151 and decoded as either the gen3 0.25 K/LSB or the gen4 0.25 C/LSB
+  encoding, whichever lands in -20..80 C; otherwise 25.0 C stays marked estimated.
+  Raw values are published as `SweetBatteryRaw{MSOC,VBATT,IBATT,Temp}`,
+  `SweetBatterySocReady` and `SweetBatteryChargerState`. Patch written; not yet
+  built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the
