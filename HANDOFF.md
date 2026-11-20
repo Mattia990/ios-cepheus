@@ -30,13 +30,19 @@ Runtime test: `kill -9 <vmd>` dropped total CPU from ~410% to ~127%
 (PID changed, coreduetd resumed at 100%), so a one-shot kill is not
 enough.
 
-Persistent fix to test: disable the `com.apple.voicemail.vmd` and
-`com.apple.dasd` entries (or replace their `Program` with a no-op) in
-`/System/Library/xpc/launchd.plist`, which is the file
-`tools/cepheus-wifi-install.sh` already edits. This disables Visual
+Persistent fix installed (user approved): both entries were removed
+from `/System/Library/xpc/launchd.plist` (532 -> 530 jobs) via
+`tools/cepheus-files.py`; the pre-change copy is
+`work/daemons/launchd.plist.before` (gitignored). This disables Visual
 Voicemail and background task scheduling; both are useless without the
-modem. Needs a reboot and user approval before touching the system
-volume.
+modem. If launchd rescans `/System/Library/LaunchDaemons` and starts
+them again, the two per-job plists need the same treatment.
+
+Next image is ready: `work/boot/runs/daemons-off/daemons-off.img`
+(sha256 `649b5568...`), cmdline includes `sweetrtcoff=1554650334`.
+Boot it after the battery has charged and check `psx` for vmd/dasd,
+`coreduetd` CPU, current, and that the clock starts at 2026 rather than
+1977.
 
 RTC: the boot still starts in 1977 and jumps when userspace sets the
 clock. The kernel logged offset `1554650334` (RTC 240555155 vs time of
