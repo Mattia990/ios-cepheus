@@ -29,10 +29,12 @@ for a in dropbear scp dbclient dropbearkey dropbearconvert; do
 	$F link /var/local/bin/dropbearmulti "/var/local/bin/$a" || true
 done
 if [ -f "$U/stage/toybox" ]; then
-	for a in ls cat cp mv rm mkdir rmdir ln chmod chown ps kill grep sed head tail wc find xargs \
-		sort uniq cut tr df du mount uname date env id whoami hexdump od dd sleep touch stat \
-		which file tee printf echo true false test basename dirname readlink realpath uptime \
-		free top hostname nc ping ifconfig netstat dmesg sync md5sum sha1sum sha256sum tar gzip; do
+	# Only applets in toybox's macos_miniconfig: a symlink to an applet that
+	# was not built would shadow the iOS tool of the same name (PATH order).
+	for a in ls cat cp mv rm mkdir rmdir ln chmod chown kill grep sed head tail wc find xargs \
+		sort uniq cut tr df du uname date env id whoami od sleep touch stat \
+		which file tee printf echo true false test basename dirname readlink realpath \
+		hostname nc md5sum sha1sum sha256sum tar zcat; do
 		$F link /var/local/bin/toybox "/var/local/bin/$a" >/dev/null 2>&1 || true
 	done
 fi
@@ -57,7 +59,9 @@ p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist'
     'Label': 'org.iosonpixel.dropbear',
     'ProgramArguments': ['/var/local/bin/dropbear', '-F', '-E', '-R', '-p', '22'],
     'RunAtLoad': True, 'KeepAlive': True, 'UserName': 'root',
-    'EnvironmentVariables': {'PATH': '/var/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
+    # System paths first: toybox is a fallback, so a missing applet cannot
+    # shadow a working iOS tool with the same name.
+    'EnvironmentVariables': {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin:/var/local/bin'},
     'StandardErrorPath': '/var/local/dropbear.log',
 }
 plistlib.dump(p, open(sys.argv[2], 'wb'), fmt=plistlib.FMT_BINARY)
