@@ -28,9 +28,38 @@ libvulkan_freedreno.dylib}` are byte-identical to `phone/metal2/out`
 match the running build.
 
 Next: wall-charge and cool the phone before trusting more timings (the
-pack was 37% at 3.146 V on the non-charging PC port), then decide whether
-the ~25 ms frame is CPU-side submit cost or a compositor-wide 30 fps
-cadence.
+pack was 37% at 3.146 V on the non-charging PC port). The transparency
+A/B below narrows the cost to render-pass and draw encoding.
+
+### UI: transparency is not the cost; per-pass encode is (2026-11-20)
+
+Set `com.apple.Accessibility ReduceTransparencyEnabled=1`, respringed
+(backboardd 1261), and repeated the Preferences scroll: **25.8 fps**
+versus 29-34 fps before, so blur/backdrop is not the frame-pacing cause.
+With transparency off the draws per commit grew from 56 to 140-147 while
+the pass count stayed 12, and GPU time per submit rose to 4.4 ms. The
+setting was put back to 0 and backboardd respringed again (1350).
+
+Backboardd's own telemetry shows one command buffer per frame. A full
+frame is `rp12 dr56 kpx8182` (12 passes, 56 draws, 8.18 Mpixels) and a
+lighter frame is `rp1 dr37 kpx2676`. Commits are 23-29 ms apart, one per
+frame. Creation-to-commit age is 12.6 ms for the full frame and 5.2 ms
+for the light one; commit-to-complete is ~10.6 ms and ~8.4 ms. The 7.4 ms
+difference over 11 more passes and 19 more draws fits roughly **0.5 ms
+per render pass plus 0.1 ms per draw**, all on the encoding thread. That
+fixed per-pass cost is the biggest lever; removing the ~2 ms/commit
+surface cache clean is secondary.
+
+The J row (`surface cache`) logs 9812 flushes over 2223 commits, 10.9 MB
+each (4.4 per commit, ~2.2 ms during scrolling): `flushSurfaces` runs at
+commit and again at finish, and flushes every IOSurface render target
+whether the CPU wrote it or not.
+
+Blocked on driver work: this Mac has no `rustc`/`cargo`/`rustup`, and
+`work/m2v-bridge/` and `work/turnip/build-ios/` are gone, so neither
+SweetMetal2 nor Turnip can be rebuilt as-is. Profiling further or
+testing a fix needs the Rust 1.98 toolchain + `aarch64-apple-ios` target
+(both the bridge and Turnip builds also need the local iOS clang setup).
 
 ### Battery: 0150 booted; vmd + dasd/coreduetd cause the heat (2026-11-20)
 
