@@ -5,30 +5,50 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### SSH: CI build for dropbear, dash and toybox (2026-11-20)
+### SSH: restored; dash had a weak strchrnul import (2026-11-20)
 
-SSH was gone because `/var/local/bin/{dropbearmulti,dash,toybox}` were no longer on the
-phone, and this Mac has no iPhoneOS SDK. `.github/workflows/ssh.yml` (commit `a5fabad`)
-builds dropbear 2024.86, dash 0.5.12, toybox 0.8.12 (best-effort) and `phone/tools` for
-iOS 16 arm64; `tools/cepheus-install-ssh.sh` installs the artifact over the file server.
+SSH is back on the phone over USB. `.github/workflows/ssh.yml` builds dropbear
+2024.86, dash 0.5.12 (toybox still best-effort) and `phone/tools` for iOS 16
+arm64; `tools/cepheus-install-ssh.sh` installs the artifact over the file server.
 
-The first run failed in dropbear's bundled libtommath with
-`./tommath_class.h:1322:10: fatal error: 'dbmalloc.h' file not found`. `CFLAGS` passed on
-the `make` command line overrides libtommath's `CFLAGS += -I../ -I../src`, so the include
-path to dropbear's `src/dbmalloc.h` disappeared. The workflow no longer passes `CFLAGS`
-to `make`; `configure` already puts `-O2` in the Makefile. A native build of the same
-tree with that make line succeeds, and dash's cross-configure path
-(`--host=aarch64-apple-darwin`) was checked locally.
+The first working dropbear exposed two bugs:
 
-The next run (`beaab50`) built and signed `dropbearmulti` and `dash`, and all
-`phone/tools` binaries. The optional toybox step failed: toybox's macOS code includes
-`<sys/disk.h>`, which the iOS SDK does not have. The `ssh-ios16` artifact was uploaded
-anyway (267,163 bytes, artifact 14619539596); toybox is not needed for SSH.
+- dropbear 2024.86 has no `-E` (that is OpenSSH); with syslog off it already logs
+  to stderr. The job is now `dropbear -F -e -R -p 22`; `-e` passes the job's PATH
+  (including `/var/local/bin`) to the login shell.
+- dash's configure found `strchrnul` in the iOS SDK, but iOS 16 only has it as a
+  weak import, so the first call jumped to address 0 (`CRASH dash ... pc 0x0`).
+  The workflow now configures `ac_cv_func_strchrnul=no` (dash's own fallback in
+  `system.c`) and fails the build if any weak imports remain. Rebuilt dash:
+  SHA-256 `80348063...`, no weak imports, `_strchrnul` defined locally.
 
-Pending: download `ssh-ios16` from the run and unzip it at the repository root; then
-`CEPH_FILES_HOST=192.168.1.100 tools/cepheus-install-ssh.sh`, reboot, and
-`ssh -i work/userland/ssh/id_ed25519 root@192.168.1.100`. The phone was at
-`192.168.1.100` when this was written.
+Installed over `CEPH_FILES_HOST=192.168.7.2`; `/bin/sh` is a symlink to the new
+dash, and the installer now removes it before relinking so upgrades work.
+Verified with `ssh -i work/userland/ssh/id_ed25519 root@192.168.7.2 'echo SSH_OK'`.
+
+The root image is very minimal: `/bin/ps` and `/bin/df` exist, but there is no
+`ls`, `cat`, `kill`, `sleep`, `date`, `launchctl` or `chmod`; toybox would fill
+that gap but still fails on `<sys/disk.h>`. Guard it with `__APPLE__` and
+`!defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)` to use the generic
+stub.
+
+Open: SSH is over USB only for now; Wi-Fi is up but not joined because
+`/var/local/wlan.conf` is missing (see the Wi-Fi section).
+
+### WiFi: radio up, but wlan.conf is missing (2026-11-20)
+
+Cold boot `wifi12-cold.img` (`cepheusreboot=1200 sweetmtl=2 sweetusb=2
+cepheustouchpanel=0 cepheustouchpanelpor=0`) with SSH installed. `wland` is
+alive and the modem/WLAN firmware came up: `WLFW ... FW READY`, `mission mode
+on`, HTC/WMI, then scans every ~15 s (10-11 networks, e.g. `TP-Link_3355_5G`).
+`radio: stats: state 0, tx 0 ...` and no `net: will join` line: `/var/local/
+wlan.conf` is absent (no backup either), so `read_conf()` returned before
+setting `conf_ssid`. `wifid` is running and `bridge: scan done` reaches it;
+`netsvc` still publishes only `ue0` (USB) because `en0` is not joined.
+
+Next: recreate `/var/local/wlan.conf` on the phone (`ssid=...`, `psk=...`,
+mode 600), reboot into fastboot and boot the image again; `wland` reads it at
+startup. Then check the L2 join, `en0`, DHCP/configd and the grey icon.
 
 ### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
 
