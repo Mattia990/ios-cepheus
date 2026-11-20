@@ -5,6 +5,44 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### WiFi: L2 join works; DHCP waits on configd; cold boot hit a TFTP stall (2026-11-20)
+
+`wifi7` (cold boot, race-uploaded `wland`) got the modem and WLAN firmware up: Settings
+scanned 8-17 networks and a join to `TP-Link_3355_5G` completed at L2:
+
+```
+radio: join: auth reply status 0
+radio: join: assoc reply status 0 aid 19
+radio: *** joined 'TP-Link_3355_5G' ***
+bridge: link up
+```
+
+The kernel answered `wifid`'s `ASSOCIATE`/`ASSOCIATE_RESULT`/`CURRENT_NETWORK` gets, but
+`radio: stats: state 5, tx 4` showed only the four EAPOL frames: no DHCP discover/request
+and no ARP reached the radio. The IP side is configd's job on `en0` (bridge.c does not use
+`ipnet.c` when `/dev/wlan` is present).
+
+`preferences.plist` was the 192-byte host-names-only file with no `NetworkServices`, and
+removing it plus rebooting (`wifi8`/`wifi9`) only recreated it before `en0` existed. `wifi10`
+wrote a crafted service instead (`en0`, `Hardware=AirPort`, `Type=IEEE80211`, DHCP) and
+configd accepted it: it added its own `en0` service (`Type=Ethernet`, DHCP) and
+`Interface/en0/AirPort/JoinMode=Automatic`. `wifid` still did not auto-join (the 5 GHz
+network and `Enable5GhzAutoJoinScan=false`), so the next test needs a tap in Settings.
+
+`wifi11` was the first full power cycle after that. It never reached WLFW: the 4 MB
+`wlanmdsp.mbn` TFTP read stalled after block ~20, and at 42.6 s the modem logged
+`smp2p: modem state 7 ERR-FATAL ready handover`; the radio stayed at `state 0`, so Settings
+had no Wi-Fi at all. `wlan7` shows the same transfer succeeding on another cold boot
+(`read done (3960 blocks ... 6482 ms waiting)`), so this is a cold-storage timing failure,
+not a config error. Fix in the tree: `tftp_init()` now reads `wlanmdsp.mbn` once before
+registering the TFTP service (`phone/wifi/tftp.c`, commit `c5b40f6`); for the immediate
+boot `work/wifi12-watch.py` also fetches the file over the USB file server as soon as it
+answers (4.3 s for 4 MB), before `wland` starts.
+
+Open after DHCP works: the `Preferences` crash (`wifid sets 383 (?): REFUSED`,
+`CURRENT_NETWORK` 1164 bytes), the 16.7.16 Apple80211 layouts (`ASSOCIATE_RESULT` currently
+returns `0 bytes`), and whether configd receives the `en0` link event.
+
 ### WiFi: modem ERR-FATAL was the RMTFS buffer size (2026-11-20)
 
 `wifi5` (patched MPSS constants) got past PAS: `auth and reset -> 0/0`, `modem ready
