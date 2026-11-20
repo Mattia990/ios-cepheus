@@ -57,7 +57,9 @@ import plistlib, sys
 p = plistlib.load(open(sys.argv[1], 'rb'))
 p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist'] = {
     'Label': 'org.iosonpixel.dropbear',
-    'ProgramArguments': ['/var/local/bin/dropbear', '-F', '-E', '-R', '-p', '22'],
+    # dropbear has no -E (that is OpenSSH); with syslog disabled it already
+    # logs to stderr, which StandardErrorPath captures.
+    'ProgramArguments': ['/var/local/bin/dropbear', '-F', '-R', '-p', '22'],
     'RunAtLoad': True, 'KeepAlive': True, 'UserName': 'root',
     # System paths first: toybox is a fallback, so a missing applet cannot
     # shadow a working iOS tool with the same name.
