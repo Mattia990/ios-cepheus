@@ -5,6 +5,47 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Battery: 0150 booted; vmd + dasd/coreduetd cause the heat (2026-11-20)
+
+Booted `work/boot/runs/battery-0150/battery-0150.img` (kernel SHA-256
+`bc6bc2b9...`; disassembly confirms it contains 0150's `ma > 0` and
+`percent >= 99` gates). 0150 works: on the PC port the FG reads
+`RawIBATT` +308...+1260 (`InstantAmperage` -150...-615 mA) and
+`IsCharging=No` with `ExternalConnected=Yes`. `FullyCharged=No`.
+
+Heat/drain: iOS was running ~4.1 cores and drawing ~590 mA (2.2 W) at
+boot. Two loops:
+
+- `vmd` (VisualVoicemail.framework, no modem) at 51-90% CPU, repeatedly
+  hitting its 90 s/180 s CPU limit (`vmd.cpu_resource-*.ips`).
+- `dasd` asks `coreduetd` for `_DKPredictionQuery` predictions in a
+  tight loop (oslog: `[Storage] Starting executeQuery ... 'dasd'`);
+  `coreduetd` used 80-100% of a core, `dasd` ~7%, and ReportCrash wrote
+  the vmd reports.
+- `aggregated` also peaked at ~100% early; it settled.
+
+Runtime test: `kill -9 <vmd>` dropped total CPU from ~410% to ~127%
+(current 586 mA -> ~150 mA); `kill -9 <dasd>` dropped it to ~10% and
+~110 mA at 3.86 V. vmd stayed dead, but `dasd` is re-launched on demand
+(PID changed, coreduetd resumed at 100%), so a one-shot kill is not
+enough.
+
+Persistent fix to test: disable the `com.apple.voicemail.vmd` and
+`com.apple.dasd` entries (or replace their `Program` with a no-op) in
+`/System/Library/xpc/launchd.plist`, which is the file
+`tools/cepheus-wifi-install.sh` already edits. This disables Visual
+Voicemail and background task scheduling; both are useless without the
+modem. Needs a reboot and user approval before touching the system
+volume.
+
+RTC: the boot still starts in 1977 and jumps when userspace sets the
+clock. The kernel logged offset `1554650334` (RTC 240555155 vs time of
+day 1795205489); saved in `work/rtc-offset` (gitignored) for the next
+cmdline. It did not stop coreduetd's loop, but it avoids the jump.
+
+Battery was down to 27% (raw MSOC 69, 3.1 V loaded) on the PC port; the
+port cannot charge this phone. Watchdog ended the boot at ~21:27.
+
 ### Battery: 0149 booted; 0150 fixes the charging flag (2026-11-20)
 
 Booted `work/boot/runs/battery-0149.img` with 0123+0148+0149. The
