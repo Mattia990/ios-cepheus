@@ -38,6 +38,7 @@ if [ -f "$U/stage/toybox" ]; then
 		$F link /var/local/bin/toybox "/var/local/bin/$a" >/dev/null 2>&1 || true
 	done
 fi
+$F rm /bin/sh 2>/dev/null || true
 $F link /var/local/bin/dash /bin/sh || echo "(/bin/sh exists)"
 $F put $U/ssh/id_ed25519.pub /var/root/.ssh/authorized_keys 600
 for t in psx prefs oslog nettest netsvc openapp lsreg imgtest membw pstack; do
@@ -59,7 +60,8 @@ p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.dropbear.plist'
     'Label': 'org.iosonpixel.dropbear',
     # dropbear has no -E (that is OpenSSH); with syslog disabled it already
     # logs to stderr, which StandardErrorPath captures.
-    'ProgramArguments': ['/var/local/bin/dropbear', '-F', '-R', '-p', '22'],
+    # -e passes the job's PATH (which includes /var/local/bin) to the shell.
+    'ProgramArguments': ['/var/local/bin/dropbear', '-F', '-e', '-R', '-p', '22'],
     'RunAtLoad': True, 'KeepAlive': True, 'UserName': 'root',
     # System paths first: toybox is a fallback, so a missing applet cannot
     # shadow a working iOS tool with the same name.
