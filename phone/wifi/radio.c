@@ -1183,8 +1183,9 @@ static int s_join_asked, s_result = -1;
 static uint8_t s_ssid[32], s_ssid_len, s_bssid[6], s_pmk[32];
 static uint8_t s_body[768];				/* the AP's beacon elements */
 static uint32_t s_body_len, s_freq, s_aid, s_tries, s_desc, s_msg1s;
-static uint64_t s_deadline;
+static uint64_t s_deadline, s_keepalive_ms;
 static int s_rsn, s_start_resp, s_ptk_set;
+static unsigned s_keepalives;
 static int32_t s_start_status;
 static uint8_t s_assoc_req[512];
 static uint32_t s_assoc_req_len;
@@ -1535,6 +1536,18 @@ int radio_tx_ether(const uint8_t *e, uint32_t len)
 	return s_state == S_UP ? w_tx_ether(e, len, 0) : -1;
 }
 
+/* a Null data frame to the AP: keeps its inactivity timer from ending the association while nothing is sent */
+static int w_send_keepalive(void)
+{
+	uint8_t f[24] = { 0 };
+	f[0] = 0x48;					/* data, Null */
+	f[1] = (uint8_t)(0x01 | (s_ptk_set ? 0x40 : 0));	/* to DS, protected once the PTK is in */
+	memcpy(f + 4, s_bssid, 6);
+	memcpy(f + 10, radio_mac, 6);
+	memcpy(f + 16, s_bssid, 6);
+	return htt_tx_frame(f, sizeof(f), !s_ptk_set);
+}
+
 /* ---- the join, step by step from the poll loop */
 
 static void w_link(int up)
@@ -1565,6 +1578,7 @@ static void w_join_end(int result)
 		w_teardown();
 	} else {
 		s_state = S_UP;
+		s_keepalive_ms = link_ms();
 		LOG("*** joined '%.*s' ***", (int)s_ssid_len, s_ssid);
 		w_link(1);
 	}
@@ -1875,6 +1889,13 @@ static void sta_poll(void)
 		LOG("join: no 4-way handshake (%u message 1s)", s_msg1s);
 		w_join_end(s_msg1s ? EAUTH : ETIMEDOUT);
 	}
+	if (s_state == S_UP && !scanning && now - s_keepalive_ms >= 60000) {
+		if (w_send_keepalive() == 0) {
+			s_keepalive_ms = now;
+			if (++s_keepalives % 5 == 1)
+				LOG("keepalive: %u sent", s_keepalives);
+		}
+	}
 }
 
 /*
@@ -1914,6 +1935,20 @@ int radio_join(const char *ssid, const char *pass)
 int radio_join_result(void)	/* -1 while it runs, 0 joined, else an errno */
 {
 	return s_join_asked ? -1 : s_result;
+}
+
+/* join the network last joined again (same SSID and PMK), after the link was lost by itself */
+int radio_rejoin(void)
+{
+	if (s_state == S_UP)
+		return EALREADY;
+	if (s_join_asked)
+		return EBUSY;
+	if (!s_ssid_len)
+		return EINVAL;
+	s_result = -1;
+	s_join_asked = 1;
+	return 0;
 }
 
 /* ---------------------------------------------------------------- WMI events */

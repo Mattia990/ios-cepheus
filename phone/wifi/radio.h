@@ -16,6 +16,7 @@ extern const uint8_t radio_mac[6];
 /* station: join SSID (passphrase, 64 hex digits = PMK, or "" for open); after the first scan */
 int radio_join(const char *ssid, const char *pass);
 int radio_join_result(void);	/* -1 while it runs, 0 joined, ENOTCONN joined then lost, else an errno */
+int radio_rejoin(void);		/* join the last network again (same PMK); 0 = started */
 void radio_disconnect(void);	/* drop a joined link (tests the rejoin) */
 /* what scans heard, for wifid (cepheuswlan.c) */
 struct radio_bss {

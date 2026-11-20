@@ -17,8 +17,10 @@
 static int bfd = -1;
 static int hello_sent;
 static int scan_pending, join_pending;
+static int leave_asked, link_was_up;
+static int rejoin_asked, rejoin_pending;
 static unsigned scans_at;
-static uint64_t scan_deadline, join_deadline, last_bg_scan;
+static uint64_t scan_deadline, join_deadline, last_bg_scan, link_down_ms;
 int bridge_joins;	/* wifid has asked for a network (or to leave): wland's own wlan.conf join stands down */
 
 static void bridge_send(uint16_t type, const void *data, size_t len)
@@ -48,6 +50,16 @@ static void bridge_rx(const uint8_t *frame, uint32_t len)
 static void bridge_link(int up)
 {
 	struct fw_link l;
+	if (up) {
+		link_was_up = 1;
+		link_down_ms = 0;
+		rejoin_asked = 0;
+	} else {
+		int had = link_was_up;
+		link_was_up = 0;
+		if (!leave_asked && had)
+			link_down_ms = link_ms();
+	}
 	memset(&l, 0, sizeof(l));
 	l.up = (uint8_t)(up != 0);
 	l.ssid_len = (uint8_t)radio_ssid(l.ssid, l.bssid);
@@ -118,8 +130,11 @@ static void on_join(const struct fw_join *j)
 		for (int i = 0; i < 32; i++)
 			snprintf(pass + 2 * i, 3, "%02x", j->key[i]);	/* radio_join takes the PMK as 64 hex digits */
 	}
+	rejoin_pending = 0;			/* wifid's join wins over a fallback under way */
+	leave_asked = 1;
 	if (radio_joined())
 		radio_disconnect();
+	leave_asked = 0;
 	int r = radio_join(ssid, pass);
 	printf("[%6llu] bridge: join '%s' (%s) -> %d\n", (unsigned long long)link_ms(), ssid,
 	       j->key_kind == FW_KEY_PMK ? "PMK" : j->key_kind == FW_KEY_PASSPHRASE ? "passphrase" : "open", r);
@@ -177,6 +192,9 @@ void bridge_poll(void)
 			break;
 		case FW_LEAVE:
 			bridge_joins = 1;
+			leave_asked = 1;
+			link_down_ms = 0;
+			rejoin_asked = 1;
 			printf("[%6llu] bridge: leave\n", (unsigned long long)link_ms());
 			radio_disconnect();
 			bridge_status(FW_LEFT, 0);
@@ -199,6 +217,21 @@ void bridge_poll(void)
 			join_pending = 0;
 			bridge_status(FW_JOIN_DONE, r == -1 ? ETIMEDOUT : r);
 		}
+	}
+	if (rejoin_pending) {
+		int r = radio_join_result();
+		if (r != -1) {
+			rejoin_pending = 0;
+			printf("[%6llu] bridge: fallback join %s\n", (unsigned long long)now, r ? strerror(r) : "joined");
+		}
+	} else if (bridge_joins && link_down_ms && !leave_asked && !join_pending && !rejoin_asked &&
+		   now - link_down_ms >= 20000) {
+		int r = radio_rejoin();
+		rejoin_asked = 1;
+		printf("[%6llu] bridge: wifid has not rejoined in 20 s: %s\n", (unsigned long long)now,
+		       r ? strerror(r) : "joining again");
+		if (r == 0)
+			rejoin_pending = 1;
 	}
 }
 
