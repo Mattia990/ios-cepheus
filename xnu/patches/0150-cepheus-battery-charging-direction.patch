@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 65bccdf..270cd8e 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -430,11 +430,20 @@ SweetBattery::pollCepheus(void)
+ 		bool inhibit = (errorValid && (error & 0x02u)) ||
+ 		    (thermalValid && (thermal & 0x0cu));
+ 		charging = capable && state >= 1 && state <= 4 && !inhibit;
++		/* A charge state alone does not mean the pack is gaining charge:
++		 * a weak source can sit in CC while the system draws more than
++		 * the input supplies. Only report charging when the net battery
++		 * current is actually into the pack. */
++		if (charging && currentValid && ma <= 0) {
++			charging = false;
++		}
+ 		/* Inhibit (0) does not by itself establish full capacity. */
+ 		full = external && state == 5 &&
+ 		    !(errorValid && (error & 0x02u));
+ 	}
+ 	unsigned percent = socValid ? scaleMsoc(msoc) : estimatePercent(mv);
++	/* Charge-done must not turn an arbitrary low SOC into 100%. */
++	full = full && percent >= 99;
+ 	/* Raw values for bring-up: compare with TWRP/vendor sysfs. */
+ 	putNumber("SweetBatteryRawMSOC", msoc);
+ 	putNumber("SweetBatteryRawVBATT", rawVoltage);
+@@ -448,7 +457,7 @@ SweetBattery::pollCepheus(void)
+ 		    (unsigned)charger);
+ 	}
+ 	fHaveSample = true;
+-	publish(full ? 100 : percent, mv, ma, external, capable, charging, full,
++	publish(percent, mv, ma, external, capable, charging, full,
+ 	    true, currentValid, !socValid, tempCenti, tempValid);
+ }
+ 
+@@ -496,8 +505,14 @@ SweetBattery::poll(void)
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid, true, 2500, false);
++	/* Require current into the pack, not just a charge state. */
++	if (charging && currentValid && ma <= 0) {
++		charging = false;
++	}
++	unsigned percent = estimatePercent(mv);
++	full = full && percent >= 99;
++	publish(percent, mv, ma, external, capable, charging, full, true,
++	    currentValid, true, 2500, false);
+ }
+ 
+ void

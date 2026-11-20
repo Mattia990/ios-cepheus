@@ -5,6 +5,32 @@ Last updated **2026-11-20** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Battery: 0149 booted; 0150 fixes the charging flag (2026-11-20)
+
+Booted `work/boot/runs/battery-0149.img` with 0123+0148+0149. The
+PM8150B backend probed successfully: `SweetBatteryFallback=No`,
+`SocReady=1`, `MaxCapacity=3300`, and the FG reported a real, falling
+SOC (95 -> 87, 37% -> 34%) with `VBATT` 3.13 -> 3.10 V and net
+`InstantAmperage` about -370 mA while on the PC USB port. TWRP's 99%
+was a stale Nov 18 reading; 3.79 V at 35% is plausible.
+
+The bug: `IsCharging` came from SMB5 state 3 (CC) alone, so SpringBoard
+showed CHARGING while the pack drained. A PC port supplies less than the
+phone draws. Patch `0150-cepheus-battery-charging-direction.patch`
+requires `currentValid && ma > 0` before setting `IsCharging`, stops
+forcing 100% when `BATTERY_CHARGER_STATUS_1` is 5 (gated on
+`percent >= 99`), and applies the same current-direction rule to the
+PM6150 path.
+
+Also confirmed: `BATT_INFO` temp registers 0x4150/0x4151 read 0, so
+`Temperature` is the estimated 25.0 C (`SweetBatteryTemperatureEstimated=Yes`);
+TWRP's gen4 path read 18.5 C from SRAM. Real temperature still needs the
+FG SRAM access path.
+
+Boot ended at 1121 s when the watchdog (`cepheusreboot=1200`) took the
+phone down; no panic. Battery was ~34% and discharging, so wall-charge
+before the next cold boot.
+
 ### Battery: cepheus PM8150B FG-gen4 backend written as patch 0149 (2026-11-20)
 
 The live battery is still the static fallback (`SweetBatteryFallback=Yes`,
@@ -40,13 +66,9 @@ read-only cepheus backend:
 
 Patch applies cleanly after 0062+0099 (the only earlier patches that
 touch these files) and was round-tripped against a reconstructed
-post-0099 tree. Not built or booted yet. Next: build the kernel with
-0123+0148+0149, boot, and check `SWEET BATTERY: PM8150B FG-gen4, ...`
-plus `ioreg -c IOPMPowerSource`; compare the percentage with TWRP
-(previous 92%, 25.5 C) and test charging/discharging with the cable.
-The main unknown is whether EE0's SPMI observer has readable APIDs for
-USID 2; if not, the log stays at `static fallback` and we need another
-access path.
+post-0099 tree. It was subsequently built into
+`work/boot/runs/battery-0149.img` and booted; see the 0150 section above
+for the result. The SPMI observer does expose USID 2's FG/charger APIDs.
 
 ### WiFi: keepalive and fallback both verified on a cold boot (2026-11-20)
 
