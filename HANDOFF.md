@@ -52,6 +52,40 @@ cmdline. It did not stop coreduetd's loop, but it avoids the jump.
 Battery was down to 27% (raw MSOC 69, 3.1 V loaded) on the PC port; the
 port cannot charge this phone. Watchdog ended the boot at ~21:27.
 
+### UI: daemons-off boot is cool, but frames still present slowly (2026-11-20)
+
+Booted `work/boot/runs/daemons-off/daemons-off.img` (kernel 0150,
+`sweetrtcoff=1554650334`). The daemon fix held: no `vmd` or `dasd`, and
+`coreduetd`/`aggregated` stayed near idle. The clock started in 2026.
+Battery read 37% at 3.146 V, `ExternalConnected=Yes`,
+`IsCharging=No`, about 149 mA on the PC port.
+
+The UI is still sluggish. During the boot animation the 5 s buckets
+peaked at **14.4 fps**; opening Preferences gave **7.8 fps** (39 swaps,
+38 panel copies, 697 us average copy). The GPU was not starved: at
+93 s it submitted 281 frames in 5 s (56/s), 20% busy, longest 13.5 ms,
+while backboardd presented only 87 times (17/s). So rendering is fast
+but presentation is paced/blocked.
+
+The fake `AppleARMBacklight` is active on this boot (`sweetbl` default
+1): `SWEET BL: setProperties backlight-level = 8128`, then DCS `0x51`
+at display-on. However, the earlier `metal2` run also published
+`AppleARMBacklight` (at 15.5 s) and still reached **58 fps** under real
+interaction with the 0148 kernel, so the backlight alone is not proven.
+Differences to isolate: `sweetbl=0`, the 0149/0150 battery backend, and
+`sweetrtcoff`.
+
+Next image is ready: `work/boot/runs/daemons-off-bl0/daemons-off-bl0.img`
+(kernel 0150, same rootfs/firmware, `sweetbl=0`; SHA-256 starts
+`a16280078f`). Boot it, open Preferences and swipe for ~20 s, and compare
+the same `SWEET FB`/`SWEET GPU` counters. If it is still slow, A/B the
+0148 `metal2` kernel with the same cmdline to check for a 0149/0150
+regression; that image is also ready at
+`work/boot/runs/daemons-off-bl0-0148/daemons-off-bl0-0148.img`
+(SHA-256 starts `cdb7393e`). The phone was off/disconnected at 22:03
+and the pack was last seen at 37%; wall-charge before the next cold
+boot.
+
 ### Battery: 0149 booted; 0150 fixes the charging flag (2026-11-20)
 
 Booted `work/boot/runs/battery-0149.img` with 0123+0148+0149. The
