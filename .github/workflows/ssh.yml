@@ -131,10 +131,20 @@ jobs:
         run: |
           set -euxo pipefail
           cd "work/userland/src/dash-$DASH_VERSION"
-          CC="$IOS_CC" ./configure --host=aarch64-apple-darwin CFLAGS="-O2"
+          # iOS 16 has no strchrnul. The SDK still declares it (introduced
+          # later), so configure links it as a weak import and the first call
+          # jumps to address 0. Force dash's own fallback from system.c.
+          CC="$IOS_CC" ./configure --host=aarch64-apple-darwin CFLAGS="-O2" \
+            ac_cv_func_strchrnul=no
           make -j"$(sysctl -n hw.ncpu)" CC="$IOS_CC"
           file src/dash
           lipo -info src/dash
+          # A weak import is a runtime null on iOS 16; fail the build instead.
+          if xcrun dyld_info -imports src/dash | grep -q 'weak-import'; then
+            echo "dash has weak imports:"
+            xcrun dyld_info -imports src/dash | grep 'weak-import'
+            exit 1
+          fi
           codesign -f -s - src/dash
           cp src/dash ../../stage/dash
 
