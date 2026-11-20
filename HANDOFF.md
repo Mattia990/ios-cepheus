@@ -27,9 +27,17 @@ libvulkan_freedreno.dylib}` are byte-identical to `phone/metal2/out`
 (SHA-256 `74df7865...` and `441a16d4...`), so the `nm`/pstack symbols
 match the running build.
 
-Next: wall-charge and cool the phone before trusting more timings (the
-pack was 37% at 3.146 V on the non-charging PC port). The transparency
-A/B below narrows the cost to render-pass and draw encoding.
+The early **49.4 fps** bucket (t=84.7) is real interaction: 247 swaps
+during 3.7 injected home-screen swipes. The next bucket's 33.6 fps is
+diluted by ~2 s with no swipes, so it is not a 5 s collapse. GPU work
+was 1.07 ms/submit early versus 3.5-3.9 ms later, which fits a lighter,
+still-loading home screen as well as throttling. Do not treat 49 fps as
+the baseline until the same scene is measured early and late.
+
+Next: wall-charge and cool the phone (the pack was 37% at 3.146 V on the
+non-charging PC port), then scroll Preferences immediately after a cold
+boot and again after ~15 min. The transparency A/B below narrows the
+cost to render-pass and draw encoding.
 
 ### UI: transparency is not the cost; per-pass encode is (2026-11-20)
 
