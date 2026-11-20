@@ -2,8 +2,9 @@
  * rmtfs: the modem's EFS lives in the modemst1/modemst2/fsg/fsc partitions,
  * which the modem reaches through this QMI service (14) on the apps side
  * (protocol as github.com/andersson/rmtfs; memory set up as the downstream
- * msm_sharedmem rmtfs client: 2 MB, guarded by 4K at both ends, shared with
- * the modem's VM by hyp_assign). The partitions are files on the phone.
+ * msm_sharedmem rmtfs client: 3 MB (stock DT qcom,rmtfs_sharedmem@0), guarded
+ * by 4K at both ends, shared with the modem's VM by hyp_assign). The
+ * partitions are files on the phone.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -19,7 +20,7 @@
 #include "scm.h"
 
 #define RMTFS_DIR	"/var/local/fw/rmtfs"
-#define BUF_SIZE	0x200000u
+#define BUF_SIZE	0x300000u	/* cepheus stock DT: qcom,rmtfs_sharedmem@0 = 3 MB; the modem asks for all of it */
 #define SECTOR		512
 
 enum { RMTFS_OPEN = 1, RMTFS_CLOSE, RMTFS_RW_IOVEC, RMTFS_ALLOC_BUFF, RMTFS_GET_DEV_ERROR, RMTFS_FORCE_SYNC_IND };
@@ -46,7 +47,7 @@ int rmtfs_init(void)
 		}
 	}
 	/*
-	 * One buffer per phone boot, kept across modem restarts: a fresh 2 MB hyp_assign after
+	 * One buffer per phone boot, kept across modem restarts: a fresh hyp_assign after
 	 * every restart (the old ones never handed back) ends with an SMC that never returns.
 	 */
 	struct timeval bt;
@@ -54,13 +55,13 @@ int rmtfs_init(void)
 	sysctlbyname("kern.boottime", &bt, &btl, NULL, 0);
 	FILE *f = fopen(RMTFS_DIR "/.buffer", "r");
 	long long fb = 0;
-	unsigned long long fpa = 0;
+	unsigned long long fpa = 0, fsz = 0;
 	if (f) {
-		if (fscanf(f, "%lld %llx", &fb, &fpa) != 2)
+		if (fscanf(f, "%lld %llx %llx", &fb, &fpa, &fsz) != 3)
 			fpa = 0;
 		fclose(f);
 	}
-	if (fpa && fb == (long long)bt.tv_sec) {
+	if (fpa && fb == (long long)bt.tv_sec && fsz == BUF_SIZE) {
 		buf_pa = fpa;
 		printf("rmtfs: buffer %llx from this boot's first run\n", (unsigned long long)buf_pa);
 	} else {
@@ -72,7 +73,8 @@ int rmtfs_init(void)
 		if (hyp_assign(buf_pa, BUF_SIZE, src, 1, dst, 2))
 			return -1;
 		if ((f = fopen(RMTFS_DIR "/.buffer", "w"))) {
-			fprintf(f, "%lld %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa);
+			fprintf(f, "%lld %llx %llx\n", (long long)bt.tv_sec, (unsigned long long)buf_pa,
+				(unsigned long long)BUF_SIZE);
 			fclose(f);
 		}
 	}

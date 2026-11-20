@@ -46,14 +46,15 @@ echo "probing the file server ($CEPH_FILES_HOST:2223)..."
 printf x > /tmp/wifi-probe
 ready=0
 for _ in $(seq 1 90); do
-	if $F put /tmp/wifi-probe /var/local/wifi-probe 644 >/dev/null 2>&1; then ready=1; break; fi
+	if $F mkdir /var/local 755 >/dev/null 2>&1 &&
+	    $F put /tmp/wifi-probe /var/local/wifi-probe 644 >/dev/null 2>&1; then ready=1; break; fi
 	sleep 2
 done
 [ "$ready" = 1 ] || { echo "file server not reachable (is iOS up?)" >&2; exit 1; }
 $F rm /var/local/wifi-probe >/dev/null 2>&1 || true
 
 echo "installing wland and firmware..."
-for d in /var/local /var/local/bin /var/local/fw /var/local/fw/modem /var/local/fw/rmtfs; do
+for d in /var/local/bin /var/local/fw /var/local/fw/modem /var/local/fw/rmtfs; do
 	$F mkdir "$d" 755 >/dev/null 2>&1 || true
 done
 $F put "$W" /var/local/bin/wland 755
@@ -92,7 +93,10 @@ p['LaunchDaemons']['/System/Library/LaunchDaemons/org.iosonpixel.wland.plist'] =
 plistlib.dump(p, open(sys.argv[2], 'wb'), fmt=plistlib.FMT_BINARY)
 print('launchd jobs:', len(p['LaunchDaemons']))
 PY
-	$F put /System/Library/xpc/launchd.plist.orig /System/Library/xpc/launchd.plist.orig 644 >/dev/null 2>&1 || true
+	if ! $F get /System/Library/xpc/launchd.plist.orig /tmp/launchd.plist.orig >/dev/null 2>&1; then
+		cp /tmp/launchd.plist.cur /tmp/launchd.plist.orig
+		$F put /tmp/launchd.plist.orig /System/Library/xpc/launchd.plist.orig 644
+	fi
 	$F put /tmp/launchd.plist.new /System/Library/xpc/launchd.plist 644
 fi
 

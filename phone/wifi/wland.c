@@ -356,8 +356,11 @@ static int qmp_send(const char *msg)
 /* ---- modem boot: TrustZone PAS (Linux qcom_q6v5_pas + qcom_mdt_loader) ---- */
 
 #define PAS_MODEM	4
-#define MPSS_PA		0x8dc00000ull	/* cepheus modem_region */
-#define MPSS_SIZE	0x0b400000ull
+/* Stock cepheus DTB: /reserved-memory/modem_region = 0x8e000000 + 0x9600000.
+ * The image's last segment ends exactly at 0x97600000, so the base must be
+ * the region base, not flame's 0x8dc00000 (TZ hashes at base + segment). */
+#define MPSS_PA		0x8e000000ull
+#define MPSS_SIZE	0x09600000ull
 #define FW_DIR		"/var/local/fw/modem"
 #define SCM_PIL(cmd)	(0x42000000ull | (2u << 8) | (cmd))
 

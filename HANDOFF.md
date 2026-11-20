@@ -1,9 +1,81 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-19** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-20** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### WiFi: modem ERR-FATAL was the RMTFS buffer size (2026-11-20)
+
+`wifi5` (patched MPSS constants) got past PAS: `auth and reset -> 0/0`, `modem ready
+after 100 ms`, GLINK/QRTR up, services `0x42/0xb401` and `0x2b/0x1202`, RMTFS opened
+`modem_fs1`, `modem_fs2`, `modem_fsg`, pd-mapper answered `tms/pdr_enabled` and
+`tms/pddump_disabled` with 0 domains, then
+`rmtfs: alloc 3145728 bytes for 1 -> 107aa5000` at [4168] and
+`[4211] smp2p: modem state 7 ERR-FATAL ready handover` 43 ms later.
+
+Root cause: `phone/wifi/rmtfs.c` had flame's 2 MB `BUF_SIZE`; the cepheus modem asks
+for 3 MB. The stock DT confirms it: `/soc/qcom,rmtfs_sharedmem@0` has
+`reg = <0 0x300000>` (3 MB). The daemon's `size <= BUF_SIZE` check failed, so the
+modem got QMI error 3 for its allocation and asserted. The pd-mapper 0-domain replies
+are not the cause: flame's table is identical and its modem stayed up, and those
+services are not in either `.jsn` file.
+
+Fix (in the working tree): `BUF_SIZE 0x300000u` in `phone/wifi/rmtfs.c`; the
+`/var/local/fw/rmtfs/.buffer` record now includes the size, so a stale 2 MB mapping is
+not reused. For the immediate test the constants were binary-patched in
+`phone/wifi/out/wland` (`0x200000 -> 0x300000` at file offsets `0xa0c8`, `0xa0f4`,
+`0xa380`, `0xa578`) and the binary re-signed ad hoc; `wland.pre-rmtfs` keeps the
+pre-fix copy. The patched binary is installed at `/var/local/bin/wland` (SHA-256
+`a74209b16168da0183dc6daab2dcc4f8d0884b398ada74cbd635531b34ae7075`), `.buffer` was
+removed, and `wifi6` booted with
+`-G -k logs/runs/touch-0148-quiet/kernel -s 900 -a "sweetmtl=2 sweetusb=2 cepheustouchpanel=0 cepheustouchpanelpor=0"`.
+
+`wifi6` result: the 3 MB alloc now succeeds (`hyp_assign 107a45000+300000`), the modem
+reads `modemst1.img`/`modemst2.img` sector 1+1, then asks for a **single 3 MB iovec**
+(`2 7a45400 17fe`, i.e. `fsg` sector 2 + 6142 sectors) and fails at
+`rmtfs: iovec out of the buffer (2 7a45400 17fe)`: the source's `tmp[BUF_SIZE]` bounce
+buffer is still 2 MB in the patched binary, so the `bytes > sizeof(tmp)` check rejects
+it. The modem err-fatals 35 ms later. This is the last missing piece: a real rebuild
+with `BUF_SIZE=3 MB` grows `tmp` and makes the check pass. The binary patch cannot do
+that safely (`_iovec.tmp` is exactly 2 MB and `_xf` follows it in BSS).
+
+Next: dispatch the `wlan` workflow with the `rmtfs.c` change, put the artifact at
+`phone/wifi/out/wland`, reinstall, and boot `wifi7`. Then the modem should finish the
+EFS reads, start the WLAN PD, publish WLFW `0x45`, and load `wlanmdsp.mbn`.
+
+The earlier `boot: mem setup 8dc00000+9600000` line is only the printf/compile-time
+copy; the SMC literal is patched to `0x8e000000` and auth passed. A real rebuild will
+make all copies consistent.
+
+### WiFi: PAS auth failed on flame's modem region; stock cepheus DT has the real one (2026-11-20)
+
+`wifi3` and `wifi4` proved the launchd job works: `exec wland` at 20.0 s, SMMU
+`0x640/0x1 -> CB5 ... ok`, all WLAN rails up, QMP clock/image acks, the 77,508,765
+bytes of modem segments loaded, then
+`boot: auth and reset -> 4291821497/0` (`0xFFCFFFB9`) and wland exits. `sweetusblog=0`
+in `wifi4` changed nothing, so the failure is not SMC interruption noise.
+
+Root cause: `phone/wifi/wland.c` carried flame's `MPSS_PA=0x8dc00000` /
+`MPSS_SIZE=0x0b400000`, but the stock cepheus DTB (the four appended DTBs in
+`downloads/cepheus/boot_unpacked/kernel`) says
+`/reserved-memory/modem_region = 0x8e000000 + 0x9600000`, with
+`mss@4080000: qcom,pas-id = <4>`, `qcom,firmware-name = "modem"` and
+`memory-region` pointing at it. The image is relocatable and `wland` writes the
+segments at their absolute `p_paddr` (0x8e000000…); the last segment ends exactly at
+0x97600000 and the segment sum is exactly the 77,508,765 bytes in the log. TrustZone
+was therefore told the image starts 2 MB lower than where it was written, so its hash
+check failed.
+
+Fix (in the working tree): `MPSS_PA=0x8e000000`, `MPSS_SIZE=0x09600000` in
+`phone/wifi/wland.c`. For the immediate test the two constants were also binary-patched
+in `phone/wifi/out/wland` (literal at file offset 0x143d8, `mov w19,#0xb400000` at
+0x5da4) and the binary re-signed ad hoc; `wland.flame-base` keeps the old copy.
+`wifi5` race-uploads this binary as soon as the kernel file server listens (~14 s,
+before the 20 s launchd job). The result is in the `wifi5`/`wifi6` section above: PAS
+now succeeds; the next blocker was RMTFS. The stock DT also confirms `icnss`'s
+`iommus = <0x26 0x640 0x1>`, so `radio.c`'s hardcoded WLAN SMMU stream 0x640 is right
+for cepheus.
 
 ### WiFi: the port is staged, wland is the last piece (2026-11-19)
 
