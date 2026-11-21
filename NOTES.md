@@ -379,7 +379,9 @@ Of the ~81 original ios-sweet kernel patches:
   A76/prime, no `cpus=8`. Diagnostic only; patch written, not yet built or tested.
 - 0152 sampler: every `sweetsample` `SMP` line gains `cpu`, `pset` and `ptype` from
   `thread->last_processor` and its processor set, so a placement run can show where
-  each sampled thread runs. Patch written; not yet built or tested.
+  each sampled thread runs. `sweetsamplestart`, `sweetsampleperiod` and
+  `sweetsamplecount` (default 90/120/40) tune the schedule for a short test.
+  Patch written; not yet built or tested.
 - 0153 AMP: `__ARM_AMP__=1` and `MAX_CPU_CLUSTERS=2` for SWEET, plus an early panic
   when the ADT has no E or no P cluster. Needs `tools/mkadt.py --amp` (cluster-type
   `'E'` on CPUs 0-3, `'P'` on 4-7). Held in `xnu/pending/` so the CI series stops at

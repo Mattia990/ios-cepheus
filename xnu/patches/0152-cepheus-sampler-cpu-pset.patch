@@ -1,3 +1,63 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..712d57f 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,9 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * First sample sweetsamplestart seconds after start (default 90), then
++ * every sweetsampleperiod seconds (default 120), sweetsamplecount samples
++ * at most (default 40).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -26,6 +28,17 @@ extern void sweet_sample_start(void);
+ 
+ static char sweet_sample_names[128];
+ 
++static unsigned int
++sweet_sample_arg(const char *name, unsigned int def)
++{
++	unsigned int value = 0;
++
++	if (PE_parse_boot_argn(name, &value, sizeof(value)) && value > 0) {
++		return value;
++	}
++	return def;
++}
++
+ static bool
+ sweet_sample_wanted(const char *name)
+ {
+@@ -64,17 +77,22 @@ static void
+ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static int chan;
++	unsigned int start, period, count;
++
+ 	if (!PE_parse_boot_argn("sweetsample", sweet_sample_names, sizeof(sweet_sample_names))) {
+ 		strlcpy(sweet_sample_names, "SpringBoard,backboardd", sizeof(sweet_sample_names));
+ 	}
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
+-		printf("SMP --- sample %d\n", i);
++	start = sweet_sample_arg("sweetsamplestart", 90);
++	period = sweet_sample_arg("sweetsampleperiod", 120);
++	count = sweet_sample_arg("sweetsamplecount", 40);
++	(void)tsleep(&chan, PZERO, "sweetsmp", start * hz);
++	for (unsigned int i = 0; i < count; i++) {
++		printf("SMP --- sample %u\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", period * hz);
+ 	}
+ }
+ 
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
 index a20a764..212d84f 100644
 --- a/osfmk/kern/exception.c

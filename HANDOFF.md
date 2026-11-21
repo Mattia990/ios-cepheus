@@ -15,7 +15,9 @@ the series (all three are untested):
   without `cpus=` (they cannot be combined). `cpumask=0xF1` selects the
   boot A55 plus all four A76/prime as five logical CPUs.
 - `0152-cepheus-sampler-cpu-pset.patch` adds `cpu N pset N ptype N` to
-  every `sweetsample` `SMP` line, from `thread->last_processor`.
+  every `sweetsample` `SMP` line, from `thread->last_processor`, and
+  adds `sweetsamplestart`/`sweetsampleperiod`/`sweetsamplecount`
+  (defaults 90/120/40 s) so a short test can sample every 20 s.
 - `0153-cepheus-amp-e-p-clusters.patch` turns on `__ARM_AMP__` and
   `MAX_CPU_CLUSTERS=2` for SWEET and panics early if the ADT lacks an E
   or P cluster. It is the intervention, not part of the diagnostic, so
@@ -28,12 +30,15 @@ default tree is byte-identical to before apart from the random seed.
 `tools/cepheus-run.sh` takes `-m CPUMASK` (replaces `cpus=8`) and
 `-A ADT` (default `work/boot/cepheus-hi.adt`).
 
-Order: cold-boot the staged 0151+0152 SMP kernel with `cpumask=0xF1`
-(no AMP, no `cpus=`), run the same full-frame scroll, and compare the
-fps buckets and the sampler's `cpu`/`pset` lines with the `cpus=8`
-baseline. Only if placement demonstrably matters, build 0153 and boot
-the `--amp` ADT. Bit 0 of the cpumask must stay set; disabling the boot
-CPU still sets `cpu_config_correct=false` and panics later.
+Order: first boot the staged 0151+0152 SMP kernel with the usual
+`cpus=8` and `sweetsamplestart=20 sweetsampleperiod=20
+sweetsamplecount=60`, then run the full-frame scroll. If backboardd's
+render threads are already on logical CPUs 4-7 (P), placement is not
+the cause: skip the cpumask and AMP boots. If they run on 0-3 (A55),
+boot the same kernel with `cpumask=0xF1` (one A55 + four P) and compare
+the fps. Only if that changes the frame rate, build 0153 and boot the
+`--amp` ADT. Bit 0 of the cpumask must stay set; disabling the boot CPU
+still sets `cpu_config_correct=false` and panics later.
 
 Open: the phone is dead (last boot ended 2026-11-20 23:04 at t~3036;
 37% at 3.146 V, and the PC port does not charge). Nothing here has been
