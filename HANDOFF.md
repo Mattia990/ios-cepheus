@@ -5,6 +5,34 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### UI: AMP boots all eight CPUs but schedules nothing on P (2026-11-21)
+
+The 0153 kernel booted with the `--amp` ADT (`work/boot/cepheus-amp.adt`,
+E on CPUs 0-3, P on 4-7) and `cpus=8`, no `cpumask`. The kernel ring shows
+`SWEET CPU: 8/8 CPUs initialized`; P CPUs 4-7 (mpidr 0x400-0x700) all came
+alive with PSCI rc=0. No panic; the run ended at t~1687 after 720 s.
+
+Placement: 40 sampler rounds, 1,796 valid `SMP` lines, all `pset 0 ptype 1`
+(E/A55); zero `pset 1`/`ptype 2` (P/A76). The `cpu` field never shows
+4-7. The A76s are online but idle.
+
+Frame rate: the real scroll at t=1182-1258 (16 buckets) averaged 22.4 fps
+(min 10.0, max 41.6); an earlier t=897-902 burst read 46-51 fps but was
+transient. `SWEET GPU: 5s:` still shows ~4% GPU busy with backboardd
+taking the CPU time, so the frame is still CPU-bound in backboardd.
+`cpumask=0xF1` remains better (36-38 steady, 50+ bursts).
+
+Cause: AMP's perfcontrol recommendation marks interactive daemons as E,
+so backboardd (an interactive daemon) never leaves the A55s. The P cluster
+is healthy; the policy is the problem. A local patch (not yet in the repo)
+adds `sweetampforcep=1` to force `TASK_APPTYPE_DAEMON_INTERACTIVE` and
+`TASK_APPTYPE_APP_DEFAULT` threads to P after the utility/background
+checks; it needs one CI build. Otherwise, revert to `cpumask=0xF1`.
+
+Logs: `logs/runs/place-amp/` (`live.txt`, `xnu.txt` 13,409 lines,
+`shim.txt`, `rescue.txt` empty). The run script died at the 720 s mark
+before the automatic rescue; the probe shim + TWRP were run manually.
+
 ### UI: cpumask placement run gained ~50%; shim thread still on A55 (2026-11-21)
 
 `place-smp` booted the 0152-series kernel with `cpus=8` and the 20/20/60
@@ -33,13 +61,6 @@ threads on A55 to 19-25 on A76 (2-8 left on the boot A55). The only
 thread caught executing SweetMetal2 code during the scroll (`t5`, PC
 `SM+0xade4b4`) was on cpu0, the remaining A55; if that is the shim's
 encode/submit thread it is the next serial cost.
-
-Next: AMP. 0153 is now in `xnu/patches/` (series ends at 0153) and
-`work/boot/cepheus-amp.adt` is generated with E/P cluster types (CPUs
-0-3 E, 4-7 P); the patch reverse-checks against the verified
-`/tmp/xnu-test` tree. The phone is in fastboot for the cold run. Push
-the patch move, dispatch the `xnu` workflow, and download the kernel
-artifact; then boot with `-A work/boot/cepheus-amp.adt` and no `-m`.
 
 ### UI: scheduler-placement test is staged, not run (2026-11-21)
 
