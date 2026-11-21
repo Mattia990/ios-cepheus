@@ -1295,9 +1295,20 @@ static char sweetMemoryOwnerKey;
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
 // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
 // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
-// has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
-// by this file's own answers (installAnswers) and any other stays the base class's neutral 0/NO. Nothing is claimed that nothing measured.
-- (void)initLimits {}
+// has not got: running them would claim an Apple GPU's capabilities. They are empty here (initLimits fills only the runtime's measured 2D
+// texture limits), so a limit or feature the runtime measured is answered by this file's own answers (installAnswers) and any other stays the
+// base class's neutral 0/NO. Nothing is claimed that nothing measured.
+- (void)initLimits {
+ // _MTLDevice keeps its limits struct at +8; maxTextureWidth2D/Height2D are the
+ // two uint32 fields at +0x84/+0x88. The base implementation would fill these
+ // from an Apple GPU profile this device has not got. PhotosUICore reads them to
+ // size its redraw context: zero makes it redraw a 1x1 transparent image at 0x0
+ // and assert in PXGCreateContext. 16384 is the runtime's measured 2D limit
+ // (private_properties.rs, MaxTextureWidth2D/Height2D).
+ uint32_t *limits = (uint32_t *)((char *)self + 8);
+ limits[0x84 / 4] = 16384;
+ limits[0x88 / 4] = 16384;
+}
 - (void)initFeatureQueries {}
 - (void)initGPUFamilySupport {}
 - (void)initWorkarounds {}

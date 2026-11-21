@@ -1,9 +1,60 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-21** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-22** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Photos fixed: bridge limits initialized; Notes hang unchanged (2026-11-22 00:35)
+
+Same 0157/0158/0159 kernel and cold boot as the 23:00 entry (`sweetampforcep=1`,
+`cepheustouchlog=1`). The phone stayed up past the expected reset and was
+genuinely unlocked (home screen, Safari, Photos); SSH was still alive at 00:35.
+
+- **Photos root cause confirmed.** The bridge's empty `initLimits` leaves
+  `_MTLDevice`'s limits struct zeroed. `PXGMetalTextureConverter` calls
+  `createTextureFromCGImage` for its 1x1 transparent image; that reads
+  `maxTextureWidth2D`/`Height2D` at `limits+0x84/+0x88`, gets 0, redraws at
+  0x0, and asserts in `PXGCreateContext` (`PXGTextureUtilities.m:290`,
+  `!PXPixelSizeAreaIsZero(roundedSize)`).
+- **Fix (installed, verified).** Patch the `initLimits` thunk at file offset
+  `0xe724` to branch to a cave at `0x12b2000` in executable `__TEXT`:
+  `mov w8,#0x4000; str w8,[x0,#0x8c]; str w8,[x0,#0x90]; ret`
+  (device+8 = limits, so +0x8c/+0x90 are limits+0x84/+0x88). Branch
+  `0x144a8e37`; cave `08 00 88 52 08 8c 00 b9 08 90 00 b9 c0 03 5f d6`.
+  Adhoc re-sign; the original nested dylib is kept, so the bundle's existing
+  `CodeResources` stays valid.
+- **Install method matters.** The first attempt uploaded the 20 MB binary
+  directly while backboardd was dead; launchd restarted it mid-write and
+  SpringBoard/dyld crash-looped (black screen). The safe method stages the
+  binary at `/var/local/bin/SweetMetal2.patched` and makes
+  `/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2` a symlink to it.
+  The bridge resolves its own path to `/var/local/bin`, so also link
+  `/var/local/bin/libvulkan_freedreno.dylib` to the bundle dylib. The swap is
+  instant; backboardd logged `device Turnip Adreno (TM) 640 in 616 ms`.
+- **Verified:** Photos (pid 1958) stays alive and renders the full Library UI
+  (status bar, Recents, tab bar); Safari renders google.com; battery 47%
+  charging in both framebuffers.
+- **Notes is not the Metal bug.** Retested after a real unlock: still black,
+  and thread 0's shared-cache frames are identical to the 23:00 entry's
+  Accounts XPC wait (AccountsUI/Accounts -> Foundation -> libxpc ->
+  libdispatch -> `mach_msg`); `accountsd` workers are still in `liblockdown`,
+  and after subtracting each boot's cache slide their four stacks are identical
+  to the 2026-11-21 run (`logs/runs/edge-forcep/pstack-accountsd-112.txt`).
+  The "lock screen" guess is disproven; this is a real Accounts/lockdown
+  deadlock.
+- **Calculator:** `/Applications/Calculator.app` is present with
+  `CFBundleIdentifier com.apple.calculator`, but `lsreg -l` does not list it
+  and `openapp` is `NotFound`. `lsreg APP` is not enough; next is the
+  MobileInstallation/installd route.
+- **Tooling:** `tools/cepheus-metal2-install.sh` is broken on this image
+  (`rm`/`mv`/`tar`/`toybox` are absent). Use `tools/cepheus-files.py` and the
+  staged-symlink swap above. The source `initLimits` now writes the two
+  fields; the bridge was not rebuilt (no Rust), so the tested artifact is the
+  binary patch.
+
+Still open: Calculator registration, the Notes/Accounts hang, and a persistent
+(non-symlink) install for the bridge once a rebuild is available.
 
 ### edge-forcep boot: force-P and battery verified; Notes black, Photos still broken (2026-11-21 23:00)
 
@@ -50,6 +101,10 @@ USB SSH up ~20 s after boot.
 The phone resets at ~23:28 (`cepheusreboot=1800`); a warm reset does not
 restore touch, so the next run needs a cold power-on. Ask the user whether the
 UI felt more responsive and how the heat was.
+
+**Update 2026-11-22 00:35:** Photos is fixed by the limits patch above. Notes
+was retested after a real unlock; it still shows black and has the same
+Accounts/lockdown hang, so the lock-screen guess is wrong.
 
 ### Edge force-P: 0158 written, 0154/0156 were dead code (2026-11-21)
 

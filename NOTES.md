@@ -39,6 +39,22 @@ Use the full path: `.../platform-tools/adb`, `.../platform-tools/fastboot`.
    table. The 2026-11-21 Notes/accountsd stacks are in
    `logs/runs/edge-forcep/pstack-*.txt`.
 
+## Metal2 bridge (userland)
+
+`SweetMetal2`'s `-initLimits` must initialize `_MTLDevice`'s limits struct; it
+lives at `device+8`. `maxTextureWidth2D`/`Height2D` are the uint32 fields at
+`limits+0x84/+0x88` (the runtime's measured value is 16384). Leaving them zero
+makes PhotosUICore redraw its 1x1 transparent image at 0x0 and assert in
+`PXGCreateContext` (`PXGTextureUtilities.m:290`). Source:
+`phone/metal2/NativeBridgeMetalFrontend.mm`.
+
+The installed test image uses a binary cave at `0x12b2000` branched from the
+`initLimits` thunk at `0xe724` (see HANDOFF). The bundle's main executable is a
+symlink to `/var/local/bin/SweetMetal2.patched`; because the bridge resolves its
+own path to `/var/local/bin`, `/var/local/bin/libvulkan_freedreno.dylib` must
+also be a symlink to the bundle copy. Stage the binary first; a direct `put`
+while backboardd is restarting races dyld and crash-loops SpringBoard.
+
 ## Boot image rules (confirmed from cepheus stock boot.img, 2026-11-05)
 
 Extracted from `/dev/block/sde49` (boot partition) via adb and unpacked with
