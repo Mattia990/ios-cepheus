@@ -1,0 +1,162 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -279,14 +279,137 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); container paths still fail with
++ * ENOENT, while extension tokens are issued and consumed as no-ops. The
++ * first use of each operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Sandbox extensions. libsystem_sandbox issues an opaque token with op 5 and
++ * consumes it with op 6. The iOS 16 ABI is: issue passes seven 64-bit fields
++ * (class, type, resource, flags, token buffer, target pid, target version);
++ * the caller allocates a 0x800-byte token buffer and expects a NUL-terminated
++ * string. Consume passes the token pointer, its length (including the NUL)
++ * and a pointer for the 64-bit handle. SWEET enforces no sandbox, so the
++ * token grants nothing: return a printable token and accept any non-empty
++ * token on consume.
++ */
++#define SWEET_SANDBOX_ISSUE_LOG_MAX 8
++
++struct sweet_sandbox_issue_args {
++	user_addr_t class_name;
++	uint64_t type;
++	user_addr_t resource;
++	uint64_t flags;
++	user_addr_t token;
++	uint64_t target_pid;
++	uint64_t target_version;
++};
++
++struct sweet_sandbox_consume_args {
++	user_addr_t token;
++	uint64_t length;
++	user_addr_t handle;
++};
++
++static unsigned sweet_sandbox_issue_logged;
++
++static int
++sweet_sandbox_extension_issue(struct proc *p, user_addr_t arg)
++{
++	struct sweet_sandbox_issue_args args;
++	char token[64];
++	int len, error;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error != 0) {
++		return error;
++	}
++	if (args.token == 0) {
++		return EINVAL;
++	}
++	len = snprintf(token, sizeof(token), "sweet-%d", proc_pid(p));
++	if (len < 0 || (size_t)len >= sizeof(token)) {
++		return EINVAL;
++	}
++	error = copyout(token, args.token, (size_t)len + 1);
++	if (error != 0) {
++		return error;
++	}
++	if (sweet_sandbox_issue_logged < SWEET_SANDBOX_ISSUE_LOG_MAX) {
++		char name[32];
++		sweet_sandbox_issue_logged++;
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET Sandbox: %s extension issue type %llu "
++		    "flags %#llx target %llu\n", name,
++		    (unsigned long long)args.type,
++		    (unsigned long long)args.flags,
++		    (unsigned long long)args.target_pid);
++	}
++	return 0;
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	struct sweet_sandbox_consume_args args;
++	char first;
++	uint64_t handle = 1;
++	int error;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error != 0) {
++		return error;
++	}
++	if (args.token == 0 || args.handle == 0 || args.length == 0) {
++		return EINVAL;
++	}
++	error = copyin(args.token, &first, sizeof(first));
++	if (error != 0) {
++		return error;
++	}
++	if (first == 0) {
++		return EINVAL;
++	}
++	return copyout(&handle, args.handle, sizeof(handle));
++}
++
++static int
++sweet_sandbox_extension_release(__unused user_addr_t arg)
++{
++	/* Handles are not tracked; releasing one always succeeds. */
++	return 0;
++}
++
++static int
++sweet_sandbox_container_expected(user_addr_t arg)
++{
++	user_addr_t out[2];
++	uint64_t zero = 0;
++	int error;
++
++	error = copyin(arg, out, sizeof(out));
++	if (error != 0) {
++		return error;
++	}
++	if (out[0] != 0) {
++		error = copyout(&zero, out[0], sizeof(zero));
++		if (error != 0) {
++			return error;
++		}
++	}
++	if (out[1] != 0) {
++		error = copyout(&zero, out[1], sizeof(zero));
++		if (error != 0) {
++			return error;
++		}
++	}
++	return 0;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,10 +419,15 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return ENOENT;
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(p, arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
++	case 7:         /* extension release */
++		return sweet_sandbox_extension_release(arg);
+ 	case 0x43:      /* container expected */
+-		return ENOENT;
++		return sweet_sandbox_container_expected(arg);
+ 	default:
+ 		return 0;
+ 	}
