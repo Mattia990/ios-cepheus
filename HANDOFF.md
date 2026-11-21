@@ -34,10 +34,12 @@ thread caught executing SweetMetal2 code during the scroll (`t5`, PC
 `SM+0xade4b4`) was on cpu0, the remaining A55; if that is the shim's
 encode/submit thread it is the next serial cost.
 
-Next: decide whether to try 0153 AMP (keep all eight cores, steer
-user-interactive work to P) or keep `cpumask=0xF1` as the working boot
-arg. AMP needs 0153 moved from `xnu/pending/` to `xnu/patches/`, the
-`--amp` ADT, and one CI build. The phone is in TWRP after the run.
+Next: AMP. 0153 is now in `xnu/patches/` (series ends at 0153) and
+`work/boot/cepheus-amp.adt` is generated with E/P cluster types (CPUs
+0-3 E, 4-7 P); the patch reverse-checks against the verified
+`/tmp/xnu-test` tree. The phone is in fastboot for the cold run. Push
+the patch move, dispatch the `xnu` workflow, and download the kernel
+artifact; then boot with `-A work/boot/cepheus-amp.adt` and no `-m`.
 
 ### UI: scheduler-placement test is staged, not run (2026-11-21)
 
