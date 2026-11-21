@@ -5,6 +5,40 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Edge force-P: 0158 written, 0154/0156 were dead code (2026-11-21)
+
+The running 0156 kernel selects the **edge** scheduler (`sched_string="edge"`),
+not `sched_amp`: `sched_prim.h` picks `sched_edge_dispatch` whenever
+`__AMP__ && CONFIG_SCHED_EDGE`, and `proc_reg.h` defines `CONFIG_SCHED_EDGE`
+for `XNU_TARGET_OS_OSX`. The force-P block in `recommended_pset_type()`
+(0154/0156) is therefore never called, and `pcore_set` is still NULL because
+`sched_amp_pset_init()` never ran. That explains the 447 placement samples:
+all `pset 0 ptype 1` (E), even with `sweetampforcep=1`.
+
+`0158-cepheus-edge-force-p.patch` puts the policy in
+`sched_edge_thread_preferred_cluster()`: with `sweetampforcep=1`, threads of
+app types 1 (interactive daemon), 2 (standard daemon) and 5 (app) whose
+`base_pri > BASEPRI_UTILITY` prefer the P pset. It finds the P pset by
+scanning `pset_array[]` for `PSET_AMP_P`, because `pcore_set` is NULL under
+edge. Utility/background priorities still go to E. `0159` adds `pri` and
+`app` to the `SMP` sampler lines for verification.
+
+Both patches apply cleanly in sequence after 0157 on the reconstructed tree
+(`0154`-`0159`), and `tools/validate-repo.py` passes. Committed as `8cbdf0b`;
+not pushed, not built, not booted.
+
+At handoff the phone did not answer ping or SSH on `192.168.7.2`; it is
+probably powered off or the USB route was lost. A cold power-on is needed
+before the next test.
+
+Next: push `main` (the xnu workflow triggers on `xnu/patches/**`), download
+the `kernel.development.sweet` artifact, and `fastboot boot` it with the AMP
+ADT and the `apps-0156-amp` cmdline (which already has `sweetampforcep=1`).
+On the boot, kill `wifid` before ~165 s, then sample backboardd/SpringBoard:
+look for `pset 1 ptype 2` and `pri > 20`. Then test Photos, Notes, Safari,
+Calculator and the battery, and ask the user whether the UI feels more
+responsive and how the heat is.
+
 ### Sandbox extensions: 0157 written for Photos (2026-11-21)
 
 Photos' TCC failure is the sandbox stub, not TCC. With the original `tccd`

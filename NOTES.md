@@ -420,6 +420,20 @@ Of the ~81 original ios-sweet kernel patches:
   handle is 1, and no sandbox is enforced. Written for Photos: tccd granted
   `kTCCServicePhotos`, then the stub's ENOENT on op 5 aborted the TCC flow
   (`PHPhotoLibrary` Code=45002). Not yet built or booted.
+- 0158 edge force P: `sweetampforcep=1` now forces
+  `TASK_APPTYPE_DAEMON_INTERACTIVE` (1), `TASK_APPTYPE_DAEMON_STANDARD` (2) and
+  `TASK_APPTYPE_APP_DEFAULT` (5) threads with `base_pri > BASEPRI_UTILITY` to
+  the P cluster from `sched_edge_thread_preferred_cluster()`. The kernel runs
+  the edge scheduler (`CONFIG_SCHED_EDGE`, `sched_string="edge"`), so the
+  0154/0156 block in `recommended_pset_type()` never runs and `pcore_set` stays
+  NULL. The patch finds the P pset by scanning `pset_array[]` for
+  `PSET_AMP_P`, so it works without `sched_amp_pset_init()`. Utility and
+  background priorities stay on E. Patch written; verified to apply after
+  0157 on the reconstructed tree; not built or booted.
+- 0159 sampler apptype/pri: `SMP` sampler lines now include `pri <base_pri>`
+  and `app <trp_apptype>` so a boot can show whether backboardd/SpringBoard
+  threads actually moved to `pset 1 ptype 2`. Patch written; not built or
+  booted.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the
