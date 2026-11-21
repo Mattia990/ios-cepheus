@@ -5,6 +5,55 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Apps/battery: SpringBoard queue, Calculator staged, 0155 written (2026-11-21)
+
+The phone is still on the 0154 force-P AMP boot, so the lag is expected (all
+work is on the A55s). The battery sample is real: raw MSOC 150 -> 59%, 3.879 V,
+-165 mA, charger state 3. `IsCharging=No` is correct because the source is
+weaker than the load. The brief 100% came from the first-probe fallback in
+`pollCepheus()` (and the legacy `poll()`), which published 100%/full before the
+gauge was ready; a transient SPMI failure also cleared `fHaveSample` and
+republished it. `0155-cepheus-battery-no-false-full.patch` makes both paths
+publish a neutral 50% estimated state and keep the last sample on a transient
+failure. Written, applies cleanly; not built or booted.
+
+SpringBoard's FrontBoard launch queue wedges after a while: every `openapp`
+then fails with `BSServiceConnectionErrorDomain Code=3` after 5 s, while
+already-running apps still answer. `kill <SpringBoard pid>` fixes it; Clock,
+Safari and Photos all launched afterwards. This was the cause of the failed
+launches; the black-screen rendering of apps that do launch still needs a
+screen-awake retest.
+
+The panel is asleep: `IOMFBBrightnessLevel=0`, `brightness-nits=0`; `/dev/pmem`
+dumps are black with stale scanline artifacts. Remote `openapp` does not wake
+the display. Wake the phone before judging any rendering.
+
+Calculator: the migrator removed the 4-file placeholder container. The full
+bundle is staged at `/private/var/staged_system_apps/Calculator.app` (binary
+mode 755) and `/private/var/preferences/com.apple.demo.SADForceInstall.plist`
+lists `com.apple.calculator`. The IPSW's own staged bundle has the same ad-hoc
+CDHash and a detached signature at
+`/System/Library/AppSignatures/com.apple.calculator`; ad-hoc signing is normal
+here and is not by itself the blocker. A plain `lsreg` of the bundle at
+`/Applications` still returns 0 even with the placeholder gone, so it must be
+installed, not just registered. Live `runmigrator` cannot complete the install:
+with the MobileInstallation SPI entitlement it aborts in
+`-[MIDaemonConfiguration init]` with `NOT_CODESIGNED` (ad-hoc binary, no daemon
+container). The boot-time SystemAppMigrator, running as the system
+`migrationpluginwrapper`, is the expected path to install it on the next boot.
+
+Safari network is healthy: `nettest google.com https://www.google.com/` gives
+DNS, TCP, and HTTP 200; WebKit logs show TLS 1.3/QUIC and resource loads with no
+network error. The remaining Safari problem is UI/rendering and needs the
+screen awake to reproduce.
+
+`lsreg -r` and `lsreg -u` wedge `lsd`; do not use them. Restarting `lsd`
+recovers. Even a plain register can block while `lsd` is wedged.
+
+Next: wake the phone and retest Photos/Safari; reconnect USB in fastboot for a
+`cpumask=0xF1` boot (and to let the boot migrator install Calculator). Build
+0155 with the next kernel.
+
 ### UI: AMP boots all eight CPUs but schedules nothing on P (2026-11-21)
 
 The 0153 kernel booted with the `--amp` ADT (`work/boot/cepheus-amp.adt`,
