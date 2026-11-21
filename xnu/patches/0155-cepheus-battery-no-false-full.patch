@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -343,9 +343,13 @@ SweetBattery::pollCepheus(void)
+ 	    readByte(PM8150B_USID, FG_BATT_SYS_BATT, &missing) &&
+ 	    !(missing & FG_BATT_MISSING_HW);
+ 	if (!hardware) {
+-		fHaveSample = false;
+-		publish(100, 4200, 0, true, true, false, true, false, false,
+-		    false, 2500, false);
++		/* A transient SPMI failure must not resurrect the boot fallback:
++		 * keep the last published sample and use a neutral estimate only
++		 * before the first real one. */
++		if (!fHaveSample) {
++			publish(50, 3800, 0, false, false, false, false, false,
++			    false, true, 2500, false);
++		}
+ 		return;
+ 	}
+ 	socValid = false;
+@@ -370,7 +374,8 @@ SweetBattery::pollCepheus(void)
+ 	if (!socValid && !voltageValid) {
+ 		if (!fHaveSample) {
+-			publish(100, 4200, 0, true, true, false, true, false, false,
+-			    false, 2500, false);
++			/* Do not claim a full pack before the gauge is ready. */
++			publish(50, 3800, 0, false, false, false, false, false,
++			    false, true, 2500, false);
+ 		}
+ 		return;
+ 	}
+@@ -470,8 +475,9 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false,
+-		    false, 2500, false);
++		/* Same rule for the legacy polling path. */
++		publish(50, 3800, 0, false, false, false, false, false,
++		    false, true, 2500, false);
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
