@@ -28,6 +28,9 @@ Use the full path: `.../platform-tools/adb`, `.../platform-tools/fastboot`.
 3. The shim sets the PMIC reboot reason to bootloader, so a reset lands in fastboot.
 4. `fastboot boot downloads/twrp/twrp-...-cepheus.img`, then
    `tools/cepheus-log-pull.sh shim logs/X.txt` (and `xnu` for the XNU ring).
+5. Never overwrite a running mapped binary in place (`cepheus-files.py put`
+   writes in place): replacing `tccd` while it ran panicked twice. Kill the
+   daemon, wait for it to exit, then replace; keep the original hash.
 
 ## Boot image rules (confirmed from cepheus stock boot.img, 2026-11-05)
 
@@ -406,6 +409,17 @@ Of the ~81 original ios-sweet kernel patches:
   launchd plist, so launchd gives it the standard-daemon type, not
   `DAEMON_INTERACTIVE`; the 0154 check (types 1 and 5) therefore missed it.
   Patch written; not yet built or tested.
+- 0157 sandbox extensions: implement the iOS 16 sandbox-extension ABI in
+  `sweet_amfi.c`, recovered from the 16.7.16 `libsystem_sandbox.dylib` in the
+  SystemCryptex dyld shared cache. Op 5 issue takes 56 bytes
+  {class,type,resource,flags,token buffer,target pid,target version} and writes
+  a NUL-terminated token into the caller's 0x800-byte buffer; op 6 consume
+  takes 24 bytes {token,length incl NUL,handle out}; op 7 release is a no-op;
+  op 0x43 container-expected takes two 64-bit out pointers and reports false.
+  Op 4 (container path) still returns ENOENT. The token is `sweet-<pid>`, the
+  handle is 1, and no sandbox is enforced. Written for Photos: tccd granted
+  `kTCCServicePhotos`, then the stub's ENOENT on op 5 aborted the TCC flow
+  (`PHPhotoLibrary` Code=45002). Not yet built or booted.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

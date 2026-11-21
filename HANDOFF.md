@@ -5,6 +5,52 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Sandbox extensions: 0157 written for Photos (2026-11-21)
+
+Photos' TCC failure is the sandbox stub, not TCC. With the original `tccd`
+(no panic, no patched binary) the log shows tccd granting
+`kTCCServicePhotos` via `com.apple.private.tcc.allow`, then
+`Failed to issue sandbox extension for class: com.apple.tcc.kTCCServicePhotos`
+and `kTCCErrorDomain Code=6`; the client preflight returns 0 and
+`PHPhotoLibrary` fails with Code=45002. The SWEET stub returned ENOENT for
+sandbox op 5 (extension issue), so the whole grant aborted.
+
+The iOS 16.7.16 ABI came from `libsystem_sandbox.dylib` in the SystemCryptex
+dyld shared cache (`dyld_shared_cache_arm64.25`, export trie/linkedit in
+`.42.dyldlinkedit`), not from the iOS 26 b2l overlay:
+
+- op 4 container path (still ENOENT);
+- op 5 issue: 56 bytes {class, type, resource, flags, token buffer, target
+  pid, target version}; the caller allocates 0x800 bytes and expects a
+  NUL-terminated token;
+- op 6 consume: 24 bytes {token, length including NUL, handle out}; the
+  wrapper only rejects the literal string "invalid";
+- op 7 release: no-op;
+- op 0x43 container-expected: two 64-bit out pointers, interpreted as
+  booleans; zero means false.
+
+`0157-cepheus-sandbox-extensions.patch` implements these: issue writes
+`sweet-<pid>` into the caller's buffer, consume returns handle 1, release
+succeeds, and op 0x43 reports false. No sandbox is enforced. Committed as
+`0f13540`; applies cleanly after 0114 on the reconstructed tree; not built or
+booted.
+
+Do not overwrite a running binary in place. Both kernel panics followed
+`cepheus-files.py put` onto the mapped `tccd` (the second even after restoring
+the original). Kill the daemon, wait for it to exit, then replace; the
+original `tccd` is back and hash-verified (`53ca5d57...`), running as pid 37.
+
+At handoff the phone is on `apps-0156-amp` with the USB route (`ssh -i
+work/userland/ssh/id_ed25519 root@192.168.7.2`), up ~35-40 s after boot;
+`wifid` must be killed before ~165 s or the Wi-Fi join deletes the USB route.
+`ps` works; `cat`, `head` and `uptime` do not.
+
+Next: build 0157 (push to main triggers the xnu workflow), `fastboot boot` the
+new image, cold power-on (a warm PSCI reboot does not restore touch), then test
+Photos, Notes and Safari with the panel awake, Calculator, and the battery.
+Also check where 0156 force-P puts `backboardd`/SpringBoard and ask the user
+whether the UI feels more responsive.
+
 ### Apps/battery: SpringBoard queue, Calculator staged, 0155 written (2026-11-21)
 
 A later boot of the 0154 AMP kernel with `cpumask=0xF1` (no
