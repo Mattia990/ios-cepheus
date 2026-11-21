@@ -1,0 +1,65 @@
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index aad9f3b..8481fa5 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -1639,6 +1639,10 @@ processor_set_threads(
+ }
+ #endif
+ 
++#if defined(SWEET)
++extern bool sweet_amp_force_p;
++#endif
++
+ pset_cluster_type_t
+ recommended_pset_type(thread_t thread)
+ {
+@@ -1677,6 +1681,23 @@ recommended_pset_type(thread_t thread)
+ 		}
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * AMP's perfcontrol recommendation puts every daemon on E, including
++	 * backboardd, whose compositor is the frame-critical thread here. Let
++	 * interactive daemons and apps use P; the utility/background checks
++	 * above still keep their low-priority threads on E.
++	 */
++	if (sweet_amp_force_p) {
++		task_t force_task = get_threadtask(thread);
++		if (force_task != kernel_task &&
++		    (force_task->requested_policy.trp_apptype == TASK_APPTYPE_DAEMON_INTERACTIVE ||
++		     force_task->requested_policy.trp_apptype == TASK_APPTYPE_APP_DEFAULT)) {
++			return PSET_AMP_P;
++		}
++	}
++#endif
++
+ 	struct thread_group *tg = thread_group_get(thread);
+ 	cluster_type_t recommendation = thread_group_recommendation(tg);
+ 	switch (recommendation) {
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..1c00587 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -433,6 +433,10 @@ int enable_task_set_cluster_type = 0;
+ bool system_ecore_only = false;
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if defined(SWEET)
++bool sweet_amp_force_p = false;
++#endif
++
+ void
+ sched_init(void)
+ {
+@@ -475,6 +479,10 @@ sched_init(void)
+ 	}
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if defined(SWEET)
++	sweet_amp_force_p = PE_parse_boot_argn("sweetampforcep", NULL, 0);
++#endif
++
+ 	simple_lock_init(&sched_available_cores_lock, 0);
+ }
+ 

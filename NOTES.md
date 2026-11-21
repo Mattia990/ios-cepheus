@@ -390,6 +390,11 @@ Of the ~81 original ios-sweet kernel patches:
   placements were pset 0 (E); no thread used P. AMP's default recommendation
   sends backboardd to E, so this is a loss versus `cpumask=0xF1`. See
   HANDOFF.md for the force-P follow-up.
+- 0154 AMP force P: `sweetampforcep=1` makes `recommended_pset_type()` return P for
+  `TASK_APPTYPE_DAEMON_INTERACTIVE` and `TASK_APPTYPE_APP_DEFAULT` threads after the
+  utility/background checks, so backboardd/SpringBoard can use the A76s while
+  background/utility work stays on E. The boot arg defaults off; the 0154 series is
+  otherwise identical to 0153. Patch written; not yet built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

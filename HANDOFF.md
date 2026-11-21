@@ -24,10 +24,15 @@ taking the CPU time, so the frame is still CPU-bound in backboardd.
 
 Cause: AMP's perfcontrol recommendation marks interactive daemons as E,
 so backboardd (an interactive daemon) never leaves the A55s. The P cluster
-is healthy; the policy is the problem. A local patch (not yet in the repo)
-adds `sweetampforcep=1` to force `TASK_APPTYPE_DAEMON_INTERACTIVE` and
-`TASK_APPTYPE_APP_DEFAULT` threads to P after the utility/background
-checks; it needs one CI build. Otherwise, revert to `cpumask=0xF1`.
+is healthy; the policy is the problem. `0154-cepheus-amp-force-p.patch`
+(now in `xnu/patches/`) adds `sweetampforcep=1`: it forces
+`TASK_APPTYPE_DAEMON_INTERACTIVE` and `TASK_APPTYPE_APP_DEFAULT` threads
+to P after the utility/background checks, so backboardd/SpringBoard can
+use the A76s while background/utility work stays on E. The arg defaults
+off. Next: push `main`, dispatch the `xnu` workflow, download the kernel
+artifact, and boot with `-A work/boot/cepheus-amp.adt` plus
+`sweetampforcep=1` (no `-m`). If that still does not use P, revert to
+`cpumask=0xF1`.
 
 Logs: `logs/runs/place-amp/` (`live.txt`, `xnu.txt` 13,409 lines,
 `shim.txt`, `rescue.txt` empty). The run script died at the 720 s mark
