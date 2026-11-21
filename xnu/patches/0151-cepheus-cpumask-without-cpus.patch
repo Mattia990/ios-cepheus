@@ -1,0 +1,26 @@
+commit 416a2bdd4c96abe20dc95ad3dab907e9c592ae31
+Author: test <a@b>
+Date:   Sat Nov 21 10:34:51 2026 +0100
+
+    cpumask fix
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..21e4a0c 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -955,8 +955,13 @@ ml_parse_cpu_topology(void)
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 
+ #if defined(SWEET)
+-	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s). */
+-	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
++	/*
++	 * Opt in to SMP with cpus=N or cpumask=... (N <= SWEET_SMP_MAX_CPUS;
++	 * cores 0-3 are the A55s, 4-7 the A76s). Without either boot arg keep
++	 * the single boot CPU. cpumask alone used to be clamped to one CPU
++	 * here, which made it unusable (cpus= and cpumask= cannot be combined).
++	 */
++	if ((!cpus_boot_arg_present && !cpumask_boot_arg_present) || cpu_boot_arg == 0) {
+ 		cpu_boot_arg = 1;
+ 	}
+ 	if (cpu_boot_arg > SWEET_SMP_MAX_CPUS) {

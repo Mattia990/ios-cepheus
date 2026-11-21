@@ -1,0 +1,26 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..212d84f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1014,7 +1014,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
++		processor_t last = thread->last_processor;
++		processor_set_t pset = last ? last->processor_set : NULL;
++		char line[512];
+ 		int n;
+ 		uint64_t fp;
+ 
+@@ -1022,7 +1024,9 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
++		n = snprintf(line, sizeof(line), "SMP %s t%d cpu %d pset %d ptype %d pc 0x%llx lr 0x%llx sp 0x%llx bt",
++		    name, tn++, last ? last->cpu_id : -1, pset ? pset->pset_id : -1,
++		    pset ? (int)pset->pset_cluster_type : -1,
+ 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];

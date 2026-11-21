@@ -4,6 +4,8 @@
 #   tools/cepheus-run.sh NAME [-k KERNEL] [-s SECS] [-a "EXTRA BOOT-ARGS"] [-f FILM_SECS] [-g REGEX]
 #                           [-p POKE_SCRIPT]   (bsd/dev/sweet_poke.c; output lines start "POKE:")
 #                           [-G]  Adreno firmware in the ADT + sweetgpu=1 (bsd/dev/sweet_gpu.c)
+#                           [-A ADT]  use this ADT (default work/boot/cepheus-hi.adt)
+#                           [-m CPUMASK]  replace cpus=8 with cpumask=CPUMASK (needs 0151)
 #
 #   1. payload + boot image from KERNEL (default: the last build) with the base
 #      boot-args, cepheusreboot=SECS (default 300) and the extra args
@@ -24,16 +26,22 @@ if [ -d "$ROOT/../platform-tools" ]; then
 fi
 name=$1; shift
 kernel=$ROOT/work/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
-secs=300 extra="" film=0 grep_re="" poke="" gpu=0
-while getopts "k:s:a:f:g:p:G" o; do
+secs=300 extra="" film=0 grep_re="" poke="" gpu=0 adt=$ROOT/work/boot/cepheus-hi.adt cpumask=""
+while getopts "k:s:a:f:g:p:GA:m:" o; do
 	case $o in
 	k) kernel=$OPTARG ;; s) secs=$OPTARG ;; a) extra=$OPTARG ;; f) film=$OPTARG ;; g) grep_re=$OPTARG ;;
 	p) poke=$OPTARG ;;
 	G) gpu=1 ;;
+	A) adt=$OPTARG ;;
+	m) cpumask=$OPTARG ;;
 	*) exit 2 ;;
 	esac
 done
 base="debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 ufsrw=1 rootrw=1"
+if [ -n "$cpumask" ]; then
+	# cpumask and cpus cannot be combined (ml_parse_cpu_topology panics).
+	base=${base/cpus=8/cpumask=$cpumask}
+fi
 base="$base unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1"
 base="$base wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 ufslogsecs=2"
 cmdline="$base cepheusreboot=$secs $extra"
@@ -47,7 +55,7 @@ echo "$cmdline" > "$out/cmdline"
 pokearg=()
 if [ -n "$poke" ]; then cp "$poke" "$out/poke.txt"; pokearg=(--poke "$poke"); fi
 if [ "$gpu" = 1 ]; then pokearg+=(--gpufw research/gpu/fw); cmdline="$cmdline sweetgpu=1"; echo "$cmdline" > "$out/cmdline"; fi
-python3 tools/mkpayload.py "$kernel" work/boot/cepheus-hi.adt "$out/payload.bin" --cmdline "$cmdline" ${pokearg[@]+"${pokearg[@]}"} >/dev/null
+python3 tools/mkpayload.py "$kernel" "$adt" "$out/payload.bin" --cmdline "$cmdline" ${pokearg[@]+"${pokearg[@]}"} >/dev/null
 shim/build.sh "$out/payload.bin" "$img" >/dev/null 2>&1
 rm -f "$out/payload.bin"
 # The probe shim (no payload) for the rescue boot: build it once per shim change.

@@ -1,0 +1,59 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 21e4a0c..2050560 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1136,6 +1136,18 @@ ml_parse_cpu_topology(void)
+ 	cluster_offsets[0] = 0;
+ #endif
+ 	assert(topology_info.boot_cpu != NULL);
++#if defined(SWEET) && defined(__ARM_AMP__)
++	/*
++	 * AMP needs one E and one P cluster. A mismatched ADT would leave
++	 * ecore_set/pcore_set incomplete and the scheduler would then reject
++	 * every E-recommended thread; fail loudly instead of booting broken.
++	 */
++	if (topology_info.cluster_type_num_clusters[CLUSTER_TYPE_E] == 0 ||
++	    topology_info.cluster_type_num_clusters[CLUSTER_TYPE_P] == 0) {
++		panic("SWEET AMP: ADT needs E and P cluster types (got 0x%x)",
++		    topology_info.cluster_types);
++	}
++#endif
+ 	ml_read_chip_revision(&topology_info.chip_revision);
+ 
+ 	/*
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 40ee459..a85044c 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -18,11 +18,14 @@
+ #define SWEET                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * All eight cores (four A55 + three A76 + one A76 prime) as two AMP
++ * clusters: cores 0-3 are the A55s (E), 4-7 the A76s (P). The ADT marks
++ * the cluster type per CPU; XNU's AMP scheduler then prefers P for
++ * user-interactive work and spills background work to E. Without
++ * __ARM_AMP__, MAX_CPU_CLUSTERS=1 below compiles AMP out and the clutch
++ * scheduler treats all eight as one homogeneous SMP cluster.
+  */
++#define __ARM_AMP__                1
+ #define SWEET_SMP_MAX_CPUS         8
+ 
+ #define ARM_ARCH_TIMER
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..3073077 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,7 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+-#define MAX_CPU_CLUSTERS               1
++#define MAX_CPU_CLUSTERS               2 /* A55 (E) + A76/prime (P) */
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 

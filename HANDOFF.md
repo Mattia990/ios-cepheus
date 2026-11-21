@@ -5,6 +5,40 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### UI: scheduler-placement test is staged, not run (2026-11-21)
+
+The next boot experiment is CPU placement, not another frequency or
+vsync test. Three kernel patches are written and apply cleanly on top of
+the series (all three are untested):
+
+- `0151-cepheus-cpumask-without-cpus.patch` lets SWEET use `cpumask=`
+  without `cpus=` (they cannot be combined). `cpumask=0xF1` selects the
+  boot A55 plus all four A76/prime as five logical CPUs.
+- `0152-cepheus-sampler-cpu-pset.patch` adds `cpu N pset N ptype N` to
+  every `sweetsample` `SMP` line, from `thread->last_processor`.
+- `0153-cepheus-amp-e-p-clusters.patch` turns on `__ARM_AMP__` and
+  `MAX_CPU_CLUSTERS=2` for SWEET and panics early if the ADT lacks an E
+  or P cluster. It is the intervention, not part of the diagnostic.
+
+`tools/mkadt.py --amp` now emits `cluster-type 'E'` for CPUs 0-3 and
+`'P'` for 4-7 (values 69/80); without it every CPU stays type 0. The
+default tree is byte-identical to before apart from the random seed.
+`tools/cepheus-run.sh` takes `-m CPUMASK` (replaces `cpus=8`) and
+`-A ADT` (default `work/boot/cepheus-hi.adt`).
+
+Order: cold-boot the staged 0151+0152 SMP kernel with `cpumask=0xF1`
+(no AMP, no `cpus=`), run the same full-frame scroll, and compare the
+fps buckets and the sampler's `cpu`/`pset` lines with the `cpus=8`
+baseline. Only if placement demonstrably matters, build 0153 and boot
+the `--amp` ADT. Bit 0 of the cpumask must stay set; disabling the boot
+CPU still sets `cpu_config_correct=false` and panics later.
+
+Open: the phone is dead (last boot ended 2026-11-20 23:04 at t~3036;
+37% at 3.146 V, and the PC port does not charge). Nothing here has been
+built or booted; there is no local kernel build environment. Still
+pending from earlier: `sweetgpufreq=5`, Reduce Motion, a longer pstack,
+and the clock/timezone and Wi-Fi status-bar checks.
+
 ### UI: 0056 is overridden; frame cost is shim throughput (2026-11-21)
 
 The exact image boots with `sweetfb_hz=60`, so 0056's throttle is

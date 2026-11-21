@@ -373,6 +373,16 @@ Of the ~81 original ios-sweet kernel patches:
   Raw values are published as `SweetBatteryRaw{MSOC,VBATT,IBATT,Temp}`,
   `SweetBatterySocReady` and `SweetBatteryChargerState`. Patch written; not yet
   built or tested.
+- 0151 cpumask: SWEET's `ml_parse_cpu_topology` clamp no longer forces one CPU when
+  only `cpumask=` is present (it still does with no boot arg, and `cpus=` and
+  `cpumask=` cannot be combined). Makes `cpumask=0xF1` usable: boot A55 plus all four
+  A76/prime, no `cpus=8`. Diagnostic only; patch written, not yet built or tested.
+- 0152 sampler: every `sweetsample` `SMP` line gains `cpu`, `pset` and `ptype` from
+  `thread->last_processor` and its processor set, so a placement run can show where
+  each sampled thread runs. Patch written; not yet built or tested.
+- 0153 AMP: `__ARM_AMP__=1` and `MAX_CPU_CLUSTERS=2` for SWEET, plus an early panic
+  when the ADT has no E or no P cluster. Needs `tools/mkadt.py --amp` (cluster-type
+  `'E'` on CPUs 0-3, `'P'` on 4-7). Patch written; not yet built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

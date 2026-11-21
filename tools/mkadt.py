@@ -4,7 +4,11 @@
 Only what the early boot path actually reads (see ios-sweet's NOTES.md); every
 MMIO address comes from the cepheus (Xiaomi Mi 9, SM8150) live FDT, read from
 the phone on 2026-11-05.
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--amp]
+
+--amp marks cores 0-3 as cluster-type 'E' (A55) and 4-7 as 'P' (A76/prime)
+for an XNU built with __ARM_AMP__; without it every CPU is cluster-type 0
+(one homogeneous SMP cluster).
 """
 import hashlib, os, struct, sys
 
@@ -80,7 +84,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, amp=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -143,20 +147,23 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SMP: all eight cores in physical-core order (flame: 0-3 Cortex-A55,
-    # 4-6 Cortex-A76, 7 the A76 prime core), one homogeneous cluster. The
-    # kernel defaults to one and uses cpus=N to select an initial prefix.
-    # QEMU retains its original single-CPU tree: its MPIDRs differ.
+    # SMP by default: all eight cores in physical-core order (cepheus: 0-3
+    # Cortex-A55, 4-6 Cortex-A76, 7 the A76 prime core), one homogeneous
+    # cluster. The kernel defaults to one and uses cpus=N to select an
+    # initial prefix. --amp instead marks 0-3 'E' and 4-7 'P' for an AMP
+    # kernel. QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        amp_cluster = 0 if core < 4 else 1
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo470') + cstr('qcom,kryo485') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-id', u32(amp_cluster if amp else 0)),  # descriptive; see ml_parse_cpu_topology
+            # 0 = homogeneous CLUSTER_TYPE_SMP; 'E'/'P' select XNU's AMP path.
+            ('cluster-type', u32((ord('E') if amp_cluster == 0 else ord('P')) if amp else 0)),
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(core)),  # per-core L2 nodes in the live FDT
@@ -264,7 +271,10 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    if '--amp' in sys.argv and '--qemu' in sys.argv:
+        raise SystemExit('--amp is phone-only (QEMU keeps a single SMP CPU)')
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 amp='--amp' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
