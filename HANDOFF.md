@@ -7,8 +7,17 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ### Apps/battery: SpringBoard queue, Calculator staged, 0155 written (2026-11-21)
 
-The phone is still on the 0154 force-P AMP boot, so the lag is expected (all
-work is on the A55s). The battery sample is real: raw MSOC 150 -> 59%, 3.879 V,
+A later boot of the 0154 AMP kernel with `cpumask=0xF1` (no
+`sweetampforcep=1`) was far laggier than the 0152-series `cpumask=0xF1` boot:
+`cpumask` leaves only CPU0 as E, and AMP's default policy puts the interactive
+daemons there while CPUs 4-7 idle. Do not combine the AMP kernel with
+`cpumask` unless force-P is on. The phone was switched back to the 0152-series
+`cpumask=0xF1` image (`work/boot/runs/apps-cpumask-good.img`), which booted
+faster and restored the known-good responsiveness. A warm PSCI reboot does not
+restore touch (the panel needs a cold power-on), so the cold-run image still
+needs the user's power cycle.
+
+The battery sample is real: raw MSOC 150 -> 59%, 3.879 V,
 -165 mA, charger state 3. `IsCharging=No` is correct because the source is
 weaker than the load. The brief 100% came from the first-probe fallback in
 `pollCepheus()` (and the legacy `poll()`), which published 100%/full before the
