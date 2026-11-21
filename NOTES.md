@@ -398,7 +398,14 @@ Of the ~81 original ios-sweet kernel patches:
 - 0155 battery: the PM8150B `pollCepheus()` and legacy `poll()` fallbacks no longer
   publish 100%/full when the gauge is missing or not ready; they publish a neutral
   50% estimated state, and a transient SPMI probe failure keeps the last sample
-  instead of clearing `fHaveSample`. Patch written; not yet built.
+  instead of clearing `fHaveSample`. Built in the 2026-11-21 13:44 kernel
+  (`work/boot/kernel-wifi-battery`, verified in the disassembly: `publish(50,
+  3800, ...)` guarded by `fHaveSample`, no clear on `!hardware`).
+- 0156 AMP force P standard: `sweetampforcep=1` also covers
+  `TASK_APPTYPE_DAEMON_STANDARD` (2). `backboardd` has no `ProcessType` in its
+  launchd plist, so launchd gives it the standard-daemon type, not
+  `DAEMON_INTERACTIVE`; the 0154 check (types 1 and 5) therefore missed it.
+  Patch written; not yet built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

@@ -1,0 +1,12 @@
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -1684,7 +1684,8 @@ recommended_pset_type(thread_t thread)
+ 		task_t force_task = get_threadtask(thread);
+ 		if (force_task != kernel_task &&
+ 		    (force_task->requested_policy.trp_apptype == TASK_APPTYPE_DAEMON_INTERACTIVE ||
++		     force_task->requested_policy.trp_apptype == TASK_APPTYPE_DAEMON_STANDARD ||
+ 		     force_task->requested_policy.trp_apptype == TASK_APPTYPE_APP_DEFAULT)) {
+ 			return PSET_AMP_P;
+ 		}
+ 	}
