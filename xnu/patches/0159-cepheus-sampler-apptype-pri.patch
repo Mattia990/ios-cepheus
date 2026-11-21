@@ -1,0 +1,15 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1024,9 +1024,10 @@
+ 			continue;
+ 		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d cpu %d pset %d ptype %d pc 0x%llx lr 0x%llx sp 0x%llx bt",
++		n = snprintf(line, sizeof(line), "SMP %s t%d cpu %d pset %d ptype %d pri %d app %d pc 0x%llx lr 0x%llx sp 0x%llx bt",
+ 		    name, tn++, last ? last->cpu_id : -1, pset ? pset->pset_id : -1,
+ 		    pset ? (int)pset->pset_cluster_type : -1,
++		    thread->base_pri, task->requested_policy.trp_apptype,
+ 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];

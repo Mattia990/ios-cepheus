@@ -1,0 +1,50 @@
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -137,6 +137,10 @@
+ static inline void sched_clutch_hierarchy_locked_assert(sched_clutch_root_t);
+ 
+ extern processor_set_t pset_array[MAX_PSETS];
++
++#if defined(SWEET)
++extern bool sweet_amp_force_p;
++#endif
+ 
+ /*
+  * Special markers for buckets that have invalid WCELs/quantums etc.
+@@ -1228,6 +1232,35 @@
+ 		return sched_edge_thread_bound_cluster_id(thread);
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * The Edge scheduler relies on CLPC to move interactive work to the P
++	 * cluster. SWEET has no CLPC, so every thread group keeps the E
++	 * preference it was initialized with and the A76s stay idle. Apply the
++	 * AMP force-P policy (0154/0156) here instead, in the scheduler this
++	 * kernel actually selects (CONFIG_SCHED_EDGE).
++	 *
++	 * Utility and background priorities stay on E, matching the AMP path's
++	 * early returns; above-utility daemon and app threads may use P.
++	 */
++	if (sweet_amp_force_p && thread->base_pri > BASEPRI_UTILITY) {
++		task_t task = get_threadtask(thread);
++
++		if (task != kernel_task &&
++		    (task->requested_policy.trp_apptype == TASK_APPTYPE_DAEMON_INTERACTIVE ||
++		     task->requested_policy.trp_apptype == TASK_APPTYPE_DAEMON_STANDARD ||
++		     task->requested_policy.trp_apptype == TASK_APPTYPE_APP_DEFAULT)) {
++			for (int i = 0; i < MAX_PSETS; i++) {
++				processor_set_t pset = pset_array[i];
++
++				if (pset != NULL && pset->pset_cluster_type == PSET_AMP_P) {
++					return pset->pset_cluster_id;
++				}
++			}
++		}
++	}
++#endif /* defined(SWEET) */
++
+ 	sched_clutch_t clutch = sched_clutch_for_thread(thread);
+ 	sched_bucket_t sched_bucket = thread->th_sched_bucket;
+ 	if (thread->sched_flags & TH_SFLAG_DEPRESSED_MASK) {
