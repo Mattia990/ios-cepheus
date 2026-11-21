@@ -18,7 +18,9 @@ the series (all three are untested):
   every `sweetsample` `SMP` line, from `thread->last_processor`.
 - `0153-cepheus-amp-e-p-clusters.patch` turns on `__ARM_AMP__` and
   `MAX_CPU_CLUSTERS=2` for SWEET and panics early if the ADT lacks an E
-  or P cluster. It is the intervention, not part of the diagnostic.
+  or P cluster. It is the intervention, not part of the diagnostic, so
+  it is held in `xnu/pending/` and the CI series stops at 0152 until the
+  cpumask result is in. Move it to `xnu/patches/` for the AMP build.
 
 `tools/mkadt.py --amp` now emits `cluster-type 'E'` for CPUs 0-3 and
 `'P'` for 4-7 (values 69/80); without it every CPU stays type 0. The

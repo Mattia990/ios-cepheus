@@ -382,7 +382,9 @@ Of the ~81 original ios-sweet kernel patches:
   each sampled thread runs. Patch written; not yet built or tested.
 - 0153 AMP: `__ARM_AMP__=1` and `MAX_CPU_CLUSTERS=2` for SWEET, plus an early panic
   when the ADT has no E or no P cluster. Needs `tools/mkadt.py --amp` (cluster-type
-  `'E'` on CPUs 0-3, `'P'` on 4-7). Patch written; not yet built or tested.
+  `'E'` on CPUs 0-3, `'P'` on 4-7). Held in `xnu/pending/` so the CI series stops at
+  0152 for the cpumask placement diagnostic; move it into `xnu/patches/` for the AMP
+  build. Patch written; not yet built or tested.
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the
