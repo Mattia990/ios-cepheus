@@ -5,6 +5,52 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### edge-forcep boot: force-P and battery verified; Notes black, Photos still broken (2026-11-21 23:00)
+
+Ran the user-built `work/boot/kernel-wifi-battery/kernel.development.sweet`
+(SHA-256 `ddd2a910...`, contains 0157/0158/0159) with the AMP ADT and
+`sweetampforcep=1`; exact args in `logs/runs/edge-forcep/cmdline`. Cold boot,
+USB SSH up ~20 s after boot.
+
+- **Force-P works.** 48 `SMP` samples: SpringBoard threads are all `pset 1
+  ptype 2`; backboardd's working threads are on P and its `pri 20` utility
+  thread stays on E. 0158 is verified under the edge scheduler.
+- **Battery is real.** `SweetBatteryPercent=65`, raw MSOC 166, 3989 mV,
+  -126 mA, `IsCharging=No`, `FullyCharged=No`, `ExternalConnected=Yes`,
+  `Fallback=No`, `SOCEstimated=No`, `HardwareSampleValid=Yes`, charger state 3.
+  No 100%/charging transient.
+- **Safari renders.** Google homepage, address bar and 65% status bar in the
+  framebuffer; ~37 fps with GPU submits active. The GPU-presented stride is
+  4352 bytes (1088 px), not 4320/4608.
+- **Photos TCC is fixed.** No `Failed to issue sandbox extension` this boot.
+  Two app-level failures remain (below).
+- **SpringBoard launch-queue wedge** reproduced after a bulk of launches; `kill
+  25` cleared it. SpringBoard restarted as pid 839; Safari then launched as pid
+  851 with WebKit children.
+- **Notes shows a black content area** (status bar and home indicator only).
+  `MobileNotes`' main thread is blocked in a synchronous Accounts XPC call
+  (Notes+0x100d0 -> AccountsUI+0x4744 -> Accounts+0x255a0 -> Foundation+0x9a224
+  -> libxpc+0xe0ec -> libdispatch+0x36308 -> `mach_msg`); FrontBoard logs a 10 s
+  `scene-update` watchdog violation but declines to terminate. `accountsd`
+  (112) worker threads are blocked in `liblockdown`
+  (+0x1fd8/+0x2128/+0x4910). SpringBoard keeps a `Device blocked` wallet
+  assertion and `wifid` first saw `unlockedSinceBoot` only at 23:21:16, so the
+  device was locked for most of the run; touch could not swipe it up. A second
+  launch fails with `FBSOpenApplicationServiceErrorDomain Code=5`
+  (`InvalidResponse`). Stacks: `logs/runs/edge-forcep/pstack-*.txt`. **Guess:**
+  this may be the lock screen (black clock/wallpaper), not a Notes rendering
+  bug; retest after a real cold-boot unlock.
+- **Still open:** `PhotosFileProvider` op 4 container path is `ENOENT`;
+  `MobileSlideShow` still asserts in `PXGCreateContext`
+  (`!PXPixelSizeAreaIsZero(roundedSize)`, `PXGTextureUtilities.m:290`) after
+  "Too large image 1x1"; the public `maxTextureWidth`/`maxTextureHeight`
+  answers are missing from the Metal bridge. Calculator is still `NotFound` to
+  FrontBoard.
+
+The phone resets at ~23:28 (`cepheusreboot=1800`); a warm reset does not
+restore touch, so the next run needs a cold power-on. Ask the user whether the
+UI felt more responsive and how the heat was.
+
 ### Edge force-P: 0158 written, 0154/0156 were dead code (2026-11-21)
 
 The running 0156 kernel selects the **edge** scheduler (`sched_string="edge"`),
@@ -27,9 +73,8 @@ Both patches apply cleanly in sequence after 0157 on the reconstructed tree
 (`0154`-`0159`), and `tools/validate-repo.py` passes. Committed as `8cbdf0b`;
 not pushed, not built, not booted.
 
-At handoff the phone did not answer ping or SSH on `192.168.7.2`; it is
-probably powered off or the USB route was lost. A cold power-on is needed
-before the next test.
+Superseded by the boot results above: the phone was reachable and the
+0157/0158/0159 kernel booted with the AMP ADT.
 
 Next: push `main` (the xnu workflow triggers on `xnu/patches/**`), download
 the `xnu-kernel` artifact, then run it with the AMP ADT and the previous
