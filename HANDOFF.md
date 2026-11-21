@@ -60,6 +60,14 @@ SMP boots `pset` is 0 and `cpu` is the logical ID (0-3 A55, 4-7 A76),
 while AMP should put user-interactive threads in `pset` 1 (`ptype` 2,
 P) and kernel/background work in `pset` 0 (`ptype` 1, E).
 
+The existing `metal2` telemetry already argues against a frontend stall:
+`J scheduled wait` 54 ms over 4370 commits, `J completed wait` 26 ms
+over 2, `J resource wait` 0. The GPU was 31-37% busy while backboardd
+used >100% CPU, so the 27-28 ms frame is CPU work in backboardd, not the
+shim waiting on the GPU. Core type/placement is therefore the remaining
+non-Rust lever, but it is still a hypothesis until the sampler shows
+where those threads actually run.
+
 Open: the phone is dead (last boot ended 2026-11-20 23:04 at t~3036;
 37% at 3.146 V, and the PC port does not charge). Nothing here has been
 built or booted; there is no local kernel build environment. Still
