@@ -1,9 +1,45 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-20** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-21** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### UI: 0056 is overridden; frame cost is shim throughput (2026-11-21)
+
+The exact image boots with `sweetfb_hz=60`, so 0056's throttle is
+disabled: `fFlushTicks = 1` and the latest pending frame is presented at
+every vsync tick. Panel
+copies track swaps (233 copies/247 swaps in the 49.4 fps bucket;
+137/141 at 28.2 fps), and the kernel's `avg copy` is 0.52-0.65 ms,
+about 1.7% of one CPU at 28 fps. 0056 is not the frame-pacing cause; do
+not spend a boot on it.
+
+Full-frame cadence is not vsync-locked. At t=2168.752-2169.058 eleven
+`rp12 dr56` frames commit every 27-28 ms (about 36 fps instantaneous),
+with ctc 10.6-11.2 ms; the 5 s buckets over the same scroll read 29-34
+fps. The 49.4 fps bucket is not evidence of a cool full frame: the
+nearby t=142 rows are a light `rp1 dr13-15` scene at 17-19 ms, and the
+bucket that follows is diluted by idle. CPU clusters are at their top
+table entries (A55 1785, A76 2419, prime 2841 MHz) and `sweetddr` votes
+are on by default, so frequency is not the missing lever.
+
+At 27-28 ms per full frame, the 12.6 ms age and 10.6 ms ctc are close
+to additive, but age includes caller idle; that is consistent with
+serialization, not proof. The cheapest boot-arg experiment left is
+`sweetgpufreq=5` (585 vs 499 MHz), estimated at ~1-1.5 ms of ctc; it
+needs a cold boot. Shaving the CPU side means changing the shim.
+
+Replay logging is structurally on: `Rebinds::any()` is `live > 0` (any
+buffer over host pages), and `open_render` creates a `RenderLog` for
+every pass while it is true. In the installed binary, `set_viewport` at
++0x267d70 tests the log Vec at encoder+0xd58; when present it allocates
+a 48-byte box and appends a 40-byte call per viewport. That is a real
+per-call cost, but the 90 SweetMetal2 pstack samples are spread over
+~70 functions and do not concentrate in this block, so its share is
+unmeasured. `phone/tools/pstack2.c` reads the Vec fields at runtime; it
+is written but not built (`work/userland/bin/ios-cc` is absent) and has
+not run.
 
 ### UI: exact metal2 image is still ~28 fps; the lag is longstanding (2026-11-20)
 
@@ -34,12 +70,15 @@ was 1.07 ms/submit early versus 3.5-3.9 ms later, which fits a lighter,
 still-loading home screen as well as throttling. Do not treat 49 fps as
 the baseline until the same scene is measured early and late.
 
-Next: wall-charge and cool the phone (the pack was 37% at 3.146 V on the
-non-charging PC port), then scroll Preferences immediately after a cold
-boot and again after ~15 min. The transparency A/B below narrows the
-cost to render-pass and draw encoding.
+Next: charge the pack and do a cold boot. The 0056 question is closed
+(above). For one free test, add `sweetgpufreq=5` to the boot args and
+compare the same full-frame scroll at ~15 s and ~10 min; Reduce Motion
+is the only other no-rebuild setting worth a try. The thermal A/B and
+the Rust install stay deferred. No non-Rust switch was found for the
+shim's per-pass/per-call encode; the only substantial fix is in the
+shim (Rust), which is not buildable here yet.
 
-### UI: transparency is not the cost; per-pass encode is (2026-11-20)
+### UI: transparency is not the cost; per-pass encode is the suspect (2026-11-20)
 
 Set `com.apple.Accessibility ReduceTransparencyEnabled=1`, respringed
 (backboardd 1261), and repeated the Preferences scroll: **25.8 fps**
@@ -53,15 +92,18 @@ frame is `rp12 dr56 kpx8182` (12 passes, 56 draws, 8.18 Mpixels) and a
 lighter frame is `rp1 dr37 kpx2676`. Commits are 23-29 ms apart, one per
 frame. Creation-to-commit age is 12.6 ms for the full frame and 5.2 ms
 for the light one; commit-to-complete is ~10.6 ms and ~8.4 ms. The 7.4 ms
-difference over 11 more passes and 19 more draws fits roughly **0.5 ms
-per render pass plus 0.1 ms per draw**, all on the encoding thread. That
-fixed per-pass cost is the biggest lever; removing the ~2 ms/commit
-surface cache clean is secondary.
+age difference over 11 more passes and 19 more draws was fitted as
+roughly **0.5 ms per render pass plus 0.1 ms per draw**, but the fit is
+not unique and age includes caller idle. The K rows qualify it: a
+`rp1 dr37` frame's ctc is 8.4 ms versus 10.6 ms for `rp12 dr56`, so the
+GPU-side cost of the extra 11 passes and 19 draws is only 2.2 ms. The
+per-pass CPU cost is still a hypothesis; measure the encode directly
+before treating it as the lever.
 
-The J row (`surface cache`) logs 9812 flushes over 2223 commits, 10.9 MB
-each (4.4 per commit, ~2.2 ms during scrolling): `flushSurfaces` runs at
-commit and again at finish, and flushes every IOSurface render target
-whether the CPU wrote it or not.
+The J row in the 3202-commit block logs 8800 flushes, 72.3 GB, 3.89 s of
+CPU (8.2 MB and 1.2 ms per commit, 2.75 per commit): `flushSurfaces`
+runs at commit and again at finish, and flushes every IOSurface render
+target whether the CPU wrote it or not.
 
 Blocked on driver work: this Mac has no `rustc`/`cargo`/`rustup`, and
 `work/m2v-bridge/` and `work/turnip/build-ios/` are gone, so neither
