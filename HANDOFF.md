@@ -40,6 +40,26 @@ the fps. Only if that changes the frame rate, build 0153 and boot the
 `--amp` ADT. Bit 0 of the cpumask must stay set; disabling the boot CPU
 still sets `cpu_config_correct=false` and panics later.
 
+Commands (the CI series must end at 0152 for the first two):
+
+```
+tools/cepheus-run.sh place-smp -G -s 900 \
+  -a "sweetmtl=2 sweetusb=2 cepheustouchpanel=0 cepheustouchpanelpor=0 \
+      sweetsamplestart=20 sweetsampleperiod=20 sweetsamplecount=60"
+tools/cepheus-run.sh place-cpumask -G -s 900 -m 0xF1 \
+  -a "sweetmtl=2 sweetusb=2 cepheustouchpanel=0 cepheustouchpanelpor=0 \
+      sweetsamplestart=20 sweetsampleperiod=20 sweetsamplecount=60"
+python3 tools/mkadt.py work/boot/cepheus-amp.adt --highmem --amp
+tools/cepheus-run.sh place-amp -G -s 900 -A work/boot/cepheus-amp.adt \
+  -a "sweetmtl=2 sweetusb=2 cepheustouchpanel=0 cepheustouchpanelpor=0 \
+      sweetsamplestart=20 sweetsampleperiod=20 sweetsamplecount=60"
+```
+
+The sampler prints `SMP name[pid] tN cpu C pset P ptype T ...`; on the
+SMP boots `pset` is 0 and `cpu` is the logical ID (0-3 A55, 4-7 A76),
+while AMP should put user-interactive threads in `pset` 1 (`ptype` 2,
+P) and kernel/background work in `pset` 0 (`ptype` 1, E).
+
 Open: the phone is dead (last boot ended 2026-11-20 23:04 at t~3036;
 37% at 3.146 V, and the PC port does not charge). Nothing here has been
 built or booted; there is no local kernel build environment. Still
