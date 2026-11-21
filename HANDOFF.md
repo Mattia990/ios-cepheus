@@ -5,6 +5,40 @@ Last updated **2026-11-21** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### UI: cpumask placement run gained ~50%; shim thread still on A55 (2026-11-21)
+
+`place-smp` booted the 0152-series kernel with `cpus=8` and the 20/20/60
+sampler; the phone was rebooted manually at t~600, so samples 0-25 were
+captured. The scroll buckets at t=494-594 read 17-40 fps, mostly 22-25,
+consistent with the known ~28 fps lag.
+
+Placement during the scroll: `backboardd` had 23-31 threads. The worker
+group with backboardd stacks (`t7`-`t12`) sat mostly on logical CPUs 0-3
+(A55) in every scroll sample; `t11` stayed on cpu6 (P). The only thread
+sampled with a non-shared-cache PC was `t5`, whose `lr` is in
+`libvulkan_freedreno`, on cpu2 (A55) in sample 22. `SpringBoard` was also
+E-heavy. All lines read `pset 0 ptype 0` (no AMP). This is consistent
+with, but not proof of, the placement hypothesis: the sampler may mostly
+return each thread's saved syscall state, so the sampled CPU is the last
+CPU, not necessarily the frame-critical one.
+
+Result: `cpumask=0xF1` booted the same 0152-series kernel with five
+logical CPUs (boot A55 + four A76). The phone returned to TWRP cleanly
+after ~550 s of uptime; no panic. Clean scroll buckets at t=408-423 read
+36.8, 37.4, 37.8, 38.2 fps; t=448-468 read 51.6, 32.2, 33.2, 50.8, 33.4
+fps (the 50+ buckets have more swaps than panel copies, so the presented
+rate is ~46 fps). Baseline was 22-25 fps, so placement is confirmed as
+part of the cost, but not the whole gap. `backboardd` moved from 15-21
+threads on A55 to 19-25 on A76 (2-8 left on the boot A55). The only
+thread caught executing SweetMetal2 code during the scroll (`t5`, PC
+`SM+0xade4b4`) was on cpu0, the remaining A55; if that is the shim's
+encode/submit thread it is the next serial cost.
+
+Next: decide whether to try 0153 AMP (keep all eight cores, steer
+user-interactive work to P) or keep `cpumask=0xF1` as the working boot
+arg. AMP needs 0153 moved from `xnu/pending/` to `xnu/patches/`, the
+`--amp` ADT, and one CI build. The phone is in TWRP after the run.
+
 ### UI: scheduler-placement test is staged, not run (2026-11-21)
 
 The next boot experiment is CPU placement, not another frequency or
@@ -68,11 +102,12 @@ shim waiting on the GPU. Core type/placement is therefore the remaining
 non-Rust lever, but it is still a hypothesis until the sampler shows
 where those threads actually run.
 
-Open: the phone is dead (last boot ended 2026-11-20 23:04 at t~3036;
-37% at 3.146 V, and the PC port does not charge). Nothing here has been
-built or booted; there is no local kernel build environment. Still
-pending from earlier: `sweetgpufreq=5`, Reduce Motion, a longer pstack,
-and the clock/timezone and Wi-Fi status-bar checks.
+Open: the phone is charged to 100% and the 0150 battery backend reports
+real FG percentage/amperage and the charging flag on the PC port. The
+0152-series SMP kernel is booted; the cpumask run is in flight. There is
+still no local kernel build environment. Pending from earlier:
+`sweetgpufreq=5`, Reduce Motion, a longer pstack, and the clock/timezone
+and Wi-Fi status-bar checks.
 
 ### UI: 0056 is overridden; frame cost is shim throughput (2026-11-21)
 
