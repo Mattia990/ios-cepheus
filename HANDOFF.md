@@ -32,12 +32,20 @@ probably powered off or the USB route was lost. A cold power-on is needed
 before the next test.
 
 Next: push `main` (the xnu workflow triggers on `xnu/patches/**`), download
-the `kernel.development.sweet` artifact, and `fastboot boot` it with the AMP
-ADT and the `apps-0156-amp` cmdline (which already has `sweetampforcep=1`).
-On the boot, kill `wifid` before ~165 s, then sample backboardd/SpringBoard:
-look for `pset 1 ptype 2` and `pri > 20`. Then test Photos, Notes, Safari,
-Calculator and the battery, and ask the user whether the UI feels more
-responsive and how the heat is.
+the `xnu-kernel` artifact, then run it with the AMP ADT and the previous
+cmdline:
+
+    tools/cepheus-run.sh edge-forcep -k <artifact>/kernel.development.sweet \
+      -A work/boot/cepheus-amp.adt -s 1800 \
+      -a "sweetampforcep=1 sweetmtl=2 sweetusb=2 cepheustouchpanel=0 \
+          cepheustouchpanelpor=0 sweetsamplestart=120 \
+          sweetsampleperiod=60 sweetsamplecount=10" -G
+
+The phone must be in fastboot (cold power-on, Vol- + Power). On the boot,
+kill `wifid` before ~165 s, then sample backboardd/SpringBoard: look for
+`pset 1 ptype 2` and `pri > 20`. Then test Photos, Notes, Safari, Calculator
+and the battery, and ask the user whether the UI feels more responsive and
+how the heat is.
 
 ### Sandbox extensions: 0157 written for Photos (2026-11-21)
 
