@@ -54,9 +54,17 @@ to install the fix.
   symlink at a copy named `lockdownd` if that matters.
 - **FairPlay/pairing stays unavailable.** The patch only turns the infinite
   wait into an immediate error; it does not make fairplayd work.
-- **Not yet cold-booted.** The symlink and patched binary are on disk and
-  lockdownd was restarted from them, but a full cold boot is the final
-  persistence test. Ask the user before rebooting.
+- **Cold-booted and verified.** Rebooted the same image with `fastboot boot
+  work/boot/runs/edge-forcep-unlock.img` at 03:17. The new lockdownd (pid 73)
+  is the symlink target; it logged `main: Starting Up` at 03:17:15,
+  `FairPlayGetHWInfo failed: -42184` at 03:17:17, and
+  `intialize_wifi_syncing` at 03:17:19, with no hang. accountsd 108 is in its
+  run loop; MobileNotes 333 rendered the full "Welcome to Notes" screen at
+  03:19; lockdownd answered accountsd's
+  `[com.apple.mobile.tethered_sync]:[Notes]` queries with `MissingValue`;
+  status bar 39% charging. The Metal2 bridge symlinks are still present and
+  MobileSlideShow 366 renders the empty Library, so the Photos fix survived
+  the cold boot too. The `cepheusreboot=3600` timer restarted with this boot.
 
 ### Photos fixed: bridge limits initialized; Notes hang unchanged (2026-11-22 00:35)
 
