@@ -5,6 +5,99 @@ Last updated **2026-11-22** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Kernel audio stack ported; CI build, then first speaker test (2026-11-22 14:45)
+
+The ADSP/QUAT_MI2S/CS35L41 stack from `not-exyy/ios-cepheus` (HakiOS) is in
+this tree as `xnu/patches/0160-cepheus-audio.patch` (11 files, 7,249 lines
+added). Until now the userland `HakiosAudio` HAL had no `/dev/hakios-audio`,
+so every write it made was discarded.
+
+- **Drivers.** `bsd/dev/hakios.adsp.c` (PAS boot, SMP2P, GLINK, QRTR, APR,
+  battery-manager thread started by default, `battmgr=0` disables it),
+  `hakios.sound.c` (QUAT_MI2S + AFE/ASM/ADM, Apps SMMU context, `sound=N`),
+  `hakios.cs35l41.c` (bit-banged I2C on GPIO 51/52, reset/IRQ pins,
+  OTP/ROM init, boost, DAI), `hakios.guard.c` (integer speaker protection:
+  200 Hz high-pass, RMS/thermal averages, peak limiter), `hakios.audio.c`
+  (`/dev/hakios-audio`, volume ioctl, sink, recording); headers
+  `bsd/sys/hakios.audio.h` and `bsd/sys/hakios.input.h`.
+  `bsd/dev/cepheus_audio_glue.c` holds the four shared locks
+  (`hakios_aop_mailbox_lock`, `hakios_smem_alloc_lock`, `hakios_rsc_lock`,
+  `hakios_smmu_lock`), `loader_sound[3]`, and no-op stubs for the parts not
+  built yet (mic, SLIMbus, haptic, torch, camera, virtio-sound, small-image
+  file server, battery report, loader hand-off).
+- **Adaptations for this tree.** `HAKIOS_SOC_BASE` is now `0x01000000`
+  because `pe_arm_get_soc_base_phys()` returns our ADT's `/arm-io` ranges
+  base, not `0x00400000`. `choose_board()` maps `device_type = "sweet-io"`
+  to `cepheus` in both the ADSP and sound drivers, so `tools/mkadt.py` stays
+  unchanged. `root_file()` falls back to `/fw/adsp/%s`: all 14
+  `adsp.mdt`/`adsp.b00..b13` files are already there (plus the CS35L41
+  `.wmfw`/`.bin` under `/fw/cs35l41/`; the sound driver does ROM/OTP init and
+  does not load them).
+- **Integration.** `bsd/conf/files` builds the six new sources as `standard`;
+  `sweet_ufs_init()` calls `hakios_audio_init()` then `hakios_adsp_init()`
+  after `sweet_pmem_init()`; `sweet_rpmh.c` now takes `hakios_rsc_lock` so
+  the RPMh sequencer is shared with the ADSP's rail requests instead of being
+  raced by `sweet_touch_init()` at boot.
+- **Checked here.** The patch applies cleanly to a detached worktree of the
+  patched baseline (0159), and `tools/validate-repo.py` passes (156 patches,
+  0001-0160 contiguous). This host cannot compile a kernel (no Xcode /
+  iPhoneOS SDK), so the first compile is CI's.
+- **Next test.** Push, let `.github/workflows/xnu.yml` build, download the
+  artifact, make a boot image with `tools/cepheus-run.sh`, and boot it with
+  `adsp=1 sound=4 speaker_probe=2 battmgr=0`, for example
+  `tools/cepheus-run.sh audio1 -k <downloaded>/kernel.development.sweet
+  -a "adsp=1 sound=4 speaker_probe=2 battmgr=0" -s 300
+  -g "adsp:|cs35l41|sound:|hakios-audio"`.
+  Expected console order:
+  `cs35l41: ... device id ...` (probe only, chip put back in reset),
+  `adsp: THE AUDIO DSP IS UP AND LINKED ...`, `sound: THE AUDIO STREAM GOES
+  THROUGH CONTEXT ... OF THE SMMU`, `sound: WHAT DARWIN PLAYS GOES TO THE
+  SPEAKERS ...`, then `hakios-audio: ...` once mediaserverd writes. First
+  thing to check on failure is the ADSP image
+  read (`adsp: N: no fw/adsp.mdt ...`, which can also mean the root was not
+  mounted yet but the thread retries). If the DSP starts but sound does not,
+  the numbers to read are the SMMU context, the AFE port, and the CS35L41
+  `its start-up` line.
+- **Still missing.** Microphone capture needs `hakios.slim.c` +
+  `hakios.mic.c` (WCD934x over SLIMbus); `hakios_mic_dsp_up/down` and
+  `hakios_slim_dsp_up/down` are deliberate no-ops. Panic/loader quiesce
+  hooks are not wired either: the guard keeps levels safe, but a panic while
+  playing can leave the amplifier powered until the next boot.
+
+### Audio path corrected: CS35L41 on QUAT_MI2S, not WCD934x/TAS2557 (2026-11-22 13:10)
+
+The earlier speaker plan (WCD934x `LINEOUT1/2` into a `hifi amp`, or the
+TAS2557 node) is wrong for cepheus. Evidence:
+
+- The SM8150 machine driver picks the external amplifier by
+  `get_hw_version_platform()`: `HARDWARE_PLATFORM_ANDROMEDA` ->
+  `tas2557.1-004c`, **`HARDWARE_PLATFORM_CEPHEUS` -> `cs35l41.0-0040`**,
+  `HARDWARE_PLATFORM_RAPHAEL` -> `tfa98xx.1-0034`. The live DT's
+  `cs35l41@40` is on `i2c@890000` (QUPv3 SE4, GPIO 51/52 function `qup4`),
+  with `cs,cdc-reset-gpio = <&tlmm 89 1>`, IRQ TLMM 10, and boost 4 A /
+  1 uH / 15 uF. The `tas2557@4c` node is present but not selected on cepheus.
+- The static mixer's speaker path is **`QUAT_MI2S_RX`**: one channel,
+  S24_LE. The sound card's active pinctrl is `quat_mi2s_active`,
+  `quat_mi2s_sd0_active`, `quat_mi2s_sd1_active` = GPIO 136 (MCLK),
+  137/138 (SCLK/LRCK), 139 (SD0), 140 (SD1). The CS35L41 is fed from
+  QUAT_MI2S. The `hifi amp`/`LINEOUT1/2` route is not the speaker, and
+  WSA881x is absent (`qcom,wsa-max-devs = <0>`).
+- CS35L41 firmware lives in the vendor partition
+  (`cs35l41-dsp1-spk-prot.wmfw` + `.bin`); the vendor driver is
+  `techpack/audio/asoc/codecs/cs35l41`. First goal is register/ROM-mode
+  init plus QUAT_MI2S, not the DSP.
+
+The ADSP path is unchanged: PAS id 1, carveout `0x8be00000` + `0x2200000`,
+SMEM `0x86000000` + `0x200000`, SMP2P items 443/429/423, GLINK APCS bit 8,
+SMP2P bit 10, AOP bit 0, GIC SPIs 156/158/389, and the AVS APR services
+(`apr_audio_svc`, AFE 4 / ASM 7 / ADM 8).
+
+Prepared `tools/cepheus-audio-fw-extract.sh` (read-only): in TWRP it pulls
+`adsp.mdt`/`adsp.bNN` from the modem partition's vfat `/image`, and the
+CS35L41 firmware plus mixer/audio XMLs from the vendor partition, into
+`work/audio/fw/` (gitignored). No ADSP firmware exists on the host or the
+iOS root yet.
+
 ### Accounts/lockdown deadlock fixed persistently; Notes and Settings render (2026-11-22 03:10)
 
 Same cold boot as the 00:35 entry (`work/boot/runs/edge-forcep-unlock.img`,

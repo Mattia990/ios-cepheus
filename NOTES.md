@@ -71,6 +71,46 @@ The original binary is `/var/local/bin/lockdownd.orig`; the live patched copy is
 only prevents the hang; FairPlay/pairing remains unavailable. See HANDOFF
 2026-11-22 03:10.
 
+## Audio hardware (speaker/mic)
+
+The speaker is a **Cirrus CS35L41** smart amplifier, not the WCD934x DAC and
+not the TAS2557 node:
+
+- I2C `cs35l41@40` on `i2c@890000` (QUPv3 SE4); pins GPIO 51/52, function
+  `qup4`. Reset `cs,cdc-reset-gpio = <&tlmm 89 1>`, interrupt TLMM 10,
+  boost 4 A / 1 uH / 15 uF. The machine driver names it
+  `cs35l41.0-0040` (`HARDWARE_PLATFORM_CEPHEUS` in `sm8150.c`); the
+  TAS2557 is selected only for `HARDWARE_PLATFORM_ANDROMEDA`.
+- Digital input is `QUAT_MI2S_RX`, one channel, S24_LE in
+  `mixer_paths_overlay_static.xml`. Pins: GPIO 136 MCLK, 137/138
+  SCLK/LRCK, 139 SD0, 140 SD1 (all function `qua_mi2s`).
+- CS35L41 firmware on the vendor partition:
+  `cs35l41-dsp1-spk-prot.wmfw` + `.bin` (speaker protection), plus
+  diag images. Vendor driver:
+  `techpack/audio/asoc/codecs/cs35l41`.
+
+The WCD934x (`tavil_codec`) still owns the headset/analog mics over
+SLIMbus; the `hifi amp`/`LINEOUT1/2` route is not the cepheus speaker.
+`qcom,wsa-max-devs = <0>` means no WSA881x.
+
+ADSP: PAS id 1, carveout `0x8be00000`+`0x2200000`, SMEM `0x86000000`+
+`0x200000`, SMP2P items 443 (in), 429 (out), 423 (crash), GLINK remote pid 2,
+APCS IPC bits 8 (GLINK) / 10 (SMP2P) / 0 (AOP), GIC SPIs 156/158/389,
+APR channel `apr_audio_svc` (AVS services AFE 4 / ASM 7 / ADM 8).
+`tools/cepheus-audio-fw-extract.sh` pulls the phone's own firmware in TWRP;
+it is gitignored under `work/audio/fw`.
+
+Kernel side (patch 0160, ported from `not-exyy/ios-cepheus`): the five
+`bsd/dev/hakios.*.c` drivers bring up the ADSP, the QUAT_MI2S port, the CS35L41
+and `/dev/hakios-audio`; `hakios.audio.c` consumes S16_LE stereo frames at
+48 kHz and hands them to the `sound=4` sink through `hakios.guard.c`.
+Boot args: `adsp=1` (boot the DSP to step 11 and keep it), `sound=4` (Darwin
+sink), `speaker_probe=2` (read-only CS35L41 ID probe), `sound_below=N`
+(eighths of a dB under Android's level; cepheus default `24`),
+`adsp_step=N` (staged bring-up, 1..11). The ADSP firmware is read from
+`/fw/adsp/adsp.mdt` + `adsp.b00..b13` on the iOS root;
+`/fw/cs35l41/` is present but unused by the ROM-mode init.
+
 ## Boot image rules (confirmed from cepheus stock boot.img, 2026-11-05)
 
 Extracted from `/dev/block/sde49` (boot partition) via adb and unpacked with
