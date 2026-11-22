@@ -119,10 +119,10 @@ index 0000000..c5a26d0
 +}
 diff --git a/bsd/dev/hakios.adsp.c b/bsd/dev/hakios.adsp.c
 new file mode 100644
-index 0000000..2fd0252
+index 0000000..6f79c0c
 --- /dev/null
 +++ b/bsd/dev/hakios.adsp.c
-@@ -0,0 +1,3550 @@
+@@ -0,0 +1,3551 @@
 +/* Ported from not-exyy/ios-cepheus (HakiOS) for this cepheus port; see HANDOFF.md. */
 +/*
 + * The audio DSP of the SM7325 phone, started, and spoken to: step 1 of sound. Every
@@ -229,7 +229,6 @@ index 0000000..2fd0252
 +#include <sys/hakios.audio.h>
 +#include <sys/hakios.input.h>
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern uint64_t kvtophys(vm_offset_t va);
@@ -378,7 +377,8 @@ index 0000000..2fd0252
 +need(struct block *b)
 +{
 +	if (b->base == 0) {
-+		b->base = ml_io_map(b->phys, b->size);
++		/* kernel_map, not ml_io_map's 8 MB io_submap: this port's other drivers have nearly filled it */
++		b->base = ml_io_map_unmappable(b->phys, b->size, VM_WIMG_IO);
 +	}
 +}
 +
@@ -1061,7 +1061,8 @@ index 0000000..2fd0252
 +
 +		if (at == 0) {
 +			/* (cepheus: qcom,cmd-db@c3f000c, the word AOP leaves at 0xc of its message RAM) */
-+			at = rd(ml_io_map(CMD_DB_POINTER_PHYS, 0x1000) + 0xc);
++			/* (kernel_map too: the io_submap has no page left by this point in this port) */
++			at = rd(ml_io_map_unmappable(CMD_DB_POINTER_PHYS, 0x1000, VM_WIMG_IO) + 0xc);
 +			printf("adsp: %u: AOP says the command database is at %#x\n", step, at);
 +			if (at == 0) {
 +				return -1;
@@ -4044,10 +4045,10 @@ index 0000000..2106fe1
 +}
 diff --git a/bsd/dev/hakios.cs35l41.c b/bsd/dev/hakios.cs35l41.c
 new file mode 100644
-index 0000000..9935f6a
+index 0000000..b617f20
 --- /dev/null
 +++ b/bsd/dev/hakios.cs35l41.c
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,948 @@
 +/* Ported from not-exyy/ios-cepheus (HakiOS) for this cepheus port; see HANDOFF.md. */
 +/*
 + * The bottom speaker of the Xiaomi Mi 9 (cepheus, SM8150): its amplifier, a Cirrus Logic CS35L41 (rev B0,
@@ -4118,8 +4119,9 @@ index 0000000..9935f6a
 +#include <pexpert/pexpert.h>
 +#include <sys/systm.h>
 +#include <sys/hakios.audio.h>
++#include <vm/memory_types.h>
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +extern kern_return_t thread_terminate(thread_t thread);
 +extern void loader_log_putc(char c);
 +
@@ -4692,8 +4694,9 @@ index 0000000..9935f6a
 +need_pins(void)
 +{
 +	if (tlmm_north == 0) {
-+		tlmm_north = ml_io_map(TLMM_NORTH_PHYS, TLMM_TILE_SIZE);
-+		tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, TLMM_TILE_SIZE);
++		/* kernel_map, not ml_io_map's 8 MB io_submap (2 MB of tiles; sweet_pmem.c does the same) */
++		tlmm_north = ml_io_map_unmappable(TLMM_NORTH_PHYS, TLMM_TILE_SIZE, VM_WIMG_IO);
++		tlmm_south = ml_io_map_unmappable(TLMM_SOUTH_PHYS, TLMM_TILE_SIZE, VM_WIMG_IO);
 +	}
 +}
 +
@@ -4934,8 +4937,9 @@ index 0000000..9935f6a
 +	uint32_t reset_cfg, reset_io;
 +	bool was_released;
 +
-+	tlmm_north = ml_io_map(TLMM_NORTH_PHYS, TLMM_TILE_SIZE);
-+	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, TLMM_TILE_SIZE);
++	/* kernel_map, not ml_io_map's 8 MB io_submap (2 MB of tiles; sweet_pmem.c does the same) */
++	tlmm_north = ml_io_map_unmappable(TLMM_NORTH_PHYS, TLMM_TILE_SIZE, VM_WIMG_IO);
++	tlmm_south = ml_io_map_unmappable(TLMM_SOUTH_PHYS, TLMM_TILE_SIZE, VM_WIMG_IO);
 +	say("cs35l41: level %u: %s\n", probe_level, probe_level == 1 ? "a look, reading only" :
 +	    "the reset released, the chip's start-up waited for, its ids read; nothing written to it");
 +	show_pins();
@@ -5320,10 +5324,10 @@ index 0000000..4c91f0a
 +}
 diff --git a/bsd/dev/hakios.sound.c b/bsd/dev/hakios.sound.c
 new file mode 100644
-index 0000000..9f5ded5
+index 0000000..571c890
 --- /dev/null
 +++ b/bsd/dev/hakios.sound.c
-@@ -0,0 +1,1668 @@
+@@ -0,0 +1,1671 @@
 +/* Ported from not-exyy/ios-cepheus (HakiOS) for this cepheus port; see HANDOFF.md. */
 +/*
 + * The phone's sound, step 3: what the audio DSP's services are told so that the speakers play.
@@ -5424,13 +5428,14 @@ index 0000000..9f5ded5
 +#include <libkern/OSAtomic.h>
 +#include <mach/mach_types.h>
 +#include <mach/vm_param.h>
++#include <vm/memory_types.h>
 +#include <pexpert/device_tree.h>
 +#include <pexpert/pexpert.h>
 +#include <sys/systm.h>
 +#include <sys/hakios.audio.h>
 +#include <vm/vm_kern.h>
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern kern_return_t thread_terminate(thread_t thread);
 +extern void loader_log_putc(char c);
@@ -5531,7 +5536,8 @@ index 0000000..9f5ded5
 +	uint32_t value;
 +
 +	if (b->base == 0) {
-+		b->base = ml_io_map(b->phys, b->size);
++		/* kernel_map, not ml_io_map's 8 MB io_submap: this port's other drivers have nearly filled it */
++		b->base = ml_io_map_unmappable(b->phys, b->size, VM_WIMG_IO);
 +	}
 +	value = rd(b->base + offset);
 +	say("sound: %s %s (%#x) = %#x\n", b->name, name, b->phys + offset, value);
@@ -5542,7 +5548,8 @@ index 0000000..9f5ded5
 +put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 +{
 +	if (b->base == 0) {
-+		b->base = ml_io_map(b->phys, b->size);
++		/* kernel_map, not ml_io_map's 8 MB io_submap: this port's other drivers have nearly filled it */
++		b->base = ml_io_map_unmappable(b->phys, b->size, VM_WIMG_IO);
 +	}
 +	say("sound: about to write %s %s at %#x: %#x\n", b->name, name, b->phys + offset, value);
 +	snprintf(last_write, sizeof(last_write), "wrote %#x to %s %s at %#x", value, b->name, name, b->phys + offset);

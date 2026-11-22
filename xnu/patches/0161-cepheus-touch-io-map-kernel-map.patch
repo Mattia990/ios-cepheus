@@ -1,0 +1,34 @@
+diff --git a/bsd/dev/sweet_fts.c b/bsd/dev/sweet_fts.c
+index 542ac9b..57982b6 100644
+--- a/bsd/dev/sweet_fts.c
++++ b/bsd/dev/sweet_fts.c
+@@ -59,8 +59,10 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <mach/mach_time.h>
++#include <vm/memory_types.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern int sweet_rpmh_write(const char *res, unsigned n, const uint32_t *offsets,
+@@ -1402,9 +1404,15 @@ fts_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("cepheustouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET FTS: starting in %u s\n", delay_s);
+ 	fts_wait(delay_s * 1000u);
+-	ft.gpio_n = ml_io_map(FTS_TLMM_NORTH_PA, 0x81000);
+-	ft.gpio_s = ml_io_map(FTS_TLMM_SOUTH_PA, 0x81000);
+-	ft.gpio_e = ml_io_map(FTS_TLMM_EAST_PA, 0x20000);
++	/*
++	 * kernel_map, not ml_io_map's 8 MB io_submap: the three tiles are
++	 * 1.2 MB and this thread maps them 20 s into boot, after the audio
++	 * stack has taken the submap's remaining room (2026-11-22: the north
++	 * tile's 528 KB kmem_alloc failed, panicking at 28.5 s).
++	 */
++	ft.gpio_n = ml_io_map_unmappable(FTS_TLMM_NORTH_PA, 0x81000, VM_WIMG_IO);
++	ft.gpio_s = ml_io_map_unmappable(FTS_TLMM_SOUTH_PA, 0x81000, VM_WIMG_IO);
++	ft.gpio_e = ml_io_map_unmappable(FTS_TLMM_EAST_PA, 0x20000, VM_WIMG_IO);
+ 	if (!ft.gpio_n || !ft.gpio_s || !ft.gpio_e) {
+ 		printf("SWEET FTS: MMIO mapping failed\n");
+ 		goto out;

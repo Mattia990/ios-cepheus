@@ -111,6 +111,17 @@ sink), `speaker_probe=2` (read-only CS35L41 ID probe), `sound_below=N`
 `/fw/adsp/adsp.mdt` + `adsp.b00..b13` on the iOS root;
 `/fw/cs35l41/` is present but unused by the ROM-mode init.
 
+The first boot with `speaker_probe=2` panicked in ADSP step 7, inside
+`ml_io_map(0x0c3f0000, 0x1000)` in `rail_position()`:
+`kmem_alloc(..., 16384, 0x100021): failed with 3 @vm_kern.c:170`. The flags are
+`KMA_PERMANENT|KMA_PAGEABLE|KMA_NOFAIL`, i.e. a plain `ml_io_map` allocation from
+the 8 MB `io_submap`; with 16 KB pages the 16384 request is one page, so the
+submap had no page left (the CS35L41 probe alone maps both 1 MB TLMM tiles, on
+top of touch/USB/UFS/display). The port therefore maps the ADSP blocks, the
+command-database pointer, the QUAT_MI2S/AFE/SMMU blocks and the TLMM tiles with
+`ml_io_map_unmappable` (kernel_map), as `sweet_pmem.c` and `sweet_gpu.c` already
+do. Do not use `ml_io_map` for new audio mappings in this tree.
+
 ## Boot image rules (confirmed from cepheus stock boot.img, 2026-11-05)
 
 Extracted from `/dev/block/sde49` (boot partition) via adb and unpacked with
@@ -515,6 +526,15 @@ Of the ~81 original ios-sweet kernel patches:
   and `app <trp_apptype>` so a boot can show whether backboardd/SpringBoard
   threads actually moved to `pset 1 ptype 2`. Built in the 2026-11-21 23:00
   kernel; the `pri`/`app` fields were observed in the 48 samples.
+- 0160 audio: the five `hakios.*` drivers bring up the ADSP (PAS, SMP2P, GLINK,
+  QRTR, APR), QUAT_MI2S + AFE/ASM/ADM, the CS35L41, the speaker guard and
+  `/dev/hakios-audio`; ported from `not-exyy/ios-cepheus` (HakiOS). All MMIO is
+  mapped with `ml_io_map_unmappable` (kernel_map) after the 2026-11-22
+  `io_submap` panic.
+- 0161 touch: the FTS thread's 1.2 MB of TLMM tiles move to
+  `ml_io_map_unmappable` (kernel_map); the north tile's 528 KB `kmem_alloc`
+  failed in the 8 MB `io_submap` once the audio stack had mapped its registers
+  (2026-11-22 panic at 28.5 s).
 - 2026-11-17 status decode: `43 05 01` = `EVT_TYPE_STATUS_FORCE_CAL` subtype `0x01`
   ("Mutual negative detect Force cal"), emitted right after every sense-on; TWRP reports
   the same and works. The old note about a distinct TWRP `43 05 02` was a misread: the

@@ -5,6 +5,56 @@ Last updated **2026-11-22** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### First audio boot: ADSP and MI2S verified; io_submap panic fixed (2026-11-22 15:35)
+
+The first CI audio kernel (`work/boot/kernel-audio/kernel.development.sweet`,
+SHA256 `c8ae48a0...`) booted with
+`adsp=1 sound=1 speaker_probe=0 battmgr=0 sweetusb=2` (`logs/runs/audio3`).
+The audio stack itself worked:
+
+- **ADSP up.** Step 11 at 16.140 s: `THE AUDIO DSP IS UP AND LINKED`, node 5,
+  8 services, APR channel open; the AFE service (4) answered every request
+  (`0x110e8` -> `0x100f3`/`0x100ef`/`0x100e5`/`0x100e6`).
+- **MI2S clock at the pins.** `sound:` configured gpio137-140 and asked the DSP
+  for the bit clock (`0x106`, 3.072 MHz), the port (I2S, 1x24-bit on SD0,
+  48 kHz, word select ours) and start. The GPIO sampler then measured
+  **14393 changes / 10000 ones on gpio137** and **1027 changes / 10020 ones on
+  gpio138** in 20000 reads: `THE INTERFACE'S CLOCK AND FRAME SYNC RUN at the
+  pins`. The test stopped the port, clock and pins cleanly at 21.204 s.
+- **Panic at 28.5 s** (photo, and `mach_absolute_time` 0x23061300):
+  `kmem_alloc(..., 540672, 0x100021): failed with 3 @vm_kern.c:170`, backtrace
+  `fts_thread+0x110 -> io_map -> kmem_alloc`. The FTS thread maps its three
+  TLMM tiles (2 x 0x81000 + 0x20000 = 1.2 MB) 20 s into boot. The 8 MB
+  `io_submap` had no 528 KB page left because the audio stack had mapped its
+  registers with plain `ml_io_map` (sound's 1 MB pin-controller window plus
+  ADSP's ~80 KB). `speaker_probe=0` had only moved the failure from ADSP step 7
+  (`rail_position`'s `ml_io_map(0xc3f0000)`, the first panic) to the touch
+  thread; the speaker probe was never the cause.
+
+**Fix (not yet built):**
+
+- `xnu/patches/0160-cepheus-audio.patch` regenerated (7,379 lines): every audio
+  `ml_io_map` is now `ml_io_map_unmappable(..., VM_WIMG_IO)` (kernel_map),
+  including the command-database pointer and the CS35L41 TLMM tiles.
+- `xnu/patches/0161-cepheus-touch-io-map-kernel-map.patch` (new, 34 lines):
+  the FTS thread's three TLMM tiles likewise use `ml_io_map_unmappable`.
+  `sweet_touch.c` is disabled by default (`sweettouch=0`) and unchanged.
+- `tools/validate-repo.py` passes (157 patches, 0001-0161); 0160 then 0161
+  apply cleanly to a detached 0159 worktree.
+
+**Next:** push both patches, let CI build, then
+
+```
+tools/cepheus-run.sh audio4 -k <kernel> -A work/boot/cepheus-amp.adt -s 300 \
+  -a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2" \
+  -g "adsp:|cs35l41|sound:|hakios-audio|panic"
+```
+
+Expect the FTS thread to map and touch to work at ~28 s, then the CS35L41 probe
+to report its device ID (probe only; it puts the chip back in reset). If the
+kernel stays up, SSH (`ssh -i work/userland/ssh/id_ed25519 root@192.168.7.2`)
+and run `/var/local/bin/sound_test route`, then `tone SECS`.
+
 ### Kernel audio stack ported; CI build, then first speaker test (2026-11-22 14:45)
 
 The ADSP/QUAT_MI2S/CS35L41 stack from `not-exyy/ios-cepheus` (HakiOS) is in
