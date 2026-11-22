@@ -30,7 +30,8 @@ Use the full path: `.../platform-tools/adb`, `.../platform-tools/fastboot`.
    `tools/cepheus-log-pull.sh shim logs/X.txt` (and `xnu` for the XNU ring).
 5. Never overwrite a running mapped binary in place (`cepheus-files.py put`
    writes in place): replacing `tccd` while it ran panicked twice. Kill the
-   daemon, wait for it to exit, then replace; keep the original hash.
+   daemon, wait for it to exit, then replace; keep the original hash. For
+   lockdownd, use the symlink swap (see Lockdown/FairPlay) instead.
 6. Framebuffer capture with the GPU presenting: read `/dev/pmem` at 0x9c000000,
    1088x2340 BGRA, stride **4352** bytes (not 4320/4608); `cepheus-files.py read`
    is enough, then decode as BGRA.
@@ -54,6 +55,21 @@ symlink to `/var/local/bin/SweetMetal2.patched`; because the bridge resolves its
 own path to `/var/local/bin`, `/var/local/bin/libvulkan_freedreno.dylib` must
 also be a symlink to the bundle copy. Stage the binary first; a direct `put`
 while backboardd is restarting races dyld and crash-loops SpringBoard.
+
+## Lockdown/FairPlay (userland)
+
+`lockdownd` blocks during boot in `create_cesm_context` because `fairplayd.H2`
+exits 0 and never serves `com.apple.fairplayd.versioned`. The four synchronous
+FairPlay MIG client stubs at file offsets `0x2b090`, `0x2b2f0`, `0x2b47c`,
+`0x2b668` (request IDs `0x4b0`..`0x4b3`) wait forever. Patch each stub entry to
+return `MACH_SEND_INVALID_DEST` (`60 00 80 52 00 00 a2 72 c0 03 5f d6`); the
+first call then logs `FairPlayGetHWInfo failed: -42184` and lockdownd finishes
+booting. Adhoc re-sign with the original identifier and entitlements:
+`codesign -f -s - -i com.apple.lockdownd --entitlements <orig>.entitlements`.
+The original binary is `/var/local/bin/lockdownd.orig`; the live patched copy is
+`/var/local/bin/lockdownd`, symlinked from `/usr/libexec/lockdownd`. The patch
+only prevents the hang; FairPlay/pairing remains unavailable. See HANDOFF
+2026-11-22 03:10.
 
 ## Boot image rules (confirmed from cepheus stock boot.img, 2026-11-05)
 

@@ -5,6 +5,59 @@ Last updated **2026-11-22** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Accounts/lockdown deadlock fixed persistently; Notes and Settings render (2026-11-22 03:10)
+
+Same cold boot as the 00:35 entry (`work/boot/runs/edge-forcep-unlock.img`,
+0157/0158/0159, `cepheustouchlog=1`, `cepheusreboot=3600`). No reboot was needed
+to install the fix.
+
+- **Root cause.** `lockdownd` blocks in `create_cesm_context` on synchronous
+  FairPlay MIG calls. `fairplayd.H2` exits 0 immediately and never serves
+  `com.apple.fairplayd.versioned`, so the calls never get a reply. `accountsd`
+  then blocks in its `handle_get_value` queries to lockdownd, which blocks
+  AccountsUI and leaves Notes black. This is the 00:35 "Accounts/lockdown
+  deadlock".
+- **In-memory proof.** Attached lldb to lockdownd 73, selected the MIG stub
+  frame (`frame select 4`) and did `thread return 0x10000003`
+  (`MACH_SEND_INVALID_DEST`) at the 0x4b0 and 0x4b3 stubs. lockdownd logged
+  `create_cesm_context: FairPlayGetHWInfo failed: -42184`, completed
+  `performBootSessionIntialization`, answered accountsd's
+  `[com.apple.mobile.tethered_sync]:[Notes]` query with `MissingValue`, and
+  entered its run loop. MobileNotes 372 then rendered the full "Welcome to
+  Notes" screen; Settings 900 rendered the Apple ID row and Wi-Fi/Bluetooth
+  state.
+- **Persistent patch.** Four FairPlay MIG client stubs in
+  `/usr/libexec/lockdownd` at file offsets `0x2b090`, `0x2b2f0`, `0x2b47c`,
+  `0x2b668` (request IDs `0x4b0`..`0x4b3`, reply IDs `0x514`..`0x517`) now
+  begin with `movz w0,#3; movk w0,#0x1000,lsl#16; ret` =
+  `60 00 80 52 00 00 a2 72 c0 03 5f d6`, returning `MACH_SEND_INVALID_DEST`
+  without a round trip. Adhoc re-sign with the original identifier
+  (`com.apple.lockdownd`) and the exact original entitlements. Original hash
+  `989b1dd4859125dc126eaab65e5281fd2e75b32b33e1e6c36c8ab453e2b31519`;
+  patched hash `3e30e628a7681378489601a73a90ebd530cfa5a1e08cfe0ef84f15890238a5f3`.
+- **Install.** `/var/local/bin/lockdownd` is the live patched copy,
+  `/var/local/bin/lockdownd.patched` the same copy, and
+  `/var/local/bin/lockdownd.orig` the original; `/usr/libexec/lockdownd` is a
+  symlink to `/var/local/bin/lockdownd`. Killed the first patched process (856)
+  to switch the symlink target; launchd started pid 888 from
+  `/var/local/bin/lockdownd` after a TCP connect to 62078.
+  Startup now goes from `main: Starting Up` to `intialize_wifi_syncing` in
+  ~50 ms, logging the expected `FairPlayGetHWInfo failed: -42184`; no hang.
+- **Verified after the swap.** lockdownd 888 in `CFRunLoopRun`; accountsd 109
+  in its run loop; MobileNotes 372 and Settings 900 render; Photos 936 renders
+  the empty Library ("No Photos or Videos", tab bar), so the Metal2 bridge
+  still works on this boot; status bar 35-36% charging.
+- **Rollback.** `tools/cepheus-files.py rm /usr/libexec/lockdownd`;
+  `tools/cepheus-files.py link /var/local/bin/lockdownd.orig
+  /usr/libexec/lockdownd`; `psx -k lockdownd 9`; trigger a restart (connect to
+  62078 or reboot). The process name becomes `lockdownd.orig`; point the
+  symlink at a copy named `lockdownd` if that matters.
+- **FairPlay/pairing stays unavailable.** The patch only turns the infinite
+  wait into an immediate error; it does not make fairplayd work.
+- **Not yet cold-booted.** The symlink and patched binary are on disk and
+  lockdownd was restarted from them, but a full cold boot is the final
+  persistence test. Ask the user before rebooting.
+
 ### Photos fixed: bridge limits initialized; Notes hang unchanged (2026-11-22 00:35)
 
 Same 0157/0158/0159 kernel and cold boot as the 23:00 entry (`sweetampforcep=1`,
@@ -53,8 +106,9 @@ genuinely unlocked (home screen, Safari, Photos); SSH was still alive at 00:35.
   fields; the bridge was not rebuilt (no Rust), so the tested artifact is the
   binary patch.
 
-Still open: Calculator registration, the Notes/Accounts hang, and a persistent
-(non-symlink) install for the bridge once a rebuild is available.
+Still open: Calculator registration and a persistent (non-symlink) install for
+the bridge once a rebuild is available. (The Notes/Accounts hang was fixed at
+03:10; see the entry above.)
 
 ### edge-forcep boot: force-P and battery verified; Notes black, Photos still broken (2026-11-21 23:00)
 
