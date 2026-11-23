@@ -530,7 +530,10 @@ Of the ~81 original ios-sweet kernel patches:
   QRTR, APR), QUAT_MI2S + AFE/ASM/ADM, the CS35L41, the speaker guard and
   `/dev/hakios-audio`; ported from `not-exyy/ios-cepheus` (HakiOS). All MMIO is
   mapped with `ml_io_map_unmappable` (kernel_map) after the 2026-11-22
-  `io_submap` panic.
+  `io_submap` panic. The microphone half (`hakios.slim.c`, `hakios.mic.c`,
+  2026-11-23) brings up SLIMbus/NGD/WCD9340 and `/dev/hakios-mic`; it follows
+  `ngd_allocbw()` (REQ_BW, DEF_ACT_CHAN, RECONFIG_NOW, each generic ACK waited
+  for) and TX5 channel 133.
 - 0161 touch: the FTS thread's 1.2 MB of TLMM tiles move to
   `ml_io_map_unmappable` (kernel_map); the north tile's 528 KB `kmem_alloc`
   failed in the 8 MB `io_submap` once the audio stack had mapped its registers

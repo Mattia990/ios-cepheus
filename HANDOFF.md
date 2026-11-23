@@ -5,53 +5,44 @@ Last updated **2026-11-23** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### audio8: the microphone drivers are in 0160, not booted yet (2026-11-23)
+### audio8: the mic path comes up to the channel define; the manager's ACK (2026-11-23)
 
-The audio patch now carries a real capture path instead of an absent device:
-a persistent SLIMbus/WCD9340 driver and a cepheus `main-mic` driver that
-publishes `/dev/hakios-mic`. Nothing has been booted with them yet; this is
-the source/test-image half of `audio8`.
+The audio8 kernel (`700c2c10...`, built from 0160+0161) booted with the audio7
+args plus `mic=4` and `-A work/boot/cepheus-amp.adt`. `/dev/hakios-mic` and
+`/dev/hakios-audio` both appeared. Holding `/dev/hakios-mic` open ran the whole
+path: QMI/QRTR, NGD, codec enumeration (interface 0xce, generic 0xcf, Tavil
+0x108), MCLK, WCD9340 bring-up, the DSP stream/COPP port, AFE `SLIM_0_TX`
+(0x4001), and the codec's MIC BIAS3/AMIC3/DEC5 writes. It failed at the last
+step: `DEF_ACT_CHAN` for channel 133 got `NO ACK within 1000 ms`; the
+`CONNECT_SRC` before it was ACKed (`c5 25 ff 5f 20`), so the manager's ACK to
+the define was the one missing. The recording broke off cleanly at 1.4 s; no
+VoiceMemos/wedge test was run, and speaker playback was not retested.
 
-- **`bsd/dev/hakios.slim.c`** (new) is the shared SLIMbus/codec half: QMI/QRTR
-  bus power, NGD enable/messages/ACKs, RPMh MCLK, codec reset and enumeration,
-  WCD9340 page/register/interface access, and persistent refcounted
-  `hakios_slim_up/down`. It also owns the TX port: WCD9340 port 5 on shared
-  channel `133` (`128 + 5`), not `PCM_CHANNEL_FC`. `slim=1..4` diagnostics
-  stay; `slim=4` still drives the earpiece.
-- **`bsd/dev/hakios.mic.c`** (new) is the cepheus path: `MIC BIAS3` at 2.7 V,
-  AMIC3 -> ADC3 -> `AMIC MUX5` -> DEC5, DEC5 at 48 kHz with the 150 Hz
-  high-pass, AFE `SLIM_0_TX` (`0x4001`) at 16-bit mono 48 kHz, ASM/ADM capture
-  into a 16384-frame ring, `/dev/hakios-mic` (16-bit mono 48 kHz).
-  `mic=1`/`2` dump the codec registers (2 after the path's writes), `mic=3`
-  records for `mic_secs`, `mic=4` serves Darwin: the path is up only while the
-  device is open, DEC5 is unmuted after 40 ms, the high-pass is restored and
-  the AMIC hold released at 300 ms, and after three broken recordings the
-  driver stops trying for the rest of the run.
-- **Order.** The DSP side first (`hakios_slim_up`, ADM path, AFE port), then
-  the codec path, then the codec TX joins channel 133; undo is the reverse.
-  This matches Android starting the AFE port before the codec TX port.
-- **The glue and headers.** Both drivers are in `bsd/conf/files`; the four
-  mic/slim stubs are gone from `cepheus_audio_glue.c`; the API is declared in
-  `bsd/sys/hakios.audio.h`. The speaker path is unchanged.
-- **`VirtualAudio.plugin` is still enabled.** Whole-bundle disable is blocked
-  on the phone rootfs lacking directory `mv`/`rm`; with a working
-  `/dev/hakios-mic` it should no longer be the failing path.
-- **Patch.** `xnu/patches/0160-cepheus-audio.patch` was regenerated (9775
-  lines) from the detached `1c09a18` worktree; `git apply --check` and a full
-  apply pass in `/private/.../xnu-audio-check`.
-- **Not booted.** The phone is still on `audio7`; `mediaserverd` is down
-  (`psx -k mediaserverd` does not bring it back, manual start crashes with
-  `CAXException`), so it needs launchd demand (open VoiceMemos) or a cold
-  reboot before audio can be tested. At the end of this session the phone was
-  unreachable (SSH timed out; no adb/fastboot device), so nothing was tested.
+- **Cause (source comparison).** Linux's `ngd_allocbw()` sends `REQ_BW` + a
+  `RECONFIG_NOW` before the first `DEF_ACT_CHAN` (`sched.msgsl !=
+  pending_msgsl`, 30 slots), and `ngd_xfer_msg()` waits for `CONNECT_SRC`'s
+  generic ACK before returning; the cepheus driver did neither. The NGD holds
+  only one received message, so the connect's ACK and the manager's ACK to the
+  define raced.
+- **Fix in 0160.** `tx_connect_src()` now waits for its generic ACK;
+  `tx_reserve_bw()` sends `REQ_BW` (30 slots) + `RECONFIG_NOW` once per bus;
+  `tx_define_activate()` logs its TID before the wait; `tx_remove()` waits for
+  all three ACKs; a failed `hakios_slim_tx_on()` now removes/disconnects the
+  half-up port (as `wcd9xxx_close_slim_sch_tx()` does) so the two retries start
+  clean. The timeout log prints NGD status/interrupt state.
+- **Patch.** Regenerated (9833 lines, 13 files); `git apply --check` and a full
+  apply pass at `1c09a18` in `/private/.../xnu-audio-check`.
+- **Not booted.** The phone is disconnected; the new kernel has not been built
+  or booted.
 
-**Next:** push/build through CI, then `fastboot boot` the same kernel and args
-as `audio7` plus `mic=4` (keep `adsp=1 sound=4 speaker_probe=2 battmgr=0
-sweetusb=2`, the graphics args and `-s 900`). The serial log should show
-`mic:`/`slim:` lines and `/dev` should gain `hakios-mic`; record with
-VoiceMemos and confirm speaker playback still works. If it wedges, capture
-`psx`/`pstack` for SpringBoard, backboardd and mediaserverd plus a live
-`oslog`, and use `mic=1..3` to separate codec bring-up from the DSP stream.
+**Next:** build the new kernel (same CI flow), connect the phone, and
+`fastboot boot` it with the audio8 args:
+`tools/cepheus-run.sh audio9 -k <kernel> -A work/boot/cepheus-amp.adt -G -s 900
+-a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2
+cepheustouchpanelpor=0 cepheustouchpanel=0 sweetampforcep=1 sweetmtl=2 mic=4"`.
+Hold `/dev/hakios-mic` open for a few seconds: the serial should show the
+bandwidth reserved, `channel 133 ... define and activate`, then `UP`. Then test
+VoiceMemos and the SpringBoard wedge, and confirm speaker playback.
 Never flash; keep the bootloader rules from NOTES.md.
 
 ### audio7: the microphone attempt wedges SpringBoard's main thread (2026-11-22 21:50)

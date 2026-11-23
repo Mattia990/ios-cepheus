@@ -6214,10 +6214,10 @@ index 0000000..25a1122
 +}
 diff --git a/bsd/dev/hakios.slim.c b/bsd/dev/hakios.slim.c
 new file mode 100644
-index 0000000..1064d15
+index 0000000..1bcf2d8
 --- /dev/null
 +++ b/bsd/dev/hakios.slim.c
-@@ -0,0 +1,1480 @@
+@@ -0,0 +1,1538 @@
 +/*
 + * The SLIMbus of the Xiaomi Mi 9 (cepheus, SM8150), and the codec behind it: the WCD9340 ("Tavil") the microphones
 + * (hakios.mic.c) and the earpiece are on. The earpiece (the receiver at the top) is driven by the codec's EAR output;
@@ -6474,6 +6474,8 @@ index 0000000..1064d15
 +#define MC_DEF_ACT_CHAN         0x21            /* (user) */
 +#define MC_CHAN_CTRL            0x23            /* (user) */
 +#define MC_RECONFIG_NOW         0x24            /* (user) */
++#define MC_REQ_BW               0x28            /* (user) */
++#define MESSAGE_BW_SLOTS        30              /* (ngd_allocbw(): the slots the manager keeps for the channel's satellite) */
 +#define MC_DISCONNECT_PORT      0x2e            /* (user) */
 +#define LA_MANAGER              0xff
 +#define WCD_REGISTERS           0x800           /* WCD9XXX_REGISTER_START_OFFSET */
@@ -6579,7 +6581,8 @@ index 0000000..1064d15
 +		}
 +		delay_for_interval(200, NSEC_PER_USEC);
 +	}
-+	say("slim: %s: NO ACK within %u ms\n", what, ms);
++	say("slim: %s: NO ACK within %u ms (status %#x, int stat %#x)\n", what, ms,
++	    rd(ngd + NGD_STATUS), rd(ngd + NGD_INT_STAT));
 +	return false;
 +}
 +
@@ -6801,6 +6804,7 @@ index 0000000..1064d15
 +static uint32_t reset_cfg, reset_io;
 +static bool mclk_on, reset_released;
 +static uint8_t next_tid = 1;
++static bool bw_reserved;                /* the manager was asked for the codec's messaging bandwidth (once per bus) */
 +
 +static const uint8_t ea_generic[6] = { 0x00, 0x01, 0x50, 0x02, 0x17, 0x02 };    /* dt elemental-addr of tavil_codec */
 +static const uint8_t ea_interface[6] = { 0x00, 0x00, 0x50, 0x02, 0x17, 0x02 };  /* qcom,cdc-slim-ifd-elemental-addr */
@@ -7176,48 +7180,99 @@ index 0000000..1064d15
 +#define WCD_IF_WATER_MARK            0x05                   /* 12 bytes | enable (SLAVE_PORT_WATER_MARK_12BYTES << 1 | 1) */
 +#define WCD_TX_AUTO_RECOVERY         0x02
 +
-+/* Connect the codec's generic-device TX port to its channel (slim_connect_src(): no ACK waited for, as Linux does not) */
++/*
++ * Connect the codec's generic-device TX port to its channel (slim_connect_src()). The codec's generic ACK is waited
++ * for: Linux waits for it too (ngd_xfer_msg() completes on it), and the NGD holds only one received message: sending
++ * the define while the connect's ACK still waits would make the manager's ACK to the define be the one lost.
++ */
 +static bool
 +tx_connect_src(uint8_t la, uint8_t port, uint8_t channel)
 +{
-+	uint8_t payload[4] = { la, port, channel, next_tid++ };
-+	uint32_t first = FIRST_WORD(sizeof(payload) + 3, MT_DEST_REFERRED_USER, MC_CONNECT_SRC, 0, LA_MANAGER);
-+	uint8_t message[8];
++	uint8_t payload[4];
++	uint8_t tid = next_tid++;
 +
-+	memcpy(message, &first, 3);
-+	memcpy(message + 3, payload, sizeof(payload));
-+	return ngd_send("connect source port", message, sizeof(message));
++	payload[0] = la;
++	payload[1] = port;
++	payload[2] = channel;
++	payload[3] = tid;
++	return ngd_send_ack("connect the source port", MC_CONNECT_SRC, tid, payload, sizeof(payload));
 +}
 +
-+/* Define and activate the channel (ngd_allocbw(): DEF_ACT_CHAN then RECONFIG_NOW, both acknowledged) */
++/* Reserve the messaging bandwidth the manager keeps for the codec's satellite (the first ngd_allocbw() of a bus) */
++static bool
++tx_reserve_bw(uint8_t la)
++{
++	uint8_t tid, now[2], payload[3];
++
++	if (bw_reserved) {
++		return true;
++	}
++	tid = next_tid++;
++	payload[0] = (uint8_t)((la & 0x1f) | ((MESSAGE_BW_SLOTS & 0x07) << 5));
++	payload[1] = (uint8_t)(MESSAGE_BW_SLOTS >> 3);
++	payload[2] = tid;
++	if (!ngd_send_ack("reserve the messaging bandwidth", MC_REQ_BW, tid, payload, sizeof(payload))) {
++		return false;
++	}
++	tid = next_tid++;
++	now[0] = tid;
++	now[1] = la;
++	if (!ngd_send_ack("reconfigure now (the bandwidth)", MC_RECONFIG_NOW, tid, now, sizeof(now))) {
++		return false;
++	}
++	bw_reserved = true;
++	say("slim: the messaging bandwidth for the codec's satellite (%u slots): reserved\n", MESSAGE_BW_SLOTS);
++	return true;
++}
++
++/* Define and activate the channel (ngd_allocbw(): REQ_BW first, then DEF_ACT_CHAN and RECONFIG_NOW, all acknowledged) */
 +static bool
 +tx_define_activate(uint8_t la, uint8_t channel)
 +{
-+	uint8_t tid = next_tid++;
++	uint8_t tid, now[2];
 +	/* dataf 0, la & 0x1f; 16 bits and coeff 3; rootexp 2 and hard ISO; 48 kHz prrate 0x83 (slim_nextdefine_ch()) */
-+	uint8_t payload[6] = { (uint8_t)(la & 0x1f), 0x24, 0x20, 0x83, tid, channel };
-+	uint8_t now[2] = { tid, la };
++	uint8_t payload[6];
 +
-+	return ngd_send_ack("define and activate the channel", MC_DEF_ACT_CHAN, tid, payload, sizeof(payload)) &&
-+	       ngd_send_ack("reconfigure now", MC_RECONFIG_NOW, tid, now, sizeof(now));
++	if (!tx_reserve_bw(la)) {
++		return false;
++	}
++	tid = next_tid++;
++	payload[0] = (uint8_t)(la & 0x1f);
++	payload[1] = 0x24;
++	payload[2] = 0x20;
++	payload[3] = 0x83;
++	payload[4] = tid;
++	payload[5] = channel;
++	say("slim: channel %u for the codec's satellite (%#x): define and activate (tid %u)\n", channel, payload[0], tid);
++	if (!ngd_send_ack("define and activate the channel", MC_DEF_ACT_CHAN, tid, payload, sizeof(payload))) {
++		return false;
++	}
++	tid = next_tid++;
++	now[0] = tid;
++	now[1] = la;
++	return ngd_send_ack("reconfigure now (the channel)", MC_RECONFIG_NOW, tid, now, sizeof(now));
 +}
 +
 +/* Remove the channel, then disconnect its port (slim_control_ch(REMOVE) and slim_disconnect_ports()) */
 +static bool
 +tx_remove(uint8_t la, uint8_t port, uint8_t channel)
 +{
-+	uint8_t tid = next_tid++;
-+	uint8_t control[3] = { (uint8_t)((SLIM_CH_REMOVE << 6) | (la & 0x1f)), tid, channel };
-+	uint8_t now[2] = { tid, la };
-+	uint8_t disconnect[3] = { la, port, next_tid++ };
-+	uint32_t first = FIRST_WORD(sizeof(disconnect) + 3, MT_DEST_REFERRED_USER, MC_DISCONNECT_PORT, 0, LA_MANAGER);
-+	uint8_t message[6];
++	uint8_t tid, control[3], now[2], disconnect[3];
 +
++	tid = next_tid++;
++	control[0] = (uint8_t)((SLIM_CH_REMOVE << 6) | (la & 0x1f));
++	control[1] = tid;
++	control[2] = channel;
 +	(void)ngd_send_ack("remove the channel", MC_CHAN_CTRL, tid, control, sizeof(control));
-+	(void)ngd_send_ack("reconfigure now", MC_RECONFIG_NOW, tid, now, sizeof(now));
-+	memcpy(message, &first, 3);
-+	memcpy(message + 3, disconnect, sizeof(disconnect));
-+	return ngd_send("disconnect the source port", message, sizeof(message));
++	tid = next_tid++;
++	now[0] = tid;
++	now[1] = la;
++	(void)ngd_send_ack("reconfigure now (the removal)", MC_RECONFIG_NOW, tid, now, sizeof(now));
++	tid = next_tid++;
++	disconnect[0] = la;
++	disconnect[1] = port;
++	disconnect[2] = tid;
++	return ngd_send_ack("disconnect the source port", MC_DISCONNECT_PORT, tid, disconnect, sizeof(disconnect));
 +}
 +
 +/* ---- the persistent way in: the bus, the codec, its ports -------------------------------------------------------- */
@@ -7278,6 +7333,7 @@ index 0000000..1064d15
 +	codec_failed = false;
 +	codec_page = -1;
 +	codec_la = interface_la = 0xff;
++	bw_reserved = false;
 +	if (!bus_power_up()) {
 +		return false;
 +	}
@@ -7522,6 +7578,8 @@ index 0000000..1064d15
 +		say("slim: the codec's TX port %u on channel %u: UP\n", port, channel);
 +	} else {
 +		say("slim: the codec's TX port %u on channel %u: NOT UP\n", port, channel);
++		/* (wcd9xxx_close_slim_sch_tx(): a half-brought-up port is removed and disconnected before any retry) */
++		(void)tx_remove(codec_la, port, channel);
 +	}
 +out:
 +	lck_mtx_unlock(&slim_lock);
