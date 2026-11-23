@@ -88,8 +88,39 @@ livepid=""
 case " $cmdline " in *" sweetusb=2 "*)
 	# Live console over USB Ethernet into the run directory; end the run early
 	# with tools/cepheus-cmd.py reboot (stop cepheus-live first: one UDP listener).
-	python3 tools/cepheus-live.py "$out/live.txt" --grep '^$' >/dev/null 2>&1 &
+	#
+	# A listener left over from an earlier run keeps the socket and makes this
+	# run's listener exit at bind time; its output used to go to /dev/null, so
+	# the run looked fine while live.txt stayed empty.  Stop our own stale
+	# listener, refuse anybody else's, and fail loudly if the new one dies.
+	if command -v lsof >/dev/null 2>&1; then
+		for pid in $(lsof -nP -iUDP:5140 -t 2>/dev/null || true); do
+			pcmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+			case $pcmd in
+			*cepheus-live.py*)
+				echo "live: stopping the stale listener $pid" >&2
+				kill "$pid" 2>/dev/null || true ;;
+			"") ;;
+			*)
+				echo "live: UDP 5140 is already held by $pid ($pcmd); stop it first" >&2
+				exit 1 ;;
+			esac
+		done
+		# (give a terminated listener a moment to release the socket)
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			lsof -nP -iUDP:5140 -t >/dev/null 2>&1 || break
+			sleep 0.2
+		done
+	fi
+	python3 tools/cepheus-live.py "$out/live.txt" --grep '^$' 2>"$out/live.err" &
 	livepid=$!
+	sleep 0.3
+	if ! kill -0 "$livepid" 2>/dev/null; then
+		echo "live: the listener did not start:" >&2
+		cat "$out/live.err" >&2
+		livepid=""
+		exit 1
+	fi
 	echo "live log -> $out/live.txt (end early: tools/cepheus-cmd.py reboot)" ;;
 esac
 if ! wait_fastboot $((secs + 180)); then
