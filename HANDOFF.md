@@ -1,9 +1,183 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-22** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-23** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### audio8: the microphone drivers are in 0160, not booted yet (2026-11-23)
+
+The audio patch now carries a real capture path instead of an absent device:
+a persistent SLIMbus/WCD9340 driver and a cepheus `main-mic` driver that
+publishes `/dev/hakios-mic`. Nothing has been booted with them yet; this is
+the source/test-image half of `audio8`.
+
+- **`bsd/dev/hakios.slim.c`** (new) is the shared SLIMbus/codec half: QMI/QRTR
+  bus power, NGD enable/messages/ACKs, RPMh MCLK, codec reset and enumeration,
+  WCD9340 page/register/interface access, and persistent refcounted
+  `hakios_slim_up/down`. It also owns the TX port: WCD9340 port 5 on shared
+  channel `133` (`128 + 5`), not `PCM_CHANNEL_FC`. `slim=1..4` diagnostics
+  stay; `slim=4` still drives the earpiece.
+- **`bsd/dev/hakios.mic.c`** (new) is the cepheus path: `MIC BIAS3` at 2.7 V,
+  AMIC3 -> ADC3 -> `AMIC MUX5` -> DEC5, DEC5 at 48 kHz with the 150 Hz
+  high-pass, AFE `SLIM_0_TX` (`0x4001`) at 16-bit mono 48 kHz, ASM/ADM capture
+  into a 16384-frame ring, `/dev/hakios-mic` (16-bit mono 48 kHz).
+  `mic=1`/`2` dump the codec registers (2 after the path's writes), `mic=3`
+  records for `mic_secs`, `mic=4` serves Darwin: the path is up only while the
+  device is open, DEC5 is unmuted after 40 ms, the high-pass is restored and
+  the AMIC hold released at 300 ms, and after three broken recordings the
+  driver stops trying for the rest of the run.
+- **Order.** The DSP side first (`hakios_slim_up`, ADM path, AFE port), then
+  the codec path, then the codec TX joins channel 133; undo is the reverse.
+  This matches Android starting the AFE port before the codec TX port.
+- **The glue and headers.** Both drivers are in `bsd/conf/files`; the four
+  mic/slim stubs are gone from `cepheus_audio_glue.c`; the API is declared in
+  `bsd/sys/hakios.audio.h`. The speaker path is unchanged.
+- **`VirtualAudio.plugin` is still enabled.** Whole-bundle disable is blocked
+  on the phone rootfs lacking directory `mv`/`rm`; with a working
+  `/dev/hakios-mic` it should no longer be the failing path.
+- **Patch.** `xnu/patches/0160-cepheus-audio.patch` was regenerated (9775
+  lines) from the detached `1c09a18` worktree; `git apply --check` and a full
+  apply pass in `/private/.../xnu-audio-check`.
+- **Not booted.** The phone is still on `audio7`; `mediaserverd` is down
+  (`psx -k mediaserverd` does not bring it back, manual start crashes with
+  `CAXException`), so it needs launchd demand (open VoiceMemos) or a cold
+  reboot before audio can be tested. At the end of this session the phone was
+  unreachable (SSH timed out; no adb/fastboot device), so nothing was tested.
+
+**Next:** push/build through CI, then `fastboot boot` the same kernel and args
+as `audio7` plus `mic=4` (keep `adsp=1 sound=4 speaker_probe=2 battmgr=0
+sweetusb=2`, the graphics args and `-s 900`). The serial log should show
+`mic:`/`slim:` lines and `/dev` should gain `hakios-mic`; record with
+VoiceMemos and confirm speaker playback still works. If it wedges, capture
+`psx`/`pstack` for SpringBoard, backboardd and mediaserverd plus a live
+`oslog`, and use `mic=1..3` to separate codec bring-up from the DSP stream.
+Never flash; keep the bootloader rules from NOTES.md.
+
+### audio7: the microphone attempt wedges SpringBoard's main thread (2026-11-22 21:50)
+
+Same kernel (`37c67296...`) and args as `audio6` (`-s 900`), booted 21:31:39.
+The display, speed and app touch were good; the buttons/gestures worked until
+the user tried to record with VoiceMemos. The app showed the microphone was not
+working, and then system input died again while app touch kept working.
+
+- **The wedge is in SpringBoard's main thread, in the capture stack.** `pstack`
+  at 21:34-21:40 (`logs/runs/audio7/pstack-*.txt`) shows thread 0 in
+  `mach_msg` ← `libdispatch+0x36308/0x36694` ← `libxpc+0xe0ec` ←
+  `CoreMedia+0xf3934/...` ← `CMCapture+0x14a820` ← `libdispatch`. That is a
+  synchronous XPC call into the capture service; SpringBoard's main run loop
+  never returns, so the volume/power buttons, the home gesture and Control
+  Center/Notification Center are all ignored. App touch still works because
+  backboardd delivers it on its own threads.
+- **The other daemons are idle, not deadlocked.** backboardd (58),
+  mediaserverd (27, then 463 after a restart), accountsd (107) and lockdownd
+  (73, then 411) thread 0 are all in normal CoreFoundation run loops
+  (`CoreFoundation+0x74148/0x752e0/0x79d20`), with `Foundation+0x3eef8` where
+  a run loop is entered. **Correction to the audio6/edge-forcep reading:** those
+  frames are CoreFoundation/Foundation, not `liblockdown`; accountsd and
+  lockdownd were not blocked in the Accounts/FairPlay call in these stacks.
+  The FairPlay boot hang and its lockdownd patch are still real, but they are
+  not what wedges this run.
+- **The microphone device does not exist yet.** `/dev/hakios-audio` is the only
+  hakios device; `/dev/hakios-mic` is absent. The custom
+  `/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver` has an input path that opens
+  `/dev/hakios-mic`, and Apple's `VirtualAudio.plugin` is enabled in
+  `/Library/Audio/Plug-Ins/HAL/` even though `tools/sweet-root-tweaks.py`
+  disables it ("mediaserverd crash") and an identical copy sits in
+  `HAL.disabled/`. The capture service is left waiting for an input stream that
+  never starts, and SpringBoard's synchronous query waits behind it.
+- **Recovery.** `psx -k SpringBoard 9` clears it: the new SpringBoard (732) has
+  its main thread back in a normal run loop. The harness timed out
+  ("run did not return to fastboot in 1080 s"); the phone stayed up and the xnu
+  ring was not pulled.
+
+**Next (superseded by the audio8 entry):** (1) move `HAL/VirtualAudio.plugin`
+out of `HAL/` (the repo tweak already does this; the `HAL.disabled` copy is
+byte-identical); (2) make the `HakiosAudio` plugin fail the input stream
+immediately when `/dev/hakios-mic` is missing, or stop advertising an input
+until the mic driver exists; (3) boot `audio8` with the same args and retry
+VoiceMemos; if it still wedges, capture SpringBoard/backboardd/mediaserverd
+`pstack`s and a live `oslog` during the attempt.
+
+### audio6: correct display and speed; SpringBoard system input wedged (2026-11-22 21:26)
+
+The good graphics/scheduler args fixed the size and the lag: with
+`sweetampforcep=1 sweetmtl=2 sweetgpu=1` the display was the right size and
+the UI responsive. But system-level input stopped working: volume +/- and the
+power button did nothing, and the home gesture and Control
+Center/Notification Center swipes were ignored, while app touch worked.
+
+- **Stacks (corrected in the audio7 entry).** `pstack` at 21:21 and 21:26
+  (`logs/runs/audio6/pstack-*.txt`): SpringBoard (25) thread 0 is in the same
+  `CMCapture` → `CoreMedia` → `libxpc` synchronous XPC wait seen in audio7;
+  backboardd, accountsd, lockdownd and runningboardd are in normal
+  CoreFoundation run loops. The earlier "Foundation synchronous-XPC" reading of
+  `0x186e5c148/0x1d1bee0ec` was wrong: those are CoreFoundation/Foundation
+  run-loop frames, not liblockdown.
+- **The kernel key driver is not the cause.** `sweet_keys.c` polls PMIC PON
+  and GPIO6; the audio4 log shows `SWEET KEYS: key=0` (power) and `key=2`
+  (volume down) events, and `sweet_hid_key` maps them to Consumer Power /
+  Volume. The audio6 kernel is the same binary (`37c67296...`); the missing
+  response is above the kernel.
+- The run's live log was empty again (the harness's `cepheus-live.py` did not
+  capture), and the phone did not reach the rescue before this entry; the xnu
+  ring will be checked when it does.
+
+**Next:** the wedge is the capture/microphone path, not the Accounts/lockdown
+XPC: restarting SpringBoard (`psx -k SpringBoard 9`) clears it, but a new
+recording attempt wedges it again. Follow the audio7 entry's next steps
+(disable `VirtualAudio`, fail the input stream fast, then boot `audio8`).
+
+### audio5: display lit; missing GPU/force-P args made it laggy (2026-11-22 21:20)
+
+The display-safe touch config works: with `cepheustouchpanelpor=0
+cepheustouchpanel=0` the panel stayed lit through the FTS rail cycle, the
+system reached SpringBoard, and audio still played. But the run was much
+laggier than `kernel-wifi-battery` and the display size was wrong because the
+`audio5` cmdline omitted the graphics/scheduler args the good run used:
+
+- `sweetampforcep=1`: edge scheduler puts interactive/standard-daemon/app
+  threads on the P (A76) pset; without it everything stays on E (little cores).
+- `sweetmtl=2`: the Metal2 bridge.
+- `sweetgpu=1` (added by `-G`): Adreno GPU presentation. The good run
+  presented a 1088-px stride; the CPU path presents 1080/1125, which is the
+  wrong-size image the user saw.
+
+`audio6` boots the same kernel with all of them plus the audio and
+display-safe touch args (`-s 600`). The `audio5` harness shell died with
+`Shell.NotFoundError` and saved no `live.txt`/`xnu.txt`, so the user's
+observation is the source for this entry.
+
+### Speaker playback confirmed; panel black after FTS start (2026-11-22 16:16)
+
+The rebuilt kernel with 0160+0161 (SHA256 `37c67296...`,
+`work/boot/kernel-audio`) booted cold from fastboot with
+`adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2` (`logs/runs/audio4`).
+No `io_submap` panic: the FTS thread mapped its tiles and the system reached
+SpringBoard (SSH at `192.168.7.2` works).
+
+- **The speaker plays.** The charging and lock sounds were audible, and a
+  controlled `/var/local/bin/sound_test tone 2` played 1 kHz/440 Hz at 0.50 of
+  full scale: `sound_test: 96000 of 96000 frames handed over`; `sound_test
+  route` reports `Speaker "Speaker"` as the output. This is the first sound
+  from the built-in speaker through the ported ADSP/QUAT_MI2S/CS35L41 path.
+- **Open: the panel is black, and the cause is now known.** The system is up
+  and sounds play, but the display never lights. The `audio4` log shows the
+  FTS thread's boot rail cycle dropping panel VCI/reset at 131.472 s
+  (`panel por=1`), then the 0144 SET_ON replay at 151.477-151.747 s
+  (`34 cmds, 33 sent, 0 errors`; the one skipped command is the intentional
+  `0x51` brightness step), and no `panel replay video off` line because
+  `cepheustouchvideo` defaults to 0. This is the known 0144/0145 defect: the
+  replay itself kills the panel (HANDOFF 0145/0146, `touch-0146-video` showed
+  `cepheustouchvideo=1` also stops the command DMA, so it is unusable). The
+  log's later display-on events (170.4, 172.5, 200.9, 204.4, 208.0, 414.5 s)
+  only reset/sense the touch controller and reassert brightness; they never
+  retry the panel init. The fix is the known-good display configuration:
+  keep panel VCI/reset powered and skip the replay
+  (`cepheustouchpanelpor=0 cepheustouchpanel=0`), which `touch-0146-noreplay-full`
+  proved keeps display and power-key wake stable through a full touch rail
+  cycle. On a cold boot the panel is already initialized by ABL, so neither
+  the panel POR nor the replay is needed.
 
 ### First audio boot: ADSP and MI2S verified; io_submap panic fixed (2026-11-22 15:35)
 
@@ -31,7 +205,7 @@ The audio stack itself worked:
   (`rail_position`'s `ml_io_map(0xc3f0000)`, the first panic) to the touch
   thread; the speaker probe was never the cause.
 
-**Fix (not yet built):**
+**Fix (built and verified):**
 
 - `xnu/patches/0160-cepheus-audio.patch` regenerated (7,379 lines): every audio
   `ml_io_map` is now `ml_io_map_unmappable(..., VM_WIMG_IO)` (kernel_map),
@@ -41,19 +215,24 @@ The audio stack itself worked:
   `sweet_touch.c` is disabled by default (`sweettouch=0`) and unchanged.
 - `tools/validate-repo.py` passes (157 patches, 0001-0161); 0160 then 0161
   apply cleanly to a detached 0159 worktree.
+- The CI kernel built from this (`37c67296...`) contains the fix: `fts_thread`
+  and `rail_position` both call `ml_io_map_unmappable`; `audio4` reached
+  SpringBoard with no `io_submap` panic.
 
-**Next:** push both patches, let CI build, then
+**Next:** boot with the known-good display config (skip the panel POR and the
+SET_ON replay; keep the touch rail cycle):
 
 ```
-tools/cepheus-run.sh audio4 -k <kernel> -A work/boot/cepheus-amp.adt -s 300 \
-  -a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2" \
-  -g "adsp:|cs35l41|sound:|hakios-audio|panic"
+tools/cepheus-run.sh audio5 -k work/boot/kernel-audio/kernel.development.sweet \
+  -A work/boot/cepheus-amp.adt -s 300 \
+  -a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2 cepheustouchpanelpor=0 cepheustouchpanel=0" \
+  -g "adsp:|cs35l41|sound:|hakios-audio|SWEET FTS|SWEET FB: display|SWEET BL: DCS|panic"
 ```
 
-Expect the FTS thread to map and touch to work at ~28 s, then the CS35L41 probe
-to report its device ID (probe only; it puts the chip back in reset). If the
-kernel stays up, SSH (`ssh -i work/userland/ssh/id_ed25519 root@192.168.7.2`)
-and run `/var/local/bin/sound_test route`, then `tone SECS`.
+The display should stay lit (the shim/ABL panel init survives the touch rail
+cycle), and the speaker should still play. If it does, the remaining audio work
+is microphone capture (`hakios.slim.c` + `hakios.mic.c`) and the touch
+ghost/re-arm behavior on warm starts.
 
 ### Kernel audio stack ported; CI build, then first speaker test (2026-11-22 14:45)
 

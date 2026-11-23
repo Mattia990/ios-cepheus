@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index ed489f8..de213c5 100644
+index ed489f8..01fd518 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -123,6 +123,12 @@ bsd/dev/redwood_net.c		standard
+@@ -123,6 +123,14 @@ bsd/dev/redwood_net.c		standard
  bsd/dev/redwood_apple80211.c	standard
  bsd/dev/cepheus_sta.c		standard
  bsd/dev/cepheus_wlan.c		standard
@@ -10,6 +10,8 @@ index ed489f8..de213c5 100644
 +bsd/dev/hakios.audio.c		standard
 +bsd/dev/hakios.adsp.c		standard
 +bsd/dev/hakios.sound.c		standard
++bsd/dev/hakios.slim.c		standard
++bsd/dev/hakios.mic.c		standard
 +bsd/dev/hakios.guard.c		standard
 +bsd/dev/hakios.cs35l41.c		standard
  bsd/dev/mem.c				standard
@@ -17,15 +19,15 @@ index ed489f8..de213c5 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/cepheus_audio_glue.c b/bsd/dev/cepheus_audio_glue.c
 new file mode 100644
-index 0000000..c5a26d0
+index 0000000..5916b95
 --- /dev/null
 +++ b/bsd/dev/cepheus_audio_glue.c
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,76 @@
 +/*
 + * Glue for the audio stack ported from not-exyy/ios-cepheus (HakiOS):
 + * the locks its drivers share, the loader hooks they expect, and the
-+ * drivers this port does not build yet (microphones, SLIMbus, haptics,
-+ * torch, camera, virtio sound, and the small-image file server).
++ * drivers this port does not build yet (haptics, torch, camera, virtio
++ * sound, and the small-image file server).
 + */
 +#include <sys/param.h>
 +#include <sys/types.h>
@@ -76,26 +78,6 @@ index 0000000..c5a26d0
 +hakios_battery_report(const struct hakios_battery_state *state)
 +{
 +	(void)state;
-+}
-+
-+void
-+hakios_mic_dsp_up(void)
-+{
-+}
-+
-+void
-+hakios_mic_dsp_down(void)
-+{
-+}
-+
-+void
-+hakios_slim_dsp_up(void)
-+{
-+}
-+
-+void
-+hakios_slim_dsp_down(void)
-+{
 +}
 +
 +void
@@ -5322,6 +5304,2400 @@ index 0000000..4c91f0a
 +	}
 +	return (int)(log2 * 30103 / 65536 / 1000);
 +}
+diff --git a/bsd/dev/hakios.mic.c b/bsd/dev/hakios.mic.c
+new file mode 100644
+index 0000000..25a1122
+--- /dev/null
++++ b/bsd/dev/hakios.mic.c
+@@ -0,0 +1,902 @@
++/*
++ * The Xiaomi Mi 9's (cepheus, SM8150) microphone, through the audio DSP. Everything below is from Android on this
++ * phone: its device tree, its mixer paths (fw/etc/mixer_paths_tavil.xml, "main-mic" = "amic3") and LineageOS'
++ * android_kernel_xiaomi_sm8150 (techpack/audio: asoc/codecs/wcd934x/wcd934x.c, dsp/q6afe.c, dsp/q6adm.c,
++ * dsp/q6asm.c, asoc/sm8150.c). Nothing here happens unless boot-arg mic=N asks for it, with adsp=1
++ * (hakios.adsp.c), which calls hakios_mic_dsp_up() once the DSP's audio services are up.
++ *
++ * The main microphone is AMIC3 of the WCD9340 ("Tavil") codec: MIC BIAS3 feeds it, ADC3 digitizes it, decimator 5
++ * (DEC5) filters it, and its samples leave through the codec's SLIMbus TX port 5 on shared channel 133. The SLIMbus
++ * belongs to the audio DSP; the codec's side of it is brought up by hakios.slim.c (QMI, NGD, MCLK, reset, logical
++ * addresses, chip id, and the codec's TX port on the channel). This file has the codec's microphone registers, the
++ * AFE's SLIMbus port, and a stream the DSP fills with 16-bit linear PCM that /dev/hakios-mic gives to Darwin.
++ *
++ * The codec's path, in the order Android's DAPM powers it (tavil_codec_enable_dec(), tavil_codec_enable_adc(),
++ * tavil_tx_hpf_corner_freq_callback(), tavil_tx_mute_update_callback()):
++ *
++ *   MIC BIAS3   2.7 V (the cepheus overlay's micbias3-mv), then enabled; a millisecond for its charge pump
++ *   AMIC3       the analog hold (ANA_AMIC4 bit 6), the power level Android leaves (default, AMIC3 bits 5-6), the
++ *               ADC's gain 8 (2 dB; the initial mixer state), the ADC on (bit 7)
++ *   the muxes   AMIC MUX5 = ADC3, ADC MUX5 = AMIC, CDC_IF TX5 MUX = DEC5, IIR0 INP0 MUX = DEC5
++ *   DEC5        48 kHz (rate code 4), muted while it powers, the power level from AMIC3, AMIC input, a 150 Hz
++ *               high-pass while it settles, 0 dB
++ *   the DSP     the AFE's SLIMbus port 0x4001 (one channel, shared channel 133, 16 bits, 48 kHz), the ADM device
++ *               path and the ASM stream that is read
++ *
++ * Forty milliseconds after DEC5 comes up it is unmuted; three hundred milliseconds after, the analog hold is
++ * released and DEC5's high-pass is put back where it was, with the codec's one-clock "go" bit (SEC2 bit 1).
++ *
++ *   mic=1    the SLIMbus and the codec brought up (hakios_slim_up()), the microphone's registers looked at; nothing
++ *            written to any of them; then all given back
++ *   mic=2    ... and the microphone's registers written as the path writes them, read back, then put back
++ *   mic=3    ... and the main microphone listened to for mic_secs seconds (default 10, at most 600), each second's
++ *            level in the log, into the recording with rec_sound_mic=1; then all given back
++ *   mic=4    the microphone for Darwin: /dev/hakios-mic, 16-bit samples, one channel, 48 kHz. The path is up only
++ *            while the audio server has the device open; a read never waits, and the reader is kept about 40 ms
++ *            behind the DSP (it comes in 20 ms periods)
++ *
++ * What is asked for is given back at the end, and before the DSP is shut down (hakios_mic_dsp_down()).
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <kern/kalloc.h>
++#include <mach/mach_types.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include <sys/hakios.audio.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++
++static LCK_GRP_DECLARE(mic_lock_group, "hakios-mic");
++static LCK_MTX_DECLARE(mic_lock, &mic_lock_group);      /* what is asked for, and given back */
++
++static uint32_t level;
++static bool running;
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[400];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	return length;
++}
++
++/* A line that says all went as it should: not said again in Darwin's later recordings (mic=4), where it is the same each time. */
++static bool quiet;
++#define note(...)       do { if (!quiet) { say(__VA_ARGS__); } } while (0)
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* ---- the DSP: the AFE's SLIMbus port, a device path for recording, a stream that is read ------------------ */
++
++#define APR_SVC_AFE                             4
++#define APR_SVC_ASM                             7
++#define APR_SVC_ADM                             8
++#define APR_BASIC_RSP_RESULT                    0x000110e8u
++#define APR_WAIT_MS                             1000
++#define AFE_PORT_CMD_DEVICE_START               0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP                0x000100e6u
++#define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
++#define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
++#define AFE_API_VERSION_SLIMBUS_CONFIG          1
++#define AFE_SLIMBUS_DEVICE_1                    0
++#define AFE_PARAM_ID_SLIMBUS_CONFIG             0x00010212u
++#define TX5_PORT                                5               /* the codec's SLIMbus TX port for DEC5 */
++#define TX5_CHANNEL                             133             /* 128 + 5, as msm-dai-q6 and sm8150.c have it */
++#define MIC_PORT                                0x4001          /* AFE_PORT_ID_SLIMBUS_MULTI_CHAN_0_TX (SLIMBUS_0_TX) */
++#define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
++#define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5          0x00010325u
++#define ADM_PATH_LIVE_RECORDING                 2
++#define ADM_MATRIX_AUDIO_TX                     1
++#define ADM_TOPOLOGY_NONE                       0x00010312u
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010d93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010d94u
++#define ASM_STREAM_CMD_OPEN_READ_V3             0x00010db4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM         0x00010c10u
++#define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2      0x00010da3u
++#define ASM_SESSION_CMD_RUN_V2                  0x00010daau
++#define ASM_DATA_CMD_READ_V2                    0x00010dacu
++#define ASM_DATA_EVENT_READ_DONE_V2             0x00010d9au
++#define ASM_STREAM_CMD_CLOSE                    0x00010bcdu
++#define ASM_TOPOLOGY_NONE                       0x00010c68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
++#define ASM_SHMEM_4K_POOL                       3
++#define MIC_SESSION                             2               /* (the speakers' is 1) */
++#define MIC_STREAM_PORT                         (MIC_SESSION << 8 | 1)
++#define READ_TOKEN                              0x40000000u     /* | the period */
++#define PCM_CHANNEL_FC                          3               /* (the ADM stream's channel map, not the SLIMbus's) */
++#define MIC_RATE                                48000
++#define MIC_PERIODS                             8
++#define MIC_PERIOD_FRAMES                       960             /* 20 ms, one channel of 16 bits */
++#define MIC_PERIOD_BYTES                        (MIC_PERIOD_FRAMES * 2)
++
++static uintptr_t mic_memory;
++static uint64_t mic_address;
++static bool memory_taken, mic_mapped, mic_copp_open, mic_stream_open, mic_port_on;
++static uint32_t mic_map_handle, mic_copp;
++static volatile uint32_t read_ready, read_errors, reads_done;
++static volatile uint32_t read_sizes[MIC_PERIODS];
++
++static bool
++mic_events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
++{
++	if (service != APR_SVC_ASM || !(token & READ_TOKEN) || (token & 0x3fffffff) >= MIC_PERIODS) {
++		return false;
++	}
++	if (opcode == ASM_DATA_EVENT_READ_DONE_V2) {
++		if (length < 24 || payload[0] != 0) {
++			OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		}
++		read_sizes[token & 0x3fffffff] = length >= 24 ? payload[4] : 0;
++		OSIncrementAtomic((volatile SInt32 *)&reads_done);
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		return true;
++	}
++	if (opcode == APR_BASIC_RSP_RESULT) {
++		OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		read_sizes[token & 0x3fffffff] = 0;
++		return true;
++	}
++	return false;
++}
++
++static bool
++mic_read(unsigned period)
++{
++	uint32_t read[5] = { (uint32_t)(mic_address + 4096 * period), (uint32_t)((mic_address + 4096 * period) >> 32),
++		             mic_map_handle, MIC_PERIOD_BYTES, period };
++
++	return hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, READ_TOKEN | period, ASM_DATA_CMD_READ_V2, read, sizeof(read), 0, NULL);
++}
++
++struct afe_param {
++	uint32_t module, param;
++	uint16_t size, reserved;
++} __attribute__((packed));
++
++static const char *
++dsp_error(uint32_t status)
++{
++	static const char *const names[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected", "panic",
++		                             "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                             "preempted", "continue", "immediate", "not implemented", "need more", "no memory",
++		                             "not there" };
++
++	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "an error this does not know";
++}
++
++static bool
++command(const char *what, uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted,
++    struct hakios_apr_answer *answer)
++{
++	struct hakios_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	if (!hakios_adsp_apr(service, 0, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		say("mic: %s (opcode %#x): NO ANSWER\n", what, opcode);
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		if (answer->words[1] == 0) {
++			note("mic: %s: done\n", what);
++		} else {
++			say("mic: %s: REFUSED: %s\n", what, dsp_error(answer->words[1]));
++		}
++		return answer->words[1] == 0 && wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	say("mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
++	    answer->words[0], answer->words[1]);
++	return false;
++}
++
++static bool
++afe_port_param(uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	*(uint16_t *)packet = MIC_PORT;
++	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return command(what, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++/* the stream and the path, opened, mapped and routed (msm-pcm-q6 and q6adm/q6asm at a recording's open and prepare) */
++static bool
++dsp_path_on(void)
++{
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, 0, 0, 0 };
++	struct {
++		uint16_t flags, mode, endpoint1, endpoint2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) open = { 0, ADM_PATH_LIVE_RECORDING, MIC_PORT, 0xffff, ADM_TOPOLOGY_NONE, 1, 16, MIC_RATE,
++		                           { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t mode, endpoint, topology, format;
++		uint16_t bits, reserved;
++	} __attribute__((packed)) reading = { 0, 0, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2, 16, 0 };
++	struct {
++		uint32_t param, size, frames_per_buffer, block_size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) encoder = { ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2, 28, 0, 20, 1, 16, MIC_RATE, 1, 0, { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps;
++		uint16_t copp[2];
++	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_TX, 1, MIC_SESSION, 1, { 0, 0 } };
++	struct hakios_apr_answer answer;
++	uint32_t bytes = 0;
++
++	if (!hakios_audio_dsp_memory(&mic_memory, &mic_address, &bytes) || bytes < MIC_PERIODS * 4096) {
++		say("mic: no memory the DSP can see\n");
++		return false;
++	}
++	memory_taken = true;
++	map.low = (uint32_t)mic_address;
++	map.high = (uint32_t)(mic_address >> 32);
++	map.size = MIC_PERIODS * 4096;
++	hakios_adsp_apr_events_second(mic_events);
++	if (!command("our periods for the microphone, mapped for the DSP", APR_SVC_ASM, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map,
++	    sizeof(map), ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
++		return false;
++	}
++	mic_mapped = true;
++	mic_map_handle = answer.words[0];
++	say("mic: our %u KB at %#llx are the DSP's handle %#x\n", MIC_PERIODS * 4, mic_address, mic_map_handle);
++	if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_STREAM_CMD_OPEN_READ_V3, &reading, sizeof(reading), APR_WAIT_MS,
++	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("mic: the stream, opened for reading: %s (%#x %#x)\n", "REFUSED OR NO ANSWER", answer.opcode, answer.words[1]);
++		return false;
++	}
++	mic_stream_open = true;
++	say("mic: the stream (session 2), opened for reading 16-bit linear PCM, no processing: done\n");
++	if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_STREAM_CMD_SET_ENCDEC_PARAM, &encoder, sizeof(encoder), APR_WAIT_MS,
++	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("mic: the stream's format: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
++		return false;
++	}
++	say("mic: the stream's format: 1 channel of 16 bits at 48 kHz: done\n");
++	if (!hakios_adsp_apr(APR_SVC_ADM, MIC_PORT, 0, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), APR_WAIT_MS, &answer) ||
++	    answer.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || answer.words[0] != 0) {
++		say("mic: a device path from the port: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[0]);
++		return false;
++	}
++	mic_copp_open = true;
++	mic_copp = answer.words[1] & 0xffff;
++	route.copp[0] = (uint16_t)mic_copp;
++	say("mic: the device path from port %#x is open: COPP %u (live recording, no processing, 1 channel, 16 bits, 48 kHz)\n",
++	    MIC_PORT, mic_copp);
++	return command("the device path routed to session 2", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0,
++	           NULL);
++}
++
++/* the AFE's SLIMbus port: SLIM_0_TX, one channel of 16 bits at 48 kHz, on shared channel 133 (TX5's) */
++static bool
++dsp_port_on(void)
++{
++	struct {
++		uint32_t version;
++		uint16_t device, bits, format, channels;
++		uint8_t map[8];
++		uint32_t rate;
++	} __attribute__((packed)) config = { AFE_API_VERSION_SLIMBUS_CONFIG, AFE_SLIMBUS_DEVICE_1, 16, 0, 1, { 0 }, MIC_RATE };
++	uint16_t start[2] = { MIC_PORT, 0 };
++
++	config.map[0] = TX5_CHANNEL;
++	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &config, sizeof(config),
++	    "the port SLIM_0_TX (0x4001): 1 channel (133) of 16 bits at 48 kHz")) {
++		return false;
++	}
++	mic_port_on = command("the port 0x4001, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
++	return mic_port_on;
++}
++
++static void
++dsp_off(void)
++{
++	uint16_t stop[2] = { MIC_PORT, 0 };
++
++	if (mic_stream_open) {
++		(void)hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_WAIT_MS, NULL);
++		say("mic: the stream, closed\n");
++		mic_stream_open = false;
++	}
++	if (mic_copp_open) {
++		(void)hakios_adsp_apr(APR_SVC_ADM, (uint16_t)mic_copp, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, APR_WAIT_MS, NULL);
++		say("mic: the device path, closed\n");
++		mic_copp_open = false;
++	}
++	if (mic_port_on) {
++		(void)command("the port 0x4001, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
++		mic_port_on = false;
++	}
++	if (mic_mapped) {
++		(void)command("our periods, unmapped", APR_SVC_ASM, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &mic_map_handle,
++		    sizeof(mic_map_handle), 0, NULL);
++		mic_mapped = false;
++	}
++	hakios_adsp_apr_events_second(NULL);
++	if (memory_taken) {
++		hakios_audio_dsp_memory_put();
++		memory_taken = false;
++	}
++}
++
++/* ---- the codec: MIC BIAS3 -> AMIC3 -> ADC3 -> DEC5 -> TX5 (hakios.slim.c has the bus and the port) ---------- */
++
++#define ANA_AMIC3                               0x0610          /* bits 7 ADC on, 5-6 power level, 0-4 gain */
++#define ANA_AMIC4                               0x0611          /* bit 6: the analog hold */
++#define ANA_MICB3                               0x0625          /* bits 6-7 on, 0-5 vout */
++#define TX5_PATH_CTL                            0x0a81          /* bits 0-3 rate, 4 mute */
++#define TX5_PATH_CFG0                           0x0a82          /* bits 1-2 power level, 5-6 high-pass, 7 AMIC */
++#define TX5_VOL_CTL                             0x0a84
++#define TX5_PATH_SEC2                           0x0a89          /* bit 1: the high-pass' go bit */
++#define AMIC_MUX5                               0x0d27          /* bits 0-2: ADC3 */
++#define ADC_MUX5                                0x0d20          /* bits 2-3: AMIC */
++#define IIR0_INP0_MUX                           0x0d31          /* bits 0-4: DEC5 */
++#define CDC_IF_TX5_MUX                          0x0d3b          /* bits 2-3: DEC5 */
++#define MICB_2700MV                             0x22            /* (2700 - 1000) / 50: the cepheus overlay's micbias3 */
++#define AMIC3_GAIN                              0x08            /* "ADC3 Volume 8" (2 dB) of the initial mixer state */
++#define TX_UNMUTE_MS                            40              /* WCD934X_TX_UNMUTE_DELAY_MS */
++#define TX_SETTLE_MS                            300             /* the high-pass work of tavil_tx_hpf_corner_freq_callback() */
++
++static bool mic_ready;
++static uint8_t dec5_hpf;                        /* CFG0 bits 5-6 as the path found them */
++
++static bool
++codec_update(const char *what, uint16_t reg, uint8_t mask, uint8_t value)
++{
++	if (!hakios_slim_codec_update(reg, mask, value)) {
++		say("mic: %s: the codec's %#06x was not written\n", what, reg);
++		return false;
++	}
++	note("mic: %s (%#06x, mask %#04x): done\n", what, reg, mask);
++	return true;
++}
++
++/*
++ * The codec's microphone path, as tavil_codec_enable_dec()/adc() power it for Android's "main-mic": MIC BIAS3 at
++ * 2.7 V, AMIC3 into ADC3, DEC5 from AMIC, TX5 from DEC5. It comes up muted and with a 150 Hz high-pass; forty
++ * milliseconds later it is unmuted, and three hundred milliseconds later the hold is released and the high-pass put
++ * back. False if a register was not written (nothing more is attempted).
++ */
++static bool
++mic_on(void)
++{
++	uint8_t cfg0 = 0;
++
++	if (mic_ready) {
++		return true;
++	}
++	if (!hakios_slim_codec_read(TX5_PATH_CFG0, &cfg0)) {
++		say("mic: DEC5's configuration cannot be read\n");
++		return false;
++	}
++	dec5_hpf = (uint8_t)((cfg0 >> 5) & 0x03);
++	/*
++	 * (from here on the path has to be given back even if a write fails: mic_off() turns off whatever was turned on, so
++	 * the bias and the ADC are not left running)
++	 */
++	mic_ready = true;
++
++	/* MIC BIAS3 2.7 V, then its charge pump; a millisecond, as __tavil_codec_enable_micbias() waits */
++	if (!codec_update("MIC BIAS3, 2.7 V", ANA_MICB3, 0x3f, MICB_2700MV) ||
++	    !codec_update("MIC BIAS3, on", ANA_MICB3, 0xc0, 0x40)) {
++		return false;
++	}
++	sleep_ms(1);
++
++	/* ADC3 on AMIC3: the analog hold, the default power level, the gain Android's initial state has, the ADC on */
++	if (!codec_update("AMIC3, the analog hold", ANA_AMIC4, 0x40, 0x40) ||
++	    !codec_update("AMIC3, the default power level", ANA_AMIC3, 0x60, 0x20) ||
++	    !codec_update("AMIC3, gain 8", ANA_AMIC3, 0x1f, AMIC3_GAIN) ||
++	    !codec_update("ADC3, on", ANA_AMIC3, 0x80, 0x80)) {
++		return false;
++	}
++
++	/* the routes of Android's "main-mic" (and its IIR, which sees DEC5) */
++	if (!codec_update("AMIC MUX5 = ADC3", AMIC_MUX5, 0x07, 0x03) ||
++	    !codec_update("ADC MUX5 = AMIC", ADC_MUX5, 0x0c, 0x04) ||
++	    !codec_update("CDC_IF TX5 = DEC5", CDC_IF_TX5_MUX, 0x0c, 0x08) ||
++	    !codec_update("IIR0 INP0 = DEC5", IIR0_INP0_MUX, 0x1f, 0x06)) {
++		return false;
++	}
++
++	/* DEC5: 48 kHz, the default power level, AMIC input, a 150 Hz high-pass, 0 dB, muted, then its supply */
++	if (!codec_update("DEC5, 48 kHz", TX5_PATH_CTL, 0x0f, 0x04) ||
++	    !codec_update("DEC5, the default power level", TX5_PATH_CFG0, 0x06, 0x00) ||
++	    !codec_update("DEC5, the AMIC input", TX5_PATH_CFG0, 0x80, 0x00) ||
++	    !codec_update("DEC5, a 150 Hz high-pass", TX5_PATH_CFG0, 0x60, 0x40) ||
++	    !codec_update("DEC5, 0 dB", TX5_VOL_CTL, 0xff, 0x00) ||
++	    !codec_update("DEC5, muted", TX5_PATH_CTL, 0x10, 0x10) ||
++	    !codec_update("DEC5, the ADC MUX5 supply", TX5_PATH_CTL, 0x20, 0x20)) {
++		return false;
++	}
++
++	/* the decimator unmuted after forty milliseconds, its gain applied as POST_PMU does */
++	sleep_ms(TX_UNMUTE_MS);
++	if (!codec_update("DEC5, unmuted", TX5_PATH_CTL, 0x10, 0x00) ||
++	    !codec_update("DEC5, its gain applied", TX5_VOL_CTL, 0xff, 0x00)) {
++		return false;
++	}
++
++	/* and at three hundred milliseconds the analog hold released and the high-pass put back, with the go bit */
++	sleep_ms(TX_SETTLE_MS - TX_UNMUTE_MS);
++	if (!codec_update("AMIC3, the hold released", ANA_AMIC4, 0x40, 0x00) ||
++	    !codec_update("DEC5, the high-pass it had", TX5_PATH_CFG0, 0x60, (uint8_t)(dec5_hpf << 5)) ||
++	    !codec_update("DEC5, the high-pass applied", TX5_PATH_SEC2, 0x02, 0x02)) {
++		return false;
++	}
++	sleep_ms(1);
++	return codec_update("DEC5, the high-pass' go bit cleared", TX5_PATH_SEC2, 0x02, 0x00);
++}
++
++/* The path powered down: muted first, then the routes, the ADC and its bias. Nothing is waited for. */
++static void
++mic_off(void)
++{
++	if (!mic_ready) {
++		return;
++	}
++	mic_ready = false;
++	(void)codec_update("DEC5, muted", TX5_PATH_CTL, 0x10, 0x10);
++	(void)codec_update("DEC5, the ADC MUX5 supply off", TX5_PATH_CTL, 0x20, 0x00);
++	(void)codec_update("DEC5, the default power level", TX5_PATH_CFG0, 0x06, 0x00);
++	(void)codec_update("CDC_IF TX5 = ZERO", CDC_IF_TX5_MUX, 0x0c, 0x00);
++	(void)codec_update("AMIC MUX5 = ZERO", AMIC_MUX5, 0x07, 0x00);
++	(void)codec_update("ADC MUX5 = DMIC", ADC_MUX5, 0x0c, 0x00);
++	(void)codec_update("IIR0 INP0 = ZERO", IIR0_INP0_MUX, 0x1f, 0x00);
++	(void)codec_update("AMIC3, the hold released", ANA_AMIC4, 0x40, 0x00);
++	(void)codec_update("ADC3, off", ANA_AMIC3, 0x80, 0x00);
++	(void)codec_update("MIC BIAS3, off", ANA_MICB3, 0xc0, 0x00);
++}
++
++/* mic=1/2: what the codec's registers hold (and, at 2, what the path's writes leave) */
++static void
++mic_look(void)
++{
++	static const struct {
++		uint16_t reg;
++		const char *name;
++	} regs[] = {
++		{ ANA_AMIC3, "ANA_AMIC3" }, { ANA_AMIC4, "ANA_AMIC4" }, { ANA_MICB3, "ANA_MICB3" },
++		{ TX5_PATH_CTL, "TX5_PATH_CTL" }, { TX5_PATH_CFG0, "TX5_PATH_CFG0" }, { TX5_VOL_CTL, "TX5_VOL_CTL" },
++		{ TX5_PATH_SEC2, "TX5_PATH_SEC2" }, { ADC_MUX5, "ADC MUX5" }, { AMIC_MUX5, "AMIC MUX5" },
++		{ IIR0_INP0_MUX, "IIR0 INP0 MUX" }, { CDC_IF_TX5_MUX, "CDC_IF TX5 MUX" },
++	};
++
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint8_t value = 0;
++
++		if (hakios_slim_codec_read(regs[i].reg, &value)) {
++			say("mic: %-16s %#06x = %#04x\n", regs[i].name, regs[i].reg, value);
++		}
++	}
++	say("mic: the codec's generic device %#x, its interface device %#x; TX%d is SLIMbus channel %u\n",
++	    hakios_slim_generic_la(), hakios_slim_interface_la(), TX5_PORT, TX5_CHANNEL);
++}
++
++static bool tx_on;
++
++/* Everything up to the stream's run, in a recording's order; false if any of it fails. */
++static bool
++path_up(void)
++{
++	if (!hakios_slim_up()) {
++		say("mic: the SLIMbus and the codec could not be brought up\n");
++		return false;
++	}
++	/* (the DSP's side first, as Android's is: the port is started before the codec's TX port joins its channel) */
++	if (!dsp_path_on() || !dsp_port_on()) {
++		return false;
++	}
++	if (!mic_on()) {
++		return false;
++	}
++	if (!hakios_slim_tx_on(TX5_PORT, TX5_CHANNEL)) {
++		return false;
++	}
++	tx_on = true;
++	return true;
++}
++
++static void
++undo(void)
++{
++	dsp_off();
++	if (tx_on) {
++		hakios_slim_tx_off(TX5_PORT, TX5_CHANNEL);
++		tx_on = false;
++	}
++	mic_off();
++	hakios_slim_down();
++}
++
++/* ---- mic=4: the microphone for Darwin ------------------------------------------------------------------- */
++
++/*
++ * What the microphone hears goes into a ring, and /dev/hakios-mic gives it to Darwin's audio server
++ * (HakiosAudio.driver's device "Codec", userland/src/audio_plugin.c): 16-bit samples, one channel,
++ * 48 kHz. The path is up only while the device is open (the audio server opens it when its input
++ * starts and closes it when it stops), and a read never waits: it gives what has come, keeping the
++ * reader about 40 ms behind the DSP (it comes in 20 ms periods), and nothing until that much is
++ * there; the audio server makes up the rest with silence.
++ */
++#define RING_FRAMES             16384           /* 341 ms; a power of two */
++#define RING_KEEP               1920            /* 40 ms: how far behind the DSP a reader is kept */
++#define RING_MOST               4800            /* 100 ms: more than this waiting, and the oldest is skipped */
++
++static int16_t *ring;
++static volatile uint64_t ring_written;          /* frames put into the ring since the device was made */
++static uint64_t ring_read;                      /* frames taken from it (one reader: the audio server) */
++static bool ring_primed;                        /* the reader is RING_KEEP behind; false after it ran dry */
++static uint64_t ring_skipped, ring_dry;         /* frames skipped, reads that found too little: said when Darwin stops */
++static volatile uint32_t darwin_wants;             /* the device is open */
++static volatile bool stopping;                  /* the run ends (hakios_mic_dsp_down()) */
++
++static void
++ring_put(const int16_t *samples, uint32_t count)
++{
++	uint64_t at = ring_written;
++
++	for (uint32_t i = 0; i < count; i++) {
++		ring[(at + i) % RING_FRAMES] = samples[i];
++	}
++	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
++}
++
++static int
++mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint64_t written = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE), avail, want;
++	int error = 0;
++
++	if (ring == NULL || uio_resid(uio) < 2) {
++		return 0;
++	}
++	want = (uint64_t)uio_resid(uio) / 2;
++	avail = written - ring_read;
++	if (avail > RING_MOST) {
++		ring_skipped += avail - RING_KEEP;
++		ring_read = written - RING_KEEP;
++		avail = RING_KEEP;
++	}
++	if (!ring_primed) {
++		if (avail < RING_KEEP) {
++			return 0;
++		}
++		ring_primed = true;
++	}
++	if (avail < want) {
++		ring_dry++;
++		ring_primed = false;
++	}
++	while (want > 0 && avail > 0 && error == 0) {
++		uint64_t at = ring_read % RING_FRAMES, n = want < avail ? want : avail;
++
++		n = n < RING_FRAMES - at ? n : RING_FRAMES - at;
++		error = uiomove((caddr_t)&ring[at], (int)(n * 2), uio);
++		ring_read += n;
++		want -= n;
++		avail -= n;
++	}
++	return error;
++}
++
++static int
++mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	darwin_wants = 1;
++	return 0;
++}
++
++/* (on the last close) */
++static int
++mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	darwin_wants = 0;
++	return 0;
++}
++
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* ---- listening ---------------------------------------------------------------------------------------------- */
++
++static uint32_t mic_secs = 10;
++
++/*
++ * The stream run, read for mic_secs (for_darwin: while Darwin has the device open): how loud it is, every
++ * second (for Darwin: the first three, then every 30th); into the recording with rec_sound_mic=1; for
++ * Darwin into the ring. False if it could not get going (the run refused, a read not sent, no read ever came
++ * back); for_darwin() counts that as a recording that broke off.
++ */
++static bool
++listen(bool for_darwin)
++{
++	uint32_t run[3] = { 0, 0, 0 }, frames = 0, seconds = 0, peak = 0, periods = 0, empty = 0;
++	int64_t sum = 0;
++	uint64_t squares = 0;
++	unsigned next = 0;
++	uint64_t began = mach_absolute_time(), now, elapsed_ms;
++
++	struct hakios_apr_answer answer;
++
++	read_ready = 0;
++	reads_done = read_errors = 0;
++	if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
++	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("mic: the session, run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
++		return false;
++	}
++	say("mic: the session 2, run: done\n");
++	for (unsigned p = 0; p < MIC_PERIODS; p++) {
++		if (!mic_read(p)) {
++			say("mic: a read could not be sent\n");
++			return false;
++		}
++	}
++	if (for_darwin) {
++		say("mic: LISTENING for Darwin: %u reads of 20 ms given to the DSP\n", MIC_PERIODS);
++	} else {
++		say("mic: LISTENING: %u reads of 20 ms given to the DSP; for %u s\n", MIC_PERIODS, mic_secs);
++	}
++	for (;;) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
++		elapsed_ms = now / NSEC_PER_MSEC;
++		/* (`stopping' ends every kind of run: hakios_mic_dsp_down() waits for mic_lock, which is held until this returns) */
++		if ((for_darwin ? !darwin_wants : elapsed_ms >= mic_secs * 1000ull) || stopping) {
++			break;
++		}
++		if (!(read_ready & (1u << next))) {
++			if (elapsed_ms > 1500 && reads_done == 0) {
++				say("mic: NO READ HAS COME BACK in 1.5 s\n");
++				return false;
++			}
++			sleep_ms(2);
++			continue;
++		}
++		OSBitAndAtomic(~(1u << next), &read_ready);
++		{
++			int16_t *samples = (int16_t *)(mic_memory + 4096 * next);
++			uint32_t got = read_sizes[next] / 2;
++			int16_t stereo[2 * 240];
++
++			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
++				__asm__ volatile ("dc ivac, %0" : : "r" (line));
++			}
++			__asm__ volatile ("dsb sy");
++			got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
++			empty += got == 0;
++			for (uint32_t i = 0; i < got; i++) {
++				int32_t v = samples[i];
++				uint32_t a = (uint32_t)(v < 0 ? -v : v);
++
++				sum += v;
++				squares += (uint64_t)((int64_t)v * v);
++				peak = a > peak ? a : peak;
++			}
++			frames += got;
++			if (for_darwin) {
++				ring_put(samples, got);
++			}
++			if (hakios_audio_recording_mic()) {
++				for (uint32_t i = 0; i < got; i += 240) {
++					uint32_t n = got - i < 240 ? got - i : 240;
++
++					for (uint32_t j = 0; j < n; j++) {
++						stereo[2 * j] = stereo[2 * j + 1] = samples[i + j];
++					}
++					hakios_audio_record_fed(stereo, n);
++				}
++			}
++		}
++		periods++;
++		(void)mic_read(next);
++		next = (next + 1) % MIC_PERIODS;
++		if (frames >= MIC_RATE) {
++			uint64_t mean_square = squares / frames;
++			uint32_t rms = 0;
++			int db10 = -999;
++
++			while ((uint64_t)(rms + 1) * (rms + 1) <= mean_square) {
++				rms++;
++			}
++			if (rms > 0) {
++				/* 20 log10(rms / 32768), in tenths, by a table of halvings: good enough to tell loud from quiet */
++				uint32_t r = rms;
++				int tenths = 0;
++
++				while (r < 16384) {
++					r *= 2;
++					tenths -= 60;   /* 6.02 dB a halving, near enough */
++				}
++				db10 = tenths - (int)((32768 - r) * 60 / 16384);
++			}
++			seconds++;
++			if (!for_darwin || seconds <= 3 || seconds % 30 == 0) {
++				say("mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld; "
++				    "reads %u, errors %u\n", seconds, frames, periods, empty, db10 / 10, db10 < 0 ? -db10 % 10 : db10 % 10,
++				    rms, peak, sum / (int64_t)frames, reads_done, read_errors);
++			}
++			frames = periods = empty = peak = 0;
++			sum = 0;
++			squares = 0;
++		}
++	}
++	return true;
++}
++
++/*
++ * mic=4: the path up whenever Darwin opens /dev/hakios-mic, down when it closes it; after three
++ * recordings that broke off, no more until the run ends.
++ */
++static void
++for_darwin(void)
++{
++	int major = cdevsw_add(-1, &mic_cdevsw);
++	unsigned recordings = 0, failures = 0;
++
++	ring = kalloc_data(RING_FRAMES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
++	if (ring == NULL || major < 0 ||
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mic") == NULL) {
++		say("mic: /dev/hakios-mic cannot be made\n");
++		return;
++	}
++	say("mic: THE MICROPHONE IS DARWIN'S (/dev/hakios-mic) from here on, until the run ends: it listens only while Darwin records\n");
++	while (!stopping) {
++		uint64_t began, ns;
++		bool failed, up;
++
++		if (!darwin_wants) {
++			sleep_ms(20);
++			continue;
++		}
++		lck_mtx_lock(&mic_lock);
++		if (stopping) {
++			lck_mtx_unlock(&mic_lock);
++			break;
++		}
++		recordings++;
++		quiet = recordings > 1;
++		ring_primed = false;
++		ring_skipped = ring_dry = 0;
++		ring_read = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
++		began = mach_absolute_time();
++		say("mic: Darwin records (%u): the path up%s\n", recordings, quiet ? " (the lines that say all went well are not said again)" :
++		    "");
++		/*
++		 * (a bring-up or a start that fails counts as a failure too: otherwise the three-recordings limit below never
++		 * applies and, while Darwin keeps the device open, the path is brought up and undone for ever)
++		 */
++		up = path_up() && listen(true);
++		failed = !up;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		say("mic: Darwin's recording %u %s after %llu.%llu s; %llu frames skipped as too late, %llu reads found too little\n",
++		    recordings, failed ? "BROKE OFF" : "ended", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 10),
++		    ring_skipped, ring_dry);
++		undo();
++		lck_mtx_unlock(&mic_lock);
++		if (failed) {
++			if (++failures >= 3) {
++				say("mic: three recordings broke off: the microphone stays off until the run ends\n");
++				break;
++			}
++			/* (not again until Darwin has closed the device and opened it again) */
++			while (darwin_wants && !stopping) {
++				sleep_ms(20);
++			}
++		}
++	}
++}
++
++static void
++mic_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	say("mic: level %u: %s\n", level, level == 1 ? "a look, after the SLIMbus and the codec are up; nothing written to the microphone" :
++	    level == 2 ? "the microphone's registers written as Android's path writes them, read back; then all undone" :
++	    level == 3 ? "the main microphone, as Android records from it, listened to; then all undone" :
++	    "the main microphone for Darwin (/dev/hakios-mic), up while Darwin records");
++	if (level == 4) {
++		for_darwin();
++	} else {
++		lck_mtx_lock(&mic_lock);
++		if (level <= 2) {
++			if (hakios_slim_up()) {
++				if (level >= 2 && !mic_on()) {
++					say("mic: the microphone's registers were not all written\n");
++				}
++				sleep_ms(10);
++				mic_look();
++				mic_off();
++			}
++			hakios_slim_down();
++		} else {
++			if (path_up()) {
++				listen(false);
++			}
++			undo();
++		}
++		lck_mtx_unlock(&mic_lock);
++	}
++	running = false;
++	say("mic: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++hakios_mic_dsp_up(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("mic", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	level = level > 4 ? 4 : level;
++	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
++	mic_secs = mic_secs < 1 ? 1 : mic_secs > 600 ? 600 : mic_secs;
++	running = true;
++	if (kernel_thread_start(mic_thread, NULL, &thread) != KERN_SUCCESS) {
++		running = false;
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++void
++hakios_mic_dsp_down(void)
++{
++	stopping = true;
++	if (running) {
++		lck_mtx_lock(&mic_lock);
++		undo();
++		lck_mtx_unlock(&mic_lock);
++	}
++}
+diff --git a/bsd/dev/hakios.slim.c b/bsd/dev/hakios.slim.c
+new file mode 100644
+index 0000000..1064d15
+--- /dev/null
++++ b/bsd/dev/hakios.slim.c
+@@ -0,0 +1,1480 @@
++/*
++ * The SLIMbus of the Xiaomi Mi 9 (cepheus, SM8150), and the codec behind it: the WCD9340 ("Tavil") the microphones
++ * (hakios.mic.c) and the earpiece are on. The earpiece (the receiver at the top) is driven by the codec's EAR output;
++ * its registers and samples go over the SoC's SLIMbus. The bus belongs to the audio DSP (it is its "master"), and the
++ * application processor has a "non-ported generic device" on it (NGD), through which it sends and receives messages.
++ * Before the NGD's registers may be touched, the DSP is asked over QMI to power the bus (Linux: drivers/slimbus/
++ * slim-msm.c msm_slim_qmi_init() and msm_slim_qmi_power_request(), slim-msm-ngd.c ngd_slim_power_up(); Xiaomi's
++ * kernel, LineageOS android_kernel_xiaomi_sm8150).
++ *
++ *   the NGD    slim@171c0000 (qcom,slim-ngd, cell-index 1: its registers at 0x171c0000 + 0x1000, NGD_BASE_V2(1)), SPI 163
++ *   the DSP's  QMI service 0x301 (SLIMBUS_QMI_SVC_ID), version 1, instance 0: the DSP tells of it over QRTR (node 5, port
++ *   service    12 on this phone); "select instance" (0x20): instance 0 (cell-index >> 1), mode MASTER (the DSP's role);
++ *              "power" (0x21): ACTIVE (2), INACTIVE (1)
++ *   the codec  tavil_codec: elemental addresses 00 01 50 02 17 02 (its generic device) and 00 00 50 02 17 02 (its
++ *              interface device); reset GPIO 143 (south; msm_cdc_pinctrl@143, active high), its MCLK 9.6 MHz from the
++ *              PMIC's LN_BB_CLK2 (audio_ext_clk_lnbb), supplies pm8150_s4 (1.8 V) and pm8150l_bob
++ *   Android    the earpiece ("handset"): SLIM_0_RX, one channel -> RX0 -> RX INT0 -> class H -> EAR PA, +6 dB
++ *              (mixer_paths_overlay_static.xml); the main microphone: AMIC3 -> ADC3 -> DEC5 -> TX5, MIC BIAS3
++ *
++ * Two ways in:
++ *
++ *   the microphones' way (hakios_slim_up() / hakios_slim_down(), below): persistent and reference-counted. The first
++ *   call powers the bus (QMI), enables the NGD, exchanges the manager's capability, waits for the NGD's logical address,
++ *   switches the codec's MCLK on (RPMh "lnbca2"), releases its reset, asks the manager for its two logical addresses,
++ *   reads its chip id and brings it up (wcd934x_bring_up() and the analog bias and internal MCLK, codec_power_on()).
++ *   The bus, the NGD and the codec's MCLK then stay up until the DSP is shut down (hakios_slim_dsp_down()); only the
++ *   codec's own biased clocks are put back when the last user leaves. The microphones' driver then has the codec's
++ *   registers (hakios_slim_codec_read/write/update), the interface device's (hakios_slim_interface_write), the two
++ *   logical addresses, and the codec's TX port on a SLIMbus channel (hakios_slim_tx_on/off: the interface device's
++ *   port registers, CONNECT_SRC, DEF_ACT_CHAN and RECONFIG_NOW, as wcd9xxx_cfg_slim_sch_tx() and slim_control_ch() send
++ *   them), and the earpiece's own power-up (hakios_slim_codec_power()).
++ *
++ *   the diagnostic way (boot-arg slim=1..4, hakios_slim_dsp_up()): what this file first did, each level with everything
++ *   done and undone in one run:
++ *
++ *     slim=1   the DSP asked for the bus (select instance, power ACTIVE); the NGD's version and state read (nothing
++ *              written to it); the codec's reset pin looked at; then the power given back (INACTIVE)
++ *     slim=2   ... and the NGD enabled as ngd_slim_power_up() enables it, without the BAM message queues (messages
++ *              through its registers: NGD_TX_MSG, NGD_RX_MSG), its interrupts unmasked (they are only read: polled);
++ *              the manager's "master capability" waited for and answered with "report satellite"
++ *              (ngd_slim_rx_msgq_thread(): the magic D9 C5, version 1, protocol 1), every message that comes for two
++ *              seconds more said; then the NGD disabled again and the power given back
++ *     slim=3   ... and, with the NGD up, the codec: its MCLK on, its reset released as wcd9xxx_reset() releases it,
++ *              the logical addresses of its generic and interface devices asked of the manager, and its chip id read
++ *              (Tavil's major id 0x108). Nothing else is written to the codec; at the end it is put back into reset and
++ *              its MCLK switched off.
++ *     slim=4   ... and the codec brought up and its earpiece path powered, with no samples yet (silence): Linux's
++ *              wcd934x_bring_up(), then the path DAPM powers for the "handset" of Android's mixer paths
++ *              (RX0 -> RX INT0 -> class H -> EAR PA); held for two seconds, the EAR's status looked at; then all of it
++ *              powered down in the reverse order (the PA first), the codec back into reset. Every write read back.
++ *
++ * Checked on the phone (2026-11-04, logs/160631-run.log, adsp=1 slim=1; 161154: slim=2; 162043: slim=3; 162759:
++ * slim=4): the DSP tells of its service at node 5 port 12; "select instance" and "power: ACTIVE" answered with success
++ * in 1 and 10 ms; "power: INACTIVE" too. The codec enumerates 51 ms after the reset: interface 0xce, generic 0xcf; chip
++ * id 01 00 08 01 (Tavil 1.1). slim=4: 48 registers changed, every one read back as written; ANA_EAR 0x80 (the PA on),
++ * the RX supplies 0xc1, INT0's path 0x24, EAR_STATUS 0x08.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/hakios.audio.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++extern lck_mtx_t hakios_rsc_lock;               /* RPMh's sequencer, shared with the other drivers that ask it */
++
++static LCK_GRP_DECLARE(slim_lock_group, "hakios-slim");
++static LCK_MTX_DECLARE(slim_lock, &slim_lock_group);
++
++static uint32_t level;
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	return length;
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* ---- QMI over QRTR (Linux's qmi_interface.c, as far as two requests need it) --------------------------------------- */
++
++#define SLIM_QMI_SERVICE        0x301
++#define SLIM_QMI_VERSION        1
++#define SLIM_QMI_INSTANCE       0
++#define QMI_SELECT_INSTANCE     0x0020
++#define QMI_POWER               0x0021
++#define SLIM_MODE_MASTER        2               /* the DSP's role: Linux's msm_slim_qmi_init(dev, false) */
++#define SLIM_PM_INACTIVE        1
++#define SLIM_PM_ACTIVE          2
++
++static uint32_t our_port, dsp_node, dsp_port;
++static volatile bool answered;
++static volatile uint16_t answer_txn, answer_msg, answer_result, answer_error;
++static uint16_t next_txn = 1;
++
++/* On the link's thread: a response (type 2) with its result TLV (0x02: result, error) */
++static void
++qmi_receive(__unused uint32_t from_node, __unused uint32_t from_port, const uint8_t *data, uint32_t length)
++{
++	uint32_t at = 7, size;
++
++	if (length < 7 || data[0] != 2) {
++		return;
++	}
++	size = (uint32_t)(data[5] | data[6] << 8);
++	answer_result = answer_error = 0xffff;
++	while (at + 3 <= length && at + 3 <= 7 + size) {
++		uint8_t type = data[at];
++		uint32_t tlv = (uint32_t)(data[at + 1] | data[at + 2] << 8);
++
++		if (at + 3 + tlv > length) {
++			break;
++		}
++		if (type == 0x02 && tlv >= 4) {
++			answer_result = (uint16_t)(data[at + 3] | data[at + 4] << 8);
++			answer_error = (uint16_t)(data[at + 5] | data[at + 6] << 8);
++		}
++		at += 3 + tlv;
++	}
++	answer_txn = (uint16_t)(data[1] | data[2] << 8);
++	answer_msg = (uint16_t)(data[3] | data[4] << 8);
++	__asm__ volatile ("dmb ish" ::: "memory");
++	answered = true;
++}
++
++/* A request of 32-bit TLVs (type, value), its response waited for: true if the result is "success". */
++static bool
++qmi_request(const char *what, uint16_t msg, const uint8_t *types, const uint32_t *values, unsigned count)
++{
++	uint8_t packet[64];
++	uint32_t length = 7;
++	uint16_t txn = next_txn++;
++	uint64_t began;
++
++	packet[0] = 0;                          /* a request */
++	packet[1] = (uint8_t)txn;
++	packet[2] = (uint8_t)(txn >> 8);
++	packet[3] = (uint8_t)msg;
++	packet[4] = (uint8_t)(msg >> 8);
++	for (unsigned i = 0; i < count; i++) {
++		packet[length++] = types[i];
++		packet[length++] = 4;
++		packet[length++] = 0;
++		for (unsigned b = 0; b < 4; b++) {
++			packet[length++] = (uint8_t)(values[i] >> (8 * b));
++		}
++	}
++	packet[5] = (uint8_t)(length - 7);
++	packet[6] = (uint8_t)((length - 7) >> 8);
++	answered = false;
++	say("slim: QMI: %s (message %#x, transaction %u) to node %u port %u\n", what, msg, txn, dsp_node, dsp_port);
++	if (!hakios_adsp_qrtr_send(our_port, dsp_node, dsp_port, packet, length)) {
++		say("slim: QMI: it cannot be sent (the link is not up?)\n");
++		return false;
++	}
++	began = now_us();
++	while (!answered && now_us() - began < 2000000) {
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	if (!answered) {
++		say("slim: QMI: %s: NO ANSWER within 2 s\n", what);
++		return false;
++	}
++	say("slim: QMI: %s: answer to transaction %u (message %#x) after %llu ms: result %u, error %u%s\n", what, answer_txn,
++	    answer_msg, (now_us() - began) / 1000, answer_result, answer_error, answer_result == 0 ? "" : " -- REFUSED");
++	return answer_txn == txn && answer_msg == msg && answer_result == 0;
++}
++
++static bool powered;
++
++static bool
++bus_power(bool on)
++{
++	const uint8_t type[1] = { 0x01 };
++	const uint32_t value[1] = { on ? SLIM_PM_ACTIVE : SLIM_PM_INACTIVE };
++
++	if (!qmi_request(on ? "power: ACTIVE" : "power: INACTIVE", QMI_POWER, type, value, 1)) {
++		return false;
++	}
++	powered = on;
++	return true;
++}
++
++/* ---- the NGD's registers (slim-msm-ngd.c) ----------------------------------------------------------------------- */
++
++#define SLIM_PHYS               0x171c0000UL
++#define SLIM_SIZE               0x2c000UL
++#define NGD_OFFSET              0x1000UL        /* NGD_BASE_V2(cell-index 1) */
++#define NGD_CFG                 0x00
++#define NGD_STATUS              0x04            /* [1] a logical address is ours */
++#define NGD_RX_MSGQ_CFG         0x08
++#define NGD_INT_EN              0x10
++#define NGD_INT_STAT            0x14
++#define NGD_INT_CLR             0x18
++#define NGD_TX_MSG              0x30
++#define NGD_RX_MSG              0x70
++#define NGD_CFG_ENABLE          1u
++#define INT_TX_NACKED_2         (1u << 25)
++#define INT_MSG_BUF_CONTE       (1u << 26)
++#define INT_MSG_TX_INVAL        (1u << 27)
++#define INT_IE_VE_CHG           (1u << 28)
++#define INT_DEV_ERR             (1u << 29)
++#define INT_RX_MSG_RCVD         (1u << 30)
++#define INT_TX_MSG_SENT         (1u << 31)
++#define INT_RECFG_DONE          (1u << 24)
++#define RX_MSGQ_TIMEOUT         0x10000u
++
++/* the messages (include/linux/slimbus/slimbus.h, slim-msm.h) */
++#define MT_CORE                 0x0
++#define MT_DEST_REFERRED_USER   0x2
++#define MT_SRC_REFERRED_USER    0x6
++#define MC_MASTER_CAPABILITY    0x00            /* (user) */
++#define MC_REPORT_SATELLITE     0x01            /* (user) */
++#define MC_GENERIC_ACK          0x25            /* (user) */
++#define MC_REPORT_PRESENT       0x01            /* (core) */
++#define MC_ADDR_QUERY           0x0d            /* (user) */
++#define MC_ADDR_REPLY           0x0e            /* (user) */
++#define MC_REQUEST_VALUE        0x60            /* (core) */
++#define MC_REPLY_VALUE          0x64
++#define MC_CHANGE_VALUE         0x68
++#define MC_CONNECT_SRC          0x2c            /* (user) */
++#define MC_DEF_ACT_CHAN         0x21            /* (user) */
++#define MC_CHAN_CTRL            0x23            /* (user) */
++#define MC_RECONFIG_NOW         0x24            /* (user) */
++#define MC_DISCONNECT_PORT      0x2e            /* (user) */
++#define LA_MANAGER              0xff
++#define WCD_REGISTERS           0x800           /* WCD9XXX_REGISTER_START_OFFSET */
++#define TAVIL_MAJOR             0x0108
++#define FIRST_WORD(length, mt, mc, dt, la) ((length) | (mt) << 5 | (mc) << 8 | (dt) << 15 | (uint32_t)(la) << 16)
++
++#define TLMM_SOUTH_PHYS         0x03d00000UL
++#define PIN_CODEC_RESET         143
++
++static vm_offset_t slim_regs, ngd;
++static bool ngd_enabled;
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* A message the NGD has received, if one waits: its words (the length in the low five bits of the first byte). */
++static bool
++ngd_receive(uint8_t *bytes, uint32_t *length)
++{
++	uint32_t stat = rd(ngd + NGD_INT_STAT), words[10];
++
++	if (!(stat & INT_RX_MSG_RCVD)) {
++		return false;
++	}
++	words[0] = rd(ngd + NGD_RX_MSG);
++	*length = words[0] & 0x1f;
++	for (uint32_t i = 1; i < ((*length + 3) >> 2) && i < 10; i++) {
++		words[i] = rd(ngd + NGD_RX_MSG + 4 * i);
++	}
++	wr(ngd + NGD_INT_CLR, INT_RX_MSG_RCVD);
++	memcpy(bytes, words, *length > 40 ? 40 : *length);
++	return true;
++}
++
++static void
++say_message(const char *when, const uint8_t *m, uint32_t length)
++{
++	char hex[3 * 40 + 1];
++	int at = 0;
++
++	for (uint32_t i = 0; i < length && i < 40; i++) {
++		at += snprintf(hex + at, sizeof(hex) - (size_t)at, " %02x", m[i]);
++	}
++	hex[at] = 0;
++	say("slim: %s: a message of %u bytes, type %u, code %#x:%s\n", when, length, (m[0] >> 5) & 7, m[1], hex);
++}
++
++/* A message sent through the NGD's registers; "sent" (or a NACK, an error) waited for. */
++static bool
++ngd_send(const char *what, const uint8_t *bytes, uint32_t length)
++{
++	uint32_t words[10] = { 0 }, stat = 0;
++	uint64_t began;
++
++	memcpy(words, bytes, length);
++	wr(ngd + NGD_INT_CLR, INT_TX_MSG_SENT | INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE);
++	for (uint32_t i = 0; i < ((length + 3) >> 2); i++) {
++		wr(ngd + NGD_TX_MSG + 4 * i, words[i]);
++	}
++	began = now_us();
++	while (now_us() - began < 1000000) {
++		stat = rd(ngd + NGD_INT_STAT);
++		if (stat & (INT_TX_MSG_SENT | INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE)) {
++			break;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	wr(ngd + NGD_INT_CLR, stat & (INT_TX_MSG_SENT | INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE));
++	if ((stat & INT_TX_MSG_SENT) && !(stat & (INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE)) &&
++	    strncmp(what, "report", 6) != 0) {
++		return true;            /* (only what is not sent, and the capability's answer, is said: the codec's are hundreds) */
++	}
++	say("slim: %s: %s after %llu us (int stat %#x)\n", what, (stat & INT_TX_MSG_SENT) && !(stat & ~INT_TX_MSG_SENT &
++	    (INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE)) ? "SENT" : (stat & INT_TX_NACKED_2) ? "NACKED" :
++	    (stat & INT_MSG_TX_INVAL) ? "INVALID" : (stat & INT_DEV_ERR) ? "a device error" : (stat & INT_MSG_BUF_CONTE) ?
++	    "a buffer contention" : "NOT SENT", now_us() - began, stat);
++	return (stat & INT_TX_MSG_SENT) && !(stat & (INT_TX_NACKED_2 | INT_MSG_TX_INVAL | INT_DEV_ERR | INT_MSG_BUF_CONTE));
++}
++
++/* A user message to the manager, its generic ACK waited for (ngd_xferandwait_ack()) */
++static bool
++wait_ack(const char *what, uint8_t tid, uint32_t ms)
++{
++	uint8_t m[40];
++	uint32_t length = 0;
++	uint64_t began = now_us();
++
++	while (now_us() - began < ms * 1000ull) {
++		if (ngd_receive(m, &length)) {
++			if (((m[0] >> 5) & 7) == MT_SRC_REFERRED_USER && m[1] == MC_GENERIC_ACK && length > 4 && m[3] == tid) {
++				if ((m[4] & 0x20) != 0) {
++					return true;
++				}
++				say("slim: %s: NACKED (status %#x)\n", what, m[4]);
++				return false;
++			}
++			say_message("meanwhile", m, length);
++			continue;
++		}
++		delay_for_interval(200, NSEC_PER_USEC);
++	}
++	say("slim: %s: NO ACK within %u ms\n", what, ms);
++	return false;
++}
++
++static bool
++ngd_send_ack(const char *what, uint8_t mc, uint8_t tid, const uint8_t *payload, uint32_t length)
++{
++	uint8_t message[16];
++	uint32_t first = FIRST_WORD(length + 3, MT_DEST_REFERRED_USER, mc, 0, LA_MANAGER);
++
++	if (length + 3 > sizeof(message)) {
++		return false;
++	}
++	memcpy(message, &first, 3);
++	memcpy(message + 3, payload, length);
++	return ngd_send(what, message, length + 3) && wait_ack(what, tid, 1000);
++}
++
++/* ngd_slim_power_up() without the BAM, and the capability exchange; false if the NGD has no address of ours. */
++static bool
++ngd_enable(bool observe)
++{
++	uint8_t m[40];
++	uint32_t length = 0;
++	uint64_t began;
++	bool capable = false, ours;
++
++	say("slim: the NGD is enabled (interrupts unmasked, read by polling; messages through its registers)\n");
++	wr(ngd + NGD_INT_EN, INT_TX_NACKED_2 | INT_MSG_BUF_CONTE | INT_MSG_TX_INVAL | INT_IE_VE_CHG | INT_DEV_ERR | INT_TX_MSG_SENT |
++	    INT_RX_MSG_RCVD | INT_RECFG_DONE);
++	wr(ngd + NGD_RX_MSGQ_CFG, rd(ngd + NGD_RX_MSGQ_CFG) | RX_MSGQ_TIMEOUT);
++	wr(ngd + NGD_CFG, NGD_CFG_ENABLE);
++	ngd_enabled = true;
++	say("slim: the NGD now: cfg %#x, status %#x, int stat %#x\n", rd(ngd + NGD_CFG), rd(ngd + NGD_STATUS), rd(ngd + NGD_INT_STAT));
++	began = now_us();
++	while (now_us() - began < 3000000 && !capable) {
++		if (ngd_receive(m, &length)) {
++			say_message("from the bus", m, length);
++			if (((m[0] >> 5) & 7) == MT_SRC_REFERRED_USER && m[1] == MC_MASTER_CAPABILITY) {
++				/* "report satellite" to the manager: length 7, D9 C5, version 1, protocol 1 (ngd_slim_rx_msgq_thread) */
++				uint8_t reply[7];
++				uint32_t first = FIRST_WORD(7, MT_SRC_REFERRED_USER, MC_REPORT_SATELLITE, 0, LA_MANAGER);
++
++				say("slim: THE MANAGER TELLS ITS CAPABILITY after %llu ms: answered with \"report satellite\"\n",
++				    (now_us() - began) / 1000);
++				memcpy(reply, &first, 3);
++				reply[3] = 0xd9;
++				reply[4] = 0xc5;
++				reply[5] = 1;
++				reply[6] = 1;
++				capable = ngd_send("report satellite", reply, sizeof(reply));
++			}
++			continue;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	if (!capable) {
++		say("slim: NO CAPABILITY EXCHANGE within 3 s (status %#x, int stat %#x)\n", rd(ngd + NGD_STATUS), rd(ngd + NGD_INT_STAT));
++		return false;
++	}
++	if (observe) {
++		began = now_us();
++		while (now_us() - began < 2000000) {
++			if (ngd_receive(m, &length)) {
++				say_message("then", m, length);
++				continue;
++			}
++			delay_for_interval(1, NSEC_PER_MSEC);
++		}
++	}
++	began = now_us();
++	while (now_us() - began < 2000000 && !(rd(ngd + NGD_STATUS) & 2)) {
++		if (ngd_receive(m, &length)) {
++			say_message("meanwhile", m, length);
++			continue;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	ours = (rd(ngd + NGD_STATUS) & 2) != 0;
++	say("slim: after it: the NGD's status %#x%s, int stat %#x\n", rd(ngd + NGD_STATUS), ours ? " (A LOGICAL ADDRESS IS OURS)" : "",
++	    rd(ngd + NGD_INT_STAT));
++	return ours;
++}
++
++static void
++ngd_down(void)
++{
++	if (!ngd_enabled) {
++		return;
++	}
++	wr(ngd + NGD_CFG, 0);
++	wr(ngd + NGD_INT_EN, 0);
++	ngd_enabled = false;
++	say("slim: the NGD disabled again (cfg %#x)\n", rd(ngd + NGD_CFG));
++}
++
++/* ---- the codec's clocks (RPMh) and its reset (TLMM) ------------------------------------------------------------ */
++
++#define CMD_DB_POINTER_PHYS     0x0c3f0000UL    /* AOP's message RAM: at 0xc, where the command database is */
++#define CMD_DB_SIZE             0x20000UL
++#define RSC_PHYS                0x18220000UL    /* the application processor's "DRV 2"; command slot set 0, active */
++#define TCS(reg)                (rsc + 0xd00 + (reg))
++#define TCS_IRQ_ENABLE          0x00
++#define TCS_IRQ_STATUS          0x04
++#define TCS_IRQ_CLEAR           0x08
++#define TCS_WAIT_FOR_COMPLETION 0x10
++#define TCS_CONTROL             0x14
++#define TCS_CONTROL_ENABLE      (1u << 16)
++#define TCS_CONTROL_TRIGGER     (1u << 24)
++#define TCS_STATUS              0x18
++#define TCS_CMD_ENABLE          0x1c
++#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
++#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
++#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
++#define MSGID_WRITE_WAITED      (0x10008u | 0x100u)
++#define VRM_ENABLE              4
++
++struct cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static vm_offset_t rsc;
++
++static uint32_t
++rpmh_address(const char *name)
++{
++	vm_offset_t pointer = ml_io_map(CMD_DB_POINTER_PHYS, 0x1000);
++	uint32_t at = rd(pointer + 0xc);
++	const struct cmd_db_header *db;
++	char id[8] = { 0 };
++
++	if (at == 0) {
++		return 0;
++	}
++	db = (const struct cmd_db_header *)ml_io_map_wcomb(at, CMD_DB_SIZE);
++	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
++		say("slim: RPMh: no command database at %#x (magic %02x %02x %02x %02x)\n", at, db->magic[0], db->magic[1], db->magic[2],
++		    db->magic[3]);
++		return 0;
++	}
++	memcpy(id, name, strnlen(name, sizeof(id)));      /* (8 letters, no terminating zero: "lnbclka2" fills it) */
++	for (unsigned sl = 0; sl < 8; sl++) {
++		const struct cmd_db_slave *slave = &db->slave[sl];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 || slave->count > 512) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++/* One write to RPMh through the active command slot set, waited for (hakios.stfts.c's rpmh_write) */
++static bool
++rpmh_write(uint32_t address, uint32_t data)
++{
++	uint32_t irq_enable;
++	bool done = false;
++
++	if (rsc == 0) {
++		rsc = ml_io_map(RSC_PHYS, 0x10000);
++	}
++	lck_mtx_lock(&hakios_rsc_lock);
++	irq_enable = rd(TCS(TCS_IRQ_ENABLE));
++	for (int i = 0; rd(TCS(TCS_STATUS)) == 0; i++) {
++		if (i > 2000) {
++			lck_mtx_unlock(&hakios_rsc_lock);
++			say("slim: RPMh: the command slots stay busy\n");
++			return false;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_CMD_MSGID(0)), MSGID_WRITE_WAITED);
++	wr(TCS(TCS_CMD_ADDR(0)), address);
++	wr(TCS(TCS_CMD_DATA(0)), data);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 1);
++	wr(TCS(TCS_CMD_ENABLE), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable | 1);
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE | TCS_CONTROL_TRIGGER);
++	for (int i = 0; i < 2000 && !done; i++) {
++		done = (rd(TCS(TCS_IRQ_STATUS)) & 1) != 0;
++		if (!done) {
++			delay_for_interval(100, NSEC_PER_USEC);
++		}
++	}
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CMD_ENABLE), 0);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 0);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable);
++	lck_mtx_unlock(&hakios_rsc_lock);
++	return done;
++}
++
++static uint32_t mclk_address;
++static vm_offset_t tlmm_south;
++static uint32_t reset_cfg, reset_io;
++static bool mclk_on, reset_released;
++static uint8_t next_tid = 1;
++
++static const uint8_t ea_generic[6] = { 0x00, 0x01, 0x50, 0x02, 0x17, 0x02 };    /* dt elemental-addr of tavil_codec */
++static const uint8_t ea_interface[6] = { 0x00, 0x00, 0x50, 0x02, 0x17, 0x02 };  /* qcom,cdc-slim-ifd-elemental-addr */
++
++static bool
++mclk(bool on)
++{
++	if (mclk_address == 0) {
++		mclk_address = rpmh_address("lnbclka2");
++		say("slim: RPMh has \"lnbclka2\" (LN_BB_CLK2, the codec's MCLK) at %#x\n", mclk_address);
++		if (mclk_address == 0) {
++			return false;
++		}
++	}
++	if (!rpmh_write(mclk_address + VRM_ENABLE, on ? 1 : 0)) {
++		say("slim: RPMh has not said done to the MCLK %s\n", on ? "on" : "off");
++		return false;
++	}
++	mclk_on = on;
++	say("slim: the codec's MCLK %s (RPMh %#x = %u)\n", on ? "ON" : "off", mclk_address + VRM_ENABLE, on ? 1 : 0);
++	return true;
++}
++
++#define PIN_CFG_8MA_PULL_DOWN_OUT       (1u | 3u << 6 | 1u << 9)        /* pull-down, 8 mA, output; function 0 (gpio) */
++#define PIN_CFG_2MA_OUT                 (0u | 0u << 6 | 1u << 9)        /* no pull, 2 mA, output */
++
++/* wcd9xxx_reset(): low 20 ms, then high, 8 mA, pull-down (msm_cdc_pinctrl's active state) */
++static bool
++codec_reset_release(void)
++{
++	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, 0x100000);
++	reset_cfg = rd(tlmm_south + 0x1000UL * PIN_CODEC_RESET);
++	reset_io = rd(tlmm_south + 0x1000UL * PIN_CODEC_RESET + 4);
++	say("slim: the codec's reset released as wcd9xxx_reset() does it: gpio143 low (2 mA) for 20 ms, then high (8 mA)\n");
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET + 4, 0);
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET, PIN_CFG_2MA_OUT);
++	reset_released = true;
++	delay_for_interval(20, NSEC_PER_MSEC);
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET, PIN_CFG_8MA_PULL_DOWN_OUT);
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET + 4, 2);
++	return true;
++}
++
++static void
++codec_reset_restore(void)
++{
++	if (!reset_released) {
++		return;
++	}
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET + 4, reset_io & 2);
++	wr(tlmm_south + 0x1000UL * PIN_CODEC_RESET, reset_cfg);
++	reset_released = false;
++	say("slim: the codec back into reset (gpio143 as it was found)\n");
++}
++
++/* A message for this transaction (a reply that carries its tid in byte 3) waited for, other messages said. */
++static bool
++wait_reply(uint8_t mt, uint8_t mc, uint8_t tid, uint8_t *m, uint32_t *length, uint32_t ms)
++{
++	uint64_t began = now_us();
++
++	while (now_us() - began < ms * 1000ull) {
++		if (ngd_receive(m, length)) {
++			if (((m[0] >> 5) & 7) == mt && m[1] == mc && *length > 3 && m[3] == tid) {
++				return true;
++			}
++			say_message("meanwhile", m, *length);
++			continue;
++		}
++		delay_for_interval(200, NSEC_PER_USEC);
++	}
++	return false;
++}
++
++/* The manager's logical address for an elemental address; 0xff: none (yet). */
++static uint8_t
++address_query(const uint8_t ea[6])
++{
++	uint8_t q[10], m[40];
++	uint32_t first = FIRST_WORD(10, MT_DEST_REFERRED_USER, MC_ADDR_QUERY, 0, LA_MANAGER), length = 0;
++	uint8_t tid = next_tid++;
++
++	memcpy(q, &first, 3);
++	q[3] = tid;
++	memcpy(q + 4, ea, 6);
++	if (!ngd_send("address query", q, sizeof(q))) {
++		return 0xff;
++	}
++	if (!wait_reply(MT_SRC_REFERRED_USER, MC_ADDR_REPLY, tid, m, &length, 500)) {
++		say("slim: no address reply within 500 ms\n");
++		return 0xff;
++	}
++	{
++		static const uint8_t none[6] = { 0, 0, 0, 0, 0, 0 };
++
++		/* (Linux's ngd_slim_rx: an elemental address of zeroes in the reply is "nobody of that address", not address 0) */
++		if (length < 11 || memcmp(m + 4, none, 6) == 0) {
++			return 0xff;
++		}
++	}
++	return m[10];
++}
++
++static bool
++codec_write(uint8_t la, uint16_t offset, uint8_t value)
++{
++	uint8_t w[6];
++	uint16_t ec = (uint16_t)(0 | 1u << 3 | (offset & 0xfff) << 4);        /* one byte: slice code 0 */
++	uint32_t first = FIRST_WORD(6, MT_CORE, MC_CHANGE_VALUE, 0, la);
++
++	memcpy(w, &first, 3);
++	w[3] = (uint8_t)ec;
++	w[4] = (uint8_t)(ec >> 8);
++	w[5] = value;
++	return ngd_send("a codec register written", w, sizeof(w));
++}
++
++/* `count' (1..4) bytes from `offset' of the device at `la' */
++static bool
++codec_read(uint8_t la, uint16_t offset, uint8_t *bytes, uint32_t count)
++{
++	static const uint8_t code[5] = { 0, 0, 1, 2, 3 };
++	uint8_t r[6], m[40];
++	uint8_t tid = next_tid++;
++	uint16_t ec = (uint16_t)(code[count] | 1u << 3 | (offset & 0xfff) << 4);
++	uint32_t first = FIRST_WORD(6, MT_CORE, MC_REQUEST_VALUE, 0, la), length = 0;
++
++	memcpy(r, &first, 3);
++	r[3] = tid;
++	r[4] = (uint8_t)ec;
++	r[5] = (uint8_t)(ec >> 8);
++	if (!ngd_send("a codec register asked for", r, sizeof(r))) {
++		return false;
++	}
++	if (!wait_reply(MT_CORE, MC_REPLY_VALUE, tid, m, &length, 500)) {
++		say("slim: no reply value within 500 ms\n");
++		return false;
++	}
++	if (length < 4 + count) {
++		say_message("a short reply", m, length);
++		return false;
++	}
++	memcpy(bytes, m + 4, count);
++	return true;
++}
++
++/* ---- the codec's registers --------------------------------------------------------------------------------------- */
++
++/* Tavil's registers (include/linux/mfd/wcd934x/registers.h): page in the high byte, written to the page register (0) */
++#define R_CODEC_RPM_CLK_GATE            0x0002
++#define R_CODEC_RPM_CLK_MCLK_CFG        0x0003
++#define R_CODEC_RPM_RST_CTL             0x0009
++#define R_CODEC_RPM_PWR_CDC_DIG_HM_CTL  0x0011
++#define R_ANA_BIAS                      0x0601
++#define R_ANA_RCO                       0x0603
++#define R_ANA_RX_SUPPLIES               0x0608
++#define R_ANA_EAR                       0x060a
++#define R_RX_BIAS_FLYB_BUFF             0x06c7
++#define R_EAR_STATUS_REG                0x06e6
++#define R_CLK_SYS_MCLK_PRG              0x0711
++#define R_SIDO_NEW_VOUT_A_STARTUP       0x071b
++#define R_SIDO_NEW_VOUT_D_STARTUP       0x071c
++#define R_HPH_NEW_INT_HPH_TIMER1        0x073a
++#define R_CDC_RX0_RX_PATH_CTL           0x0b41
++#define R_CDC_RX0_RX_PATH_CFG0          0x0b42
++#define R_CDC_RX0_RX_VOL_CTL            0x0b45
++#define R_CDC_RX0_RX_PATH_MIX_CTL       0x0b46
++#define R_CDC_RX0_RX_PATH_SEC0          0x0b49
++#define R_CDC_RX0_RX_PATH_DSMDEM_CTL    0x0b53
++#define R_CDC_CLSH_CRC                  0x0c01
++#define R_CDC_RX_INP_MUX_RX_INT0_CFG0   0x0d01
++#define R_CDC_CLK_RST_CTRL_MCLK_CONTROL 0x0d41
++#define R_CDC_CLK_RST_CTRL_FS_CNT_CONTROL 0x0d42
++
++static uint8_t codec_la = 0xff, interface_la = 0xff;
++static int codec_page = -1;
++static unsigned codec_writes, codec_mismatches;
++static bool codec_failed;
++
++static bool
++codec_page_for(uint16_t reg)
++{
++	uint8_t page = (uint8_t)(reg >> 8);
++
++	if (codec_page == page) {
++		return true;
++	}
++	if (!codec_write(codec_la, WCD_REGISTERS + 0x00, page)) {
++		codec_failed = true;
++		return false;
++	}
++	codec_page = page;
++	return true;
++}
++
++static bool
++reg_read(uint16_t reg, uint8_t *value)
++{
++	if (codec_failed || !codec_page_for(reg) || !codec_read(codec_la, WCD_REGISTERS + (reg & 0xff), value, 1)) {
++		codec_failed = true;
++		say("slim: codec register %#06x cannot be read\n", reg);
++		return false;
++	}
++	return true;
++}
++
++/* the bits of `mask' to `value', read back (bits that the codec clears by itself may not) */
++static bool
++reg_update(uint16_t reg, uint8_t mask, uint8_t value)
++{
++	uint8_t now = 0, want, back = 0;
++
++	if (!reg_read(reg, &now)) {
++		return false;
++	}
++	want = (uint8_t)((now & ~mask) | (value & mask));
++	if (want != now) {
++		if (!codec_write(codec_la, WCD_REGISTERS + (reg & 0xff), want)) {
++			codec_failed = true;
++			return false;
++		}
++		codec_writes++;
++	}
++	if (!reg_read(reg, &back)) {
++		return false;
++	}
++	if (((back ^ want) & mask) != 0) {
++		codec_mismatches++;
++		say("slim: codec register %#06x: %#04x written (mask %#04x), %#04x read back\n", reg, want, mask, back);
++	}
++	return true;
++}
++
++static bool
++reg_put(uint16_t reg, uint8_t value)
++{
++	return reg_update(reg, 0xff, value);
++}
++
++static void
++pause_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++/* wcd934x_bring_up() and the MCLK inside the codec (wcd934x_enable_ana_bias_and_sysclk()) */
++static bool
++codec_power_on(void)
++{
++	say("slim: the codec brought up (wcd934x_bring_up) and its MCLK enabled inside it\n");
++	reg_put(R_CODEC_RPM_RST_CTL, 0x01);
++	reg_put(R_SIDO_NEW_VOUT_A_STARTUP, 0x19);
++	reg_put(R_SIDO_NEW_VOUT_D_STARTUP, 0x15);
++	pause_us(1000);
++	reg_put(R_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x5);
++	reg_put(R_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x7);
++	reg_put(R_CODEC_RPM_RST_CTL, 0x3);
++	reg_put(R_CODEC_RPM_RST_CTL, 0x7);
++	reg_put(R_CODEC_RPM_PWR_CDC_DIG_HM_CTL, 0x3);
++	reg_update(R_CODEC_RPM_CLK_MCLK_CFG, 0x03, 0x01);               /* 9.6 MHz (wcd934x_comp_set_sysclk) */
++	reg_update(R_ANA_BIAS, 0x80, 0x80);
++	reg_update(R_ANA_BIAS, 0x40, 0x40);                             /* pre-charge */
++	pause_us(1000);
++	reg_update(R_ANA_BIAS, 0x40, 0x00);
++	reg_update(R_ANA_BIAS, 0x20, 0x00);
++	reg_update(R_CLK_SYS_MCLK_PRG, 0x80, 0x80);                     /* the external clock's buffer */
++	reg_update(R_CLK_SYS_MCLK_PRG, 0x30, 0x10);                     /* divided by 2 */
++	reg_update(R_CLK_SYS_MCLK_PRG, 0x02, 0x00);                     /* the MCLK from the external clock */
++	reg_update(R_CLK_SYS_MCLK_PRG, 0x01, 0x01);
++	reg_update(R_CDC_CLK_RST_CTRL_FS_CNT_CONTROL, 0x01, 0x01);
++	reg_update(R_CDC_CLK_RST_CTRL_MCLK_CONTROL, 0x01, 0x01);
++	reg_update(R_CODEC_RPM_CLK_GATE, 0x03, 0x00);
++	pause_us(15);
++	reg_update(R_ANA_RCO, 0x80, 0x80);                              /* SIDO from the RCO and the band gap */
++	pause_us(110);
++	return !codec_failed;
++}
++
++static void
++codec_power_off(void)
++{
++	codec_failed = false;
++	reg_update(R_CLK_SYS_MCLK_PRG, 0x81, 0x00);
++	reg_update(R_ANA_BIAS, 0x80, 0x00);
++	reg_update(R_ANA_BIAS, 0x40, 0x00);
++}
++
++/* ---- slim=4: the earpiece path ----------------------------------------------------------------------------------- */
++
++static bool ear_on;
++
++/* The "handset" path powered as DAPM powers it, without samples (the head) */
++static bool
++ear_path_on(void)
++{
++	say("slim: the earpiece path powered (RX0 -> RX INT0 -> class H -> EAR PA), with no samples: silence\n");
++	reg_update(R_ANA_RX_SUPPLIES, 0x01, 0x01);                      /* RX_BIAS */
++	reg_update(R_CDC_RX0_RX_PATH_CTL, 0x20, 0x20);                  /* INT0_CLK */
++	reg_update(R_CDC_RX0_RX_PATH_DSMDEM_CTL, 0x01, 0x01);           /* DSMDEM0_CLK */
++	reg_update(R_CDC_RX_INP_MUX_RX_INT0_CFG0, 0x0f, 5);             /* RX INT0_1 MIX1 INP0: RX0 */
++	reg_update(R_CDC_RX0_RX_PATH_CFG0, 0x08, 0x08);                 /* the DEM's look-ahead delay */
++	reg_update(R_CDC_RX0_RX_PATH_SEC0, 0x01, 0x01);                 /* RX INT0 DEM MUX: CLSH_DSM_OUT */
++	reg_update(R_CDC_RX0_RX_VOL_CTL, 0xff, (uint8_t)-20);           /* -20 dB, for a start */
++	/* EAR DAC, PRE_PMU: the autochop timer off; class H for the EAR (CLS_H_NORMAL) */
++	reg_update(R_HPH_NEW_INT_HPH_TIMER1, 0x02, 0x00);
++	reg_update(R_CDC_CLSH_CRC, 0x01, 0x01);
++	reg_update(R_CDC_RX0_RX_PATH_CFG0, 0x40, 0x40);
++	reg_update(R_ANA_RX_SUPPLIES, 0x08, 0x00);                      /* buck: default level */
++	reg_update(R_ANA_RX_SUPPLIES, 0x04, 0x00);                      /* flyback: default level */
++	reg_update(R_ANA_RX_SUPPLIES, 0x40, 0x40);                      /* flyback on */
++	pause_us(610);
++	reg_update(R_RX_BIAS_FLYB_BUFF, 0x0f, 0x0a);
++	reg_update(R_RX_BIAS_FLYB_BUFF, 0xf0, 0xa0);
++	pause_us(110);
++	reg_update(R_ANA_RX_SUPPLIES, 0x80, 0x80);                      /* buck on */
++	pause_us(510);
++	/* EAR PA */
++	reg_update(R_ANA_EAR, 0x80, 0x80);
++	ear_on = true;
++	pause_us(5500);
++	reg_update(R_CDC_RX0_RX_PATH_CTL, 0x10, 0x00);                  /* unmuted */
++	reg_update(R_CDC_RX0_RX_PATH_MIX_CTL, 0x10, 0x00);
++	return !codec_failed;
++}
++
++static void
++ear_path_off(void)
++{
++	codec_failed = false;
++	if (ear_on) {
++		reg_update(R_CDC_RX0_RX_PATH_CTL, 0x10, 0x10);          /* muted */
++		reg_update(R_ANA_EAR, 0x80, 0x00);
++		pause_us(5500);
++		ear_on = false;
++	}
++	reg_update(R_CDC_RX0_RX_PATH_CFG0, 0x40, 0x00);
++	reg_update(R_CDC_CLSH_CRC, 0x01, 0x00);
++	reg_update(R_ANA_RX_SUPPLIES, 0x80, 0x00);                      /* buck off */
++	pause_us(510);
++	reg_update(R_ANA_RX_SUPPLIES, 0x40, 0x00);                      /* flyback off */
++	pause_us(610);
++	reg_update(R_CDC_RX0_RX_PATH_SEC0, 0x01, 0x00);
++	reg_update(R_CDC_RX0_RX_PATH_CFG0, 0x08, 0x00);
++	reg_update(R_CDC_RX_INP_MUX_RX_INT0_CFG0, 0x0f, 0);
++	reg_update(R_CDC_RX0_RX_PATH_DSMDEM_CTL, 0x01, 0x00);
++	reg_update(R_CDC_RX0_RX_PATH_CTL, 0x20, 0x00);                  /* INT0's clock off, then its reset */
++	reg_update(R_CDC_RX0_RX_PATH_CTL, 0x40, 0x40);
++	reg_update(R_CDC_RX0_RX_PATH_CTL, 0x40, 0x00);
++	reg_update(R_ANA_RX_SUPPLIES, 0x01, 0x00);
++}
++
++static void
++ear_look(const char *when)
++{
++	uint8_t ear = 0, status = 0, supplies = 0, ctl = 0;
++
++	codec_failed = false;
++	reg_read(R_ANA_EAR, &ear);
++	reg_read(R_EAR_STATUS_REG, &status);
++	reg_read(R_ANA_RX_SUPPLIES, &supplies);
++	reg_read(R_CDC_RX0_RX_PATH_CTL, &ctl);
++	say("slim: %s: ANA_EAR %#04x, EAR_STATUS %#04x, RX supplies %#04x, RX0 path ctl %#04x\n", when, ear, status, supplies, ctl);
++}
++
++/* ---- the TX port and its SLIMbus channel (wcd9xxx_cfg_slim_sch_tx, slim_control_ch) ------------------------------- */
++
++#define SLIM_CH_ACTIVATE        1
++#define SLIM_CH_REMOVE          0
++#define WCD_IF_TX_OR_UR_CFG(port)    (0x1f0 + (port))
++#define WCD_IF_TX_MULTI_0(port)      (0x100 + 4 * (port))
++#define WCD_IF_TX_MULTI_1(port)      (0x101 + 4 * (port))
++#define WCD_IF_PORT_CFG(port)        (0x050 + (port))       /* TAIKO: sh_ch.port_tx_cfg_reg_base */
++#define WCD_IF_WATER_MARK            0x05                   /* 12 bytes | enable (SLAVE_PORT_WATER_MARK_12BYTES << 1 | 1) */
++#define WCD_TX_AUTO_RECOVERY         0x02
++
++/* Connect the codec's generic-device TX port to its channel (slim_connect_src(): no ACK waited for, as Linux does not) */
++static bool
++tx_connect_src(uint8_t la, uint8_t port, uint8_t channel)
++{
++	uint8_t payload[4] = { la, port, channel, next_tid++ };
++	uint32_t first = FIRST_WORD(sizeof(payload) + 3, MT_DEST_REFERRED_USER, MC_CONNECT_SRC, 0, LA_MANAGER);
++	uint8_t message[8];
++
++	memcpy(message, &first, 3);
++	memcpy(message + 3, payload, sizeof(payload));
++	return ngd_send("connect source port", message, sizeof(message));
++}
++
++/* Define and activate the channel (ngd_allocbw(): DEF_ACT_CHAN then RECONFIG_NOW, both acknowledged) */
++static bool
++tx_define_activate(uint8_t la, uint8_t channel)
++{
++	uint8_t tid = next_tid++;
++	/* dataf 0, la & 0x1f; 16 bits and coeff 3; rootexp 2 and hard ISO; 48 kHz prrate 0x83 (slim_nextdefine_ch()) */
++	uint8_t payload[6] = { (uint8_t)(la & 0x1f), 0x24, 0x20, 0x83, tid, channel };
++	uint8_t now[2] = { tid, la };
++
++	return ngd_send_ack("define and activate the channel", MC_DEF_ACT_CHAN, tid, payload, sizeof(payload)) &&
++	       ngd_send_ack("reconfigure now", MC_RECONFIG_NOW, tid, now, sizeof(now));
++}
++
++/* Remove the channel, then disconnect its port (slim_control_ch(REMOVE) and slim_disconnect_ports()) */
++static bool
++tx_remove(uint8_t la, uint8_t port, uint8_t channel)
++{
++	uint8_t tid = next_tid++;
++	uint8_t control[3] = { (uint8_t)((SLIM_CH_REMOVE << 6) | (la & 0x1f)), tid, channel };
++	uint8_t now[2] = { tid, la };
++	uint8_t disconnect[3] = { la, port, next_tid++ };
++	uint32_t first = FIRST_WORD(sizeof(disconnect) + 3, MT_DEST_REFERRED_USER, MC_DISCONNECT_PORT, 0, LA_MANAGER);
++	uint8_t message[6];
++
++	(void)ngd_send_ack("remove the channel", MC_CHAN_CTRL, tid, control, sizeof(control));
++	(void)ngd_send_ack("reconfigure now", MC_RECONFIG_NOW, tid, now, sizeof(now));
++	memcpy(message, &first, 3);
++	memcpy(message + 3, disconnect, sizeof(disconnect));
++	return ngd_send("disconnect the source port", message, sizeof(message));
++}
++
++/* ---- the persistent way in: the bus, the codec, its ports -------------------------------------------------------- */
++
++static bool bus_ready;                  /* QMI + NGD + MCLK + reset + logical addresses + chip id */
++static bool codec_on;                   /* codec_power_on() has run and not been undone */
++static unsigned slim_users;
++
++/* The QMI side: the DSP's service, our port, instance 0 as master, the bus powered. */
++static bool
++bus_power_up(void)
++{
++	const uint8_t types[2] = { 0x01, 0x10 };
++	const uint32_t values[2] = { SLIM_QMI_INSTANCE, SLIM_MODE_MASTER };
++	uint64_t began = now_us();
++
++	if (our_port != 0) {
++		return powered;
++	}
++	while (!hakios_adsp_qrtr_find(SLIM_QMI_SERVICE, SLIM_QMI_VERSION, SLIM_QMI_INSTANCE, &dsp_node, &dsp_port)) {
++		if (now_us() - began > 5000000) {
++			say("slim: the DSP has not told of its SLIMbus service (0x301) within 5 s: nothing is done\n");
++			return false;
++		}
++		delay_for_interval(10, NSEC_PER_MSEC);
++	}
++	our_port = hakios_adsp_qrtr_open(qmi_receive);
++	if (our_port == 0) {
++		say("slim: no QRTR port of ours left\n");
++		return false;
++	}
++	say("slim: the DSP's SLIMbus service is at node %u port %u; ours is port %#x\n", dsp_node, dsp_port, our_port);
++	if (!qmi_request("select instance 0, the DSP the master", QMI_SELECT_INSTANCE, types, values, 2) || !bus_power(true)) {
++		return false;
++	}
++	return true;
++}
++
++static void
++bus_power_down(void)
++{
++	if (our_port != 0) {
++		if (powered) {
++			(void)bus_power(false);
++		}
++		hakios_adsp_qrtr_close(our_port);
++		our_port = 0;
++	}
++}
++
++/* Everything the microphones' path needs above the codec: bus, NGD, MCLK, reset, the two logical addresses, chip id. */
++static bool
++bus_up(void)
++{
++	uint8_t generic = 0xff, interface = 0xff, id[4] = { 0 };
++	uint64_t began;
++
++	codec_failed = false;
++	codec_page = -1;
++	codec_la = interface_la = 0xff;
++	if (!bus_power_up()) {
++		return false;
++	}
++	slim_regs = ml_io_map(SLIM_PHYS, SLIM_SIZE);
++	ngd = slim_regs + NGD_OFFSET;
++	if (!ngd_enable(false)) {
++		return false;
++	}
++	if (!mclk(true)) {
++		return false;
++	}
++	codec_reset_release();
++	began = now_us();
++	while (now_us() - began < 2000000 && (generic == 0xff || interface == 0xff)) {
++		if (interface == 0xff) {
++			interface = address_query(ea_interface);
++		}
++		if (generic == 0xff) {
++			generic = address_query(ea_generic);
++		}
++		if (generic == 0xff || interface == 0xff) {
++			delay_for_interval(50, NSEC_PER_MSEC);
++		}
++	}
++	say("slim: %llu ms after the reset: the codec's interface device %s%#x, its generic device %s%#x\n",
++	    (now_us() - began) / 1000, interface == 0xff ? "has NO logical address " : "is ", interface,
++	    generic == 0xff ? "has NO logical address " : "is ", generic);
++	if (generic == 0xff || interface == 0xff) {
++		return false;
++	}
++	if (!codec_write(generic, WCD_REGISTERS + 0x00, 0) || !codec_read(generic, WCD_REGISTERS + 0x21, id, 4)) {
++		return false;
++	}
++	{
++		uint16_t minor = (uint16_t)(id[0] | id[1] << 8), major = (uint16_t)(id[2] | id[3] << 8);
++
++		say("slim: THE CODEC'S CHIP ID: %02x %02x %02x %02x: major %#x%s, minor %#x%s\n", id[0], id[1], id[2], id[3], major,
++		    major == TAVIL_MAJOR ? " (Tavil, a WCD9340/9341)" : " (NOT Tavil's 0x108)", minor,
++		    minor == 0 ? " (1.0)" : minor == 1 ? " (1.1)" : "");
++		if (major != TAVIL_MAJOR) {
++			return false;
++		}
++	}
++	codec_la = generic;
++	interface_la = interface;
++	codec_page = 0;                 /* (the page register was just written to 0) */
++	return true;
++}
++
++static void
++bus_down(void)
++{
++	if (codec_on) {
++		codec_power_off();
++		codec_on = false;
++	}
++	codec_reset_restore();
++	if (mclk_on) {
++		(void)mclk(false);
++	}
++	ngd_down();
++	bus_power_down();
++	codec_la = interface_la = 0xff;
++	codec_page = -1;
++}
++
++/* The codec's own bring-up, called with slim_lock held. */
++static bool
++codec_power_locked(bool on)
++{
++	bool ok = true;
++
++	if (on) {
++		if (!codec_on) {
++			if (!bus_ready) {
++				ok = false;
++			} else {
++				codec_failed = false;
++				ok = codec_power_on();
++				codec_on = ok;
++			}
++		}
++	} else if (codec_on) {
++		codec_power_off();
++		codec_on = false;
++	}
++	return ok;
++}
++
++/*
++ * hakios_slim_up: the bus, the NGD and the codec up (once), for the microphones' driver. The first user powers the
++ * bus, brings the codec out of reset, verifies it and brings it up; later users just count. False if it could not be
++ * had (nothing is left half up).
++ */
++bool
++hakios_slim_up(void)
++{
++	bool ok = true;
++
++	lck_mtx_lock(&slim_lock);
++	if (bus_ready) {
++		if (!codec_on && !codec_power_locked(true)) {
++			lck_mtx_unlock(&slim_lock);
++			return false;
++		}
++		slim_users++;
++		say("slim: up again (%u %s)\n", slim_users, slim_users == 1 ? "user" : "users");
++		lck_mtx_unlock(&slim_lock);
++		return true;
++	}
++	say("slim: the SLIMbus and the codec, for the microphones: up\n");
++	if (!bus_up()) {
++		say("slim: the SLIMbus and the codec could not be brought up\n");
++		bus_down();
++		ok = false;
++	} else {
++		/* (the codec is brought up with bus_ready already set: codec_power_on() reads its registers) */
++		bus_ready = true;
++		if (!codec_power_locked(true)) {
++			say("slim: the codec could not be brought up\n");
++			bus_ready = false;
++			bus_down();
++			ok = false;
++		} else {
++			slim_users = 1;
++		}
++	}
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++/* hakios_slim_down: one user fewer; the last turns the codec's own clocks off (the bus stays up for the next user). */
++void
++hakios_slim_down(void)
++{
++	lck_mtx_lock(&slim_lock);
++	if (slim_users == 0) {
++		lck_mtx_unlock(&slim_lock);
++		return;
++	}
++	if (--slim_users == 0) {
++		(void)codec_power_locked(false);
++		say("slim: the last user: the codec's clocks off (the bus stays up)\n");
++	}
++	lck_mtx_unlock(&slim_lock);
++}
++
++/* The codec's own bring-up (its analog bias and internal MCLK); false if it could not be had. */
++bool
++hakios_slim_codec_power(bool on)
++{
++	bool ok;
++
++	lck_mtx_lock(&slim_lock);
++	ok = codec_power_locked(on);
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++bool
++hakios_slim_codec_read(uint16_t reg, uint8_t *value)
++{
++	bool ok;
++
++	lck_mtx_lock(&slim_lock);
++	ok = bus_ready && codec_on && reg_read(reg, value);
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++bool
++hakios_slim_codec_write(uint16_t reg, uint8_t value)
++{
++	bool ok;
++
++	lck_mtx_lock(&slim_lock);
++	ok = bus_ready && codec_on && !codec_failed && codec_page_for(reg) &&
++	    codec_write(codec_la, WCD_REGISTERS + (reg & 0xff), value);
++	if (!ok) {
++		codec_failed = true;
++	}
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++bool
++hakios_slim_codec_update(uint16_t reg, uint8_t mask, uint8_t value)
++{
++	bool ok;
++
++	lck_mtx_lock(&slim_lock);
++	ok = bus_ready && codec_on && reg_update(reg, mask, value);
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++bool
++hakios_slim_interface_write(uint16_t reg, uint8_t value)
++{
++	bool ok;
++
++	lck_mtx_lock(&slim_lock);
++	ok = bus_ready && interface_la != 0xff && codec_write(interface_la, WCD_REGISTERS + reg, value);
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++uint8_t
++hakios_slim_generic_la(void)
++{
++	return codec_la;
++}
++
++uint8_t
++hakios_slim_interface_la(void)
++{
++	return interface_la;
++}
++
++/*
++ * The codec's TX port on a SLIMbus channel, as Android's wcd9xxx_cfg_slim_sch_tx() brings it up: the interface device's
++ * port registers, the source connected, then the channel defined and activated with the manager.
++ */
++bool
++hakios_slim_tx_on(uint8_t port, uint8_t channel)
++{
++	bool ok = false;
++	uint16_t payload = (uint16_t)(1u << (port & 0x0f));
++
++	lck_mtx_lock(&slim_lock);
++	if (!bus_ready || !codec_on || interface_la == 0xff || codec_la == 0xff) {
++		goto out;
++	}
++	say("slim: the codec's TX port %u on channel %u: up\n", port, channel);
++	ok = codec_write(interface_la, WCD_REGISTERS + WCD_IF_TX_OR_UR_CFG(port), WCD_TX_AUTO_RECOVERY) &&
++	     codec_write(interface_la, WCD_REGISTERS + WCD_IF_TX_MULTI_0(port), (uint8_t)(payload & 0xff)) &&
++	     codec_write(interface_la, WCD_REGISTERS + WCD_IF_TX_MULTI_1(port), (uint8_t)(payload >> 8)) &&
++	     codec_write(interface_la, WCD_REGISTERS + WCD_IF_PORT_CFG(port), WCD_IF_WATER_MARK) &&
++	     tx_connect_src(codec_la, port, channel) &&
++	     tx_define_activate(codec_la, channel);
++	if (ok) {
++		say("slim: the codec's TX port %u on channel %u: UP\n", port, channel);
++	} else {
++		say("slim: the codec's TX port %u on channel %u: NOT UP\n", port, channel);
++	}
++out:
++	lck_mtx_unlock(&slim_lock);
++	return ok;
++}
++
++void
++hakios_slim_tx_off(uint8_t port, uint8_t channel)
++{
++	lck_mtx_lock(&slim_lock);
++	if (bus_ready && interface_la != 0xff && codec_la != 0xff) {
++		say("slim: the codec's TX port %u on channel %u: down\n", port, channel);
++		(void)tx_remove(codec_la, port, channel);
++	}
++	lck_mtx_unlock(&slim_lock);
++}
++
++/* ---- the diagnostic way in: slim=1..4 ---------------------------------------------------------------------------- */
++
++static void
++codec_up_diagnostic(void)
++{
++	uint8_t generic = 0xff, interface = 0xff, id[4] = { 0 };
++	uint64_t began;
++
++	if (!mclk(true)) {
++		return;
++	}
++	codec_reset_release();
++	began = now_us();
++	while (now_us() - began < 2000000 && (generic == 0xff || interface == 0xff)) {
++		if (interface == 0xff) {
++			interface = address_query(ea_interface);
++		}
++		if (generic == 0xff) {
++			generic = address_query(ea_generic);
++		}
++		if (generic == 0xff || interface == 0xff) {
++			delay_for_interval(50, NSEC_PER_MSEC);
++		}
++	}
++	say("slim: %llu ms after the reset: the codec's interface device %s%#x, its generic device %s%#x\n",
++	    (now_us() - began) / 1000, interface == 0xff ? "has NO logical address " : "is ", interface,
++	    generic == 0xff ? "has NO logical address " : "is ", generic);
++	if (generic == 0xff) {
++		return;
++	}
++	codec_la = generic;
++	interface_la = interface;
++	codec_page = 0;
++	codec_failed = false;
++	if (codec_write(generic, WCD_REGISTERS + 0x00, 0) && codec_read(generic, WCD_REGISTERS + 0x21, id, 4)) {
++		uint16_t minor = (uint16_t)(id[0] | id[1] << 8), major = (uint16_t)(id[2] | id[3] << 8);
++
++		say("slim: THE CODEC'S CHIP ID: %02x %02x %02x %02x: major %#x%s, minor %#x%s\n", id[0], id[1], id[2], id[3], major,
++		    major == TAVIL_MAJOR ? " (Tavil, a WCD9340/9341)" : " (NOT Tavil's 0x108)", minor,
++		    minor == 0 ? " (1.0)" : minor == 1 ? " (1.1)" : "");
++		if (level >= 4 && major == TAVIL_MAJOR) {
++			if (codec_power_on()) {
++				codec_on = true;
++				ear_look("before the path");
++				if (ear_path_on()) {
++					ear_look("the path on");
++					delay_for_interval(2000, NSEC_PER_MSEC);
++					ear_look("two seconds later");
++				}
++				ear_path_off();
++				ear_look("the path off");
++				codec_power_off();
++				codec_on = false;
++			}
++			say("slim: the codec: %u registers changed, %u did not read back as written\n", codec_writes, codec_mismatches);
++		}
++	}
++}
++
++static void
++codec_down_diagnostic(void)
++{
++	codec_reset_restore();
++	if (mclk_on) {
++		(void)mclk(false);
++	}
++	codec_la = interface_la = 0xff;
++	codec_page = -1;
++}
++
++static void
++look(void)
++{
++	vm_offset_t slim = slim_regs;
++	vm_offset_t tlmm = ml_io_map(TLMM_SOUTH_PHYS, 0x100000);
++	uint32_t version = rd(slim), cfg = rd(tlmm + 0x1000UL * PIN_CODEC_RESET), io = rd(tlmm + 0x1000UL * PIN_CODEC_RESET + 4);
++
++	say("slim: the controller's version word %#x (version %#x)\n", version, version >> 16);
++	say("slim: the NGD (%#lx): cfg %#x, status %#x%s, rx msgq cfg %#x, int en %#x, int stat %#x\n", SLIM_PHYS + NGD_OFFSET,
++	    rd(ngd + NGD_CFG), rd(ngd + NGD_STATUS), (rd(ngd + NGD_STATUS) & 2) ? " (a logical address is ours)" : "",
++	    rd(ngd + NGD_RX_MSGQ_CFG), rd(ngd + NGD_INT_EN), rd(ngd + NGD_INT_STAT));
++	say("slim: the codec's reset, gpio%u: function %u, pull %u, %u mA, %s, reads %u\n", PIN_CODEC_RESET, (cfg >> 2) & 15, cfg & 3,
++	    (((cfg >> 6) & 7) + 1) * 2, (cfg & (1u << 9)) ? ((io & 2) ? "drives high: the codec out of reset" :
++	    "drives low: the codec in reset") : "input", io & 1);
++}
++
++static void
++slim_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	uint64_t began = now_us();
++	bool had_lock = false;
++
++	lck_mtx_lock(&slim_lock);
++	had_lock = true;
++	if (bus_ready || slim_users > 0) {
++		say("slim: the microphones' path has the SLIMbus: the diagnostic is skipped\n");
++		goto done;
++	}
++	say("slim: level %u: the DSP asked for the SLIMbus, the NGD looked at%s, the power given back\n", level,
++	    level >= 2 ? ", enabled and the capabilities exchanged" : "");
++	if (!bus_power_up()) {
++		bus_power_down();
++		goto done;
++	}
++	slim_regs = ml_io_map(SLIM_PHYS, SLIM_SIZE);
++	ngd = slim_regs + NGD_OFFSET;
++	look();
++	if (level >= 2) {
++		if (ngd_enable(true)) {
++			if (level >= 3 && (rd(ngd + NGD_STATUS) & 2)) {
++				codec_up_diagnostic();
++				codec_down_diagnostic();
++			}
++		}
++		ngd_down();
++	}
++	bus_power_down();
++done:
++	if (had_lock) {
++		lck_mtx_unlock(&slim_lock);
++	}
++	say("slim: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++hakios_slim_dsp_up(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("slim", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	level = level > 4 ? 4 : level;
++	if (kernel_thread_start(slim_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/*
++ * Before the DSP is shut down: the microphones' driver has let go of its users already (hakios_mic_dsp_down()); what
++ * is left is put back here, in the reverse order. A diagnostic run gives its power back at its level's end; if one is
++ * still running, the lock waits for it.
++ */
++void
++hakios_slim_dsp_down(void)
++{
++	lck_mtx_lock(&slim_lock);
++	if (slim_users > 0) {
++		say("slim: the DSP is going down with %u user%s of the bus: all of it put back\n", slim_users,
++		    slim_users == 1 ? "" : "s");
++		slim_users = 0;
++	}
++	if (bus_ready) {
++		bus_down();
++		bus_ready = false;
++	}
++	lck_mtx_unlock(&slim_lock);
++}
 diff --git a/bsd/dev/hakios.sound.c b/bsd/dev/hakios.sound.c
 new file mode 100644
 index 0000000..571c890
@@ -7079,10 +9455,10 @@ index 77e5d4f..fb50efd 100644
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
 diff --git a/bsd/sys/hakios.audio.h b/bsd/sys/hakios.audio.h
 new file mode 100644
-index 0000000..15f0881
+index 0000000..8c69535
 --- /dev/null
 +++ b/bsd/sys/hakios.audio.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,169 @@
 +/* Ported from not-exyy/ios-cepheus (HakiOS) for this cepheus port; see HANDOFF.md. */
 +/*
 + * /dev/hakios-audio: the sound Darwin plays, on its way to whatever can make it heard.
@@ -7227,6 +9603,26 @@ index 0000000..15f0881
 +void hakios_adsp_qrtr_close(uint32_t port);
 +bool hakios_adsp_qrtr_find(uint32_t service, uint32_t version, uint32_t instance, uint32_t *node, uint32_t *port);
 +bool hakios_adsp_qrtr_send(uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length);
++
++/*
++ * The SLIMbus and the WCD9340 codec behind it (drivers/audio/hakios.slim.c): the microphones' bus and codec.
++ * hakios_slim_up() is persistent and reference-counted: the first user powers the bus (QMI), enables the NGD,
++ * switches the codec's MCLK on, releases its reset, asks for its logical addresses and brings it up; the last
++ * hakios_slim_down() turns the codec's own clocks off (the bus stays up for the next user). The codec's
++ * registers, the interface device's, the two logical addresses, and the codec's TX port on a SLIMbus channel
++ * are then there to be used.
++ */
++bool hakios_slim_up(void);
++void hakios_slim_down(void);
++bool hakios_slim_codec_power(bool on);         /* the codec's analog bias and internal MCLK, on and off */
++bool hakios_slim_codec_read(uint16_t reg, uint8_t *value);
++bool hakios_slim_codec_write(uint16_t reg, uint8_t value);
++bool hakios_slim_codec_update(uint16_t reg, uint8_t mask, uint8_t value);
++bool hakios_slim_interface_write(uint16_t reg, uint8_t value);
++uint8_t hakios_slim_generic_la(void);          /* 0xff until the bus is up */
++uint8_t hakios_slim_interface_la(void);
++bool hakios_slim_tx_on(uint8_t port, uint8_t channel);   /* the interface device's port, CONNECT_SRC, DEF_ACT_CHAN */
++void hakios_slim_tx_off(uint8_t port, uint8_t channel);
 +void hakios_slim_dsp_up(void);         /* the DSP's audio services are up (adsp=1): boot-arg slim=N begins (hakios.slim.c) */
 +void hakios_slim_dsp_down(void);       /* before the DSP is shut down: the SLIMbus's power given back */
 +#endif
