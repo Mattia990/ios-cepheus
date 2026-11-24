@@ -5,6 +5,40 @@ Last updated **2026-11-24** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Video decode: YouTube fails because the port has no H.264 decoder (2026-11-24)
+
+Safari now renders YouTube correctly with `sweetsurf10=2`, but every video fails
+with YouTube's generic playback error (Playback ID `TilHPqRV7crsSU7F` in the
+`11:31`/`11:36` screenshots). This is not a YouTube or network problem.
+
+- **Local proof.** `http://192.168.1.12:8000/video.html` (served from the Mac)
+  loaded two plain H.264 MP4s (`Big_Buck_Bunny_360_10s_1MB.mp4`,
+  `sample-5s.mp4`). Both downloaded fully (HTTP 200 in the server log) and both
+  `<video>` elements showed the not-playable icon; the screenshot is
+  `logs/runs/safari4-cold/shot-local-video4.png`.
+- **Cause.** `oslog` during the load
+  (`logs/runs/safari4-cold/oslog-video.txt`) has
+  `mediaserverd[...] (AVD.videodecoder) AVDRegister - AppleAVDCheckPlatform() returned FALSE`
+  followed by `HTMLMediaElement::mediaLoadingFailed ... error = 6` and
+  `entered with networkState Loading, exiting with DecodeError`. The only video
+  decoder the iOS media stack knows here is Apple's `AppleAVD`; its platform
+  check refuses to register on this non-Apple platform. No other decoder
+  (H.264/HEVC/VP9/AV1) is registered.
+- **Kernel side.** `work/boot/kernel-audio/kernel.development.sweet` contains no
+  AppleAVD driver and no Qualcomm Venus driver; there is no video decoder in the
+  kernel at all. `AppleAVD` is a closed-source iPhone-X kext tied to Apple's AVD
+  hardware, which the SD855 does not have.
+- **Consequence.** YouTube's page, layout, thumbnails and 10-bit rendering work,
+  but video playback cannot start. Audio-only playback has not been tested;
+  the same missing decoder applies to any H.264/HEVC video, including local
+  files and the Photos app.
+- **What a fix needs.** Either (a) a software H.264 decoder integrated into the
+  media stack/WebKit (needs an iOS userland build route, which is currently
+  missing: no iPhoneOS SDK, no `work/userland/bin/ios-cc`), or (b) a Qualcomm
+  Venus video driver plus a VideoToolbox/AVD-compatible plugin. Both are large
+  projects, not a boot-arg fix. Do not spend more time on YouTube-specific
+  network/DRM theories: the local MP4 reproduces it without YouTube.
+
 ### Safari: deep-color `b3a8` surfaces fixed with `sweetsurf10=2` (2026-11-24)
 
 Safari live pages were black while the tab-view thumbnails were correct. The
@@ -35,13 +69,17 @@ root cause is WebKit's deep-color backing store, not WebContent drawing.
   `http://192.168.7.1:8000/test.html` served from the Mac rendered full-screen
   red/green/blue with text:
   `logs/runs/safari3-surf10/shot-local-colors.png`.
-- **Next.** `safari4-cold` boots the same image cold with `sweetsurf10=2` and
-  `cepheusreboot=1800`; join Wi-Fi and test Google/YouTube. Watch for the known
-  side effect of `=2`: clients that hard-code a 10-bit format (CA's software
+- **Cold-boot result.** `safari4-cold` (same image/ADT/args plus
+  `sweetsurf10=2`) reached Wi-Fi (192.168.1.100) and rendered YouTube and a
+  local H.264 test page correctly; screenshots are in
+  `logs/runs/safari4-cold/`. Video playback still fails in the decoder, not the
+  renderer (see the video-decode section above).
+- **Side effect of `=2`.** Clients that hard-code a 10-bit format (CA's software
   renderer in chronod, widget extensions such as NewsToday2) can get wrong
-  colours because the remap is global. If that appears, restrict the remap to
-  the WebKit GPU and WebContent process names in `SweetSurface.cpp` instead of
-  using `=2` globally.
+  colours because the remap is global. No such corruption was seen in the
+  Safari/YouTube test; if it appears, restrict the remap to the WebKit GPU and
+  WebContent process names in `SweetSurface.cpp` instead of using `=2`
+  globally.
 
 ### audio11: the capture-source wedge is fixed; mic and speaker still work (2026-11-24)
 
