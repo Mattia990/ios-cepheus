@@ -1,9 +1,122 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-23** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-24** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### audio9: microphone capture works; stopping a recording wedges SpringBoard in the capture-source XPC (2026-11-24)
+
+The audio9 kernel (`bd6aa2bd...`, 0160+0161) booted cold at 23:10 with the
+audio8 args plus `mic=4` (`logs/runs/audio9/cmdline`). The microphone now works
+end-to-end:
+
+- **The channel define/activate is ACKed.** The audio8 fix works: `the
+  messaging bandwidth for the codec's satellite (30 slots): reserved`, then
+  `channel 133 ... define and activate (tid 98)` and the TX port is `UP` at
+  101.975, **3 ms later**. The same at 139.451 (tid 219) and 283.403 (tid 84);
+  no `NO ACK` and no retry. The full DSP-first order still runs (session 2,
+  COPP 9, `SLIM_0_TX` port 0x4001, WCD9340 MIC BIAS3/AMIC3/DEC5 writes).
+- **Real frames, clean teardown.** Each of the three mic sessions delivered
+  48000 frames/s in 50x20 ms periods, 0 empty, 0 errors. The VoiceMemos test at
+  t~283 captured speech at -42.9/-37.4/-38.5 dBFS (peaks 1911-3061); the driver
+  then logged `the stream, closed`, `the device path, closed`, `channel 133
+  ... down` and `the last user: the codec's clocks off`. `sound_test tone 2`
+  still handed over 96000/96000 frames and `sound_test route` still reports
+  Speaker.
+
+**The stop still wedges SpringBoard.** It happened twice: the first recording
+at t~283 (SpringBoard 25, mediaserverd 27), and again after a SpringBoard
+restart at 14:31 phone time (SpringBoard 689, mediaserverd 544). Both
+`pstack-springboard-wedge*.txt` have the same thread 0: `mach_msg` <- libdispatch
+`_dispatch_mach_send_with_result_and_wait_for_reply` <- libxpc
+`__xpc_connection_activate_if_needed` <- CMCapture's
+`__csr_ensureClientEstablished_block_invoke` (0x1a2030794) waiting for a reply
+from `com.apple.coremedia.capturesource`. SpringBoard's main run loop never
+returns, so volume/power, the home gesture and Control Center/Notification
+Center are ignored while app touch continues through backboardd.
+
+- **Corrected caller chain.** The previous `CoreMedia+0xf3934` frame was a
+  nearest-symbol artifact. After subtracting slide `0x4a218000`:
+  `_csr_ensureClientEstablished_block_invoke` <- `figXPCCreateXPCConnectionInternal`
+  / `FigXPCRemoteClientCreateWithConnectionCreatingBlock` <-
+  `-[AVCaptureProprietaryDefaultsSingleton _updateProprietaryDefaultsSource:]`
+  <- `+[AVCaptureProprietaryDefaultsSingleton objectForKey:]` <-
+  `+[AVCaptureFigVideoDevice _devicesWithPriorRegisteredDevices:]` /
+  `__registerVideoDevicesOnce` <- `+[AVCaptureDevice _devicesWithDeviceTypes:
+  mediaType:position:]` <- `+[AVCaptureDeviceDiscoverySession
+  discoverySessionWithDeviceTypes:mediaType:position:]` <-
+  `-[AVControlCenterCaptureDeviceWatcher
+  initWithSupportedVideoEffectsDidChangeHandler:]`. The watcher is set up
+  once per SpringBoard process (`__registerVideoDevicesOnce`), so the first
+  capture after each start wedges again.
+- **Root cause shape.** launchd advertises the service because the boot cache
+  `/System/Library/xpc/launchd.plist` (the phone boots with
+  `launchd_unsecure_cache=1`) has the `com.apple.mediaserverd` job with
+  `com.apple.coremedia.capturesource` under `MachServices` (value `true`); the
+  per-job `/System/Library/LaunchDaemons/com.apple.mediaserverd.plist` has the
+  same entry, and it is the only LaunchDaemon that does. mediaserverd never
+  `bootstrap_check_in`s it: a restart 900 -> 2016 with `oslog -l
+  mediaserverd` shows no FigCapture, `FigStartCaptureServers` or
+  capturesource activity at startup, and MediaSafetyNet stays `Cam(Cold)
+  Mic(Cold)`. CMCaptureCore's `_FigStartCaptureServers.cold.1` (0x1d3fdca3c)
+  only logs `Could not find com.apple.CMCapture` and returns; it does not
+  abort, and mediaserverd's startup produced no such line. The client therefore
+  gets launchd's placeholder port, sends its first message, and waits forever.
+  `_csr_ensureClientEstablished` is a `dispatch_once`, so every later caller
+  waits on the same hung block.
+- **Recovery.** Restarting the wedged SpringBoard and mediaserverd restored a
+  normal UI; at the end SpringBoard 1781's thread 0 was back in `CFRunLoop`
+  and mediaserverd 2016 was running, with VoiceMemos gone. This is a recovery,
+  not a fix: the first capture event after a SpringBoard start should wedge
+  again.
+
+**Next, in order (the phone is disconnected):**
+
+1. Install `machsvc` (the fallback build is at `phone/tools/out/machsvc`;
+   rebuild with `phone/tools/build.sh` when the iOS SDK is back) as
+   `/var/local/bin/machsvc`. `machsvc lookup com.apple.coremedia.capturesource`
+   should return launchd's port; `machsvc checkin
+   com.apple.coremedia.capturesource 30` then shows whether a non-mediaserverd
+   process can claim it (a refusal means only the plist route is available).
+2. If check-in works, try a minimal stub that answers the CMCapture handshake
+   with an error. If it does not, remove only that key from the launchd job:
+   fetch the **current** `/System/Library/xpc/launchd.plist` first (the
+   existing `.orig` is the first-boot copy; do not restore
+   `work/daemons/launchd.plist.before`, which still has the removed vmd/dasd
+   jobs), run `tools/cepheus-capturesource-plist.py IN OUT` (it finds the job
+   by Label and handles both the cache and the per-job format), put OUT back
+   as the cache `0644`, and do the same for the per-job
+   `/System/Library/LaunchDaemons/com.apple.mediaserverd.plist` as a fallback
+   if launchd rescans. Reboot. A failed lookup makes
+   `_updateProprietaryDefaultsSource:` log `Tried to copy
+   proprietaryDefaultsSource but got NULL` and return. This is a persistent
+   rootfs edit; restoring the backups plus a reboot is the rollback. The error
+   path is real, not a guess: CMCapture's block stores the
+   `FigXPCRemoteClientCreate...` error at `[ctx+8]+0x18` and returns
+   (0x1a2030810-0x1a2030828), and AVFCapture tests the returned source for
+   NULL and only logs (0x19f0f53dc-0x19f0f54c0).
+3. The correct long-term fix is to make mediaserverd find and start
+   `com.apple.CMCapture` so it checks the service in. The framework directory
+   has no top-level `CMCapture` binary (the image is in the shared cache), so
+   first establish why `FigStartCaptureServers` reports it missing.
+
+The standard build is blocked: `ios-flame/work/userland/bin/ios-cc` is
+present but `xcrun --sdk iphoneos` fails on this host (only
+`/Library/Developer/CommandLineTools` is installed; there is no Xcode or
+iPhoneOS SDK), so `phone/tools/build.sh` cannot run. `machsvc` was instead
+cross-built once with the macOS SDK
+(`clang -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk macosx
+--show-sdk-path)"`), which links `/usr/lib/libSystem.B.dylib` and emits an
+iOS-platform Mach-O; it is ad-hoc signed at `phone/tools/out/machsvc` but has
+not been loaded on the phone yet. If the phone rejects it, rebuild with the
+iOS SDK when Xcode is back. A boot of audio9 is:
+
+```
+tools/cepheus-run.sh audio9 -k work/boot/kernel-audio/kernel.development.sweet \
+  -A work/boot/cepheus-amp.adt -G -s 900 \
+  -a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2 cepheustouchpanelpor=0 cepheustouchpanel=0 sweetampforcep=1 sweetmtl=2 mic=4"
+```
 
 ### audio8: the mic path comes up to the channel define; the manager's ACK (2026-11-23)
 
@@ -35,15 +148,17 @@ VoiceMemos/wedge test was run, and speaker playback was not retested.
 - **Not booted.** The phone is disconnected; the new kernel has not been built
   or booted.
 
-**Next:** build the new kernel (same CI flow), connect the phone, and
-`fastboot boot` it with the audio8 args:
+**Next (done in audio9):** build the new kernel (same CI flow), connect the
+phone, and `fastboot boot` it with the audio8 args:
 `tools/cepheus-run.sh audio9 -k <kernel> -A work/boot/cepheus-amp.adt -G -s 900
 -a "adsp=1 sound=4 speaker_probe=2 battmgr=0 sweetusb=2
 cepheustouchpanelpor=0 cepheustouchpanel=0 sweetampforcep=1 sweetmtl=2 mic=4"`.
 Hold `/dev/hakios-mic` open for a few seconds: the serial should show the
 bandwidth reserved, `channel 133 ... define and activate`, then `UP`. Then test
 VoiceMemos and the SpringBoard wedge, and confirm speaker playback.
-Never flash; keep the bootloader rules from NOTES.md.
+Never flash; keep the bootloader rules from NOTES.md. (audio9 confirmed the
+ACK path and real mic frames; the remaining wedge is the capture-source XPC,
+not the SLIMbus define.)
 
 ### audio7: the microphone attempt wedges SpringBoard's main thread (2026-11-22 21:50)
 
