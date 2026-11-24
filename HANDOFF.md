@@ -5,6 +5,62 @@ Last updated **2026-11-24** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### audio11: the capture-source wedge is fixed; mic and speaker still work (2026-11-24)
+
+The stale `com.apple.coremedia.capturesource` MachService was removed from the
+mediaserverd launchd job and the phone cold-booted. The wedge no longer
+reproduces.
+
+- **Patch.** Fetched the current `/System/Library/xpc/launchd.plist` (792698
+  bytes, 530 jobs, byte-identical to `work/daemons/launchd.plist.after`) and
+  `/System/Library/LaunchDaemons/com.apple.mediaserverd.plist` (4716 bytes) to
+  `backup/capturesource-2026-11-24/`. `tools/cepheus-capturesource-plist.py`
+  removed only `com.apple.coremedia.capturesource` from the mediaserverd job
+  (87 -> 86 MachServices) in both; the readbacks matched the patched files.
+  These two plists are the only persistent changes; the rollback is to put the
+  two fetched originals back as `0644` and reboot.
+- **Boot.** `audio10` was a warm boot used only to apply the patch; the user
+  then powered off and cold-booted to fastboot for `audio11`, because the
+  touchscreen needs a cold boot. Same kernel (`bd6aa2bd...`, 0160+0161) and
+  args as audio9, including `mic=4`; the full command line is
+  `logs/runs/audio11/cmdline`.
+- **The service is gone.** `machsvc lookup com.apple.coremedia.capturesource`
+  returns `unknown error code (0x44e)` (`BOOTSTRAP_UNKNOWN_SERVICE`), so
+  launchd no longer hands out the placeholder port. `machsvc` was the
+  macOS-SDK fallback build and loaded fine on the phone.
+- **First test (SpringBoard 25).** The user opened Control Center, tried the
+  volume buttons and home gesture, recorded in VoiceMemos twice (6.2 s and
+  7.2 s), and tried Control Center again: everything stayed responsive.
+- **Recurrence test (SpringBoard 437).** `psx -k SpringBoard 9` restarted
+  SpringBoard; the user repeated Control Center, volume/home and a 4.5 s
+  VoiceMemos recording. It stayed responsive. Both thread-0 stacks are in
+  `__CFRunLoopServiceMachPort`/`__CFRunLoopRun`, not `mach_msg`/libxpc.
+- **Evidence that the old path ran.** The restart log has
+  `SpringBoard[437] (AVFCapture) _registerVideoDevicesOnce: Did not find front
+  wide camera. registeredVideoDevices: ()` at 10:43:41.751, and the function
+  returns; the old wedge was inside `_registerVideoDevicesOnce`. The
+  `Tried to copy proprietaryDefaultsSource but got NULL` string did not appear
+  in the oslog, so the stronger evidence is the completed registration plus
+  the responsive UI.
+- **Mic and speaker.** All three VoiceMemos sessions delivered 48000 frames/s,
+  0 empty, 0 errors and a clean teardown: recording 1 6.2 s at
+  -57.3/-60.0/-59.4 dBFS (peaks 211/330/198), recording 2 7.2 s at
+  -55.3/-63.7/-63.7 (peaks 325/141/144), recording 3 4.5 s. The user played
+  back the latest memo and heard their voice; `sound_test route` reports
+  Speaker and `sound_test tone 2` handed over 96000/96000 frames and was
+  audible. The levels are lower than audio9's -42.9 dBFS speech test, but the
+  memo is audible; this is level/gain, not a dead path.
+- **Logs.** `logs/runs/audio11/` has `live.txt`, `oslog-capture.txt`,
+  `oslog-restart.txt`, `pstack-springboard-after.txt`,
+  `pstack-springboard-restart.txt`, `psx.txt` and `machsvc-lookup.txt` (the
+  `0x44e` readback); the plist backups are in
+  `backup/capturesource-2026-11-24/`.
+- **Still open.** The correct long-term fix is to make mediaserverd find and
+  start `com.apple.CMCapture` so it checks the service in; the framework
+  directory has no top-level `CMCapture` binary (the image is in the shared
+  cache), so first establish why `FigStartCaptureServers` reports it missing.
+  Until then, the plist edit is the fix and the camera stack remains absent.
+
 ### audio9: microphone capture works; stopping a recording wedges SpringBoard in the capture-source XPC (2026-11-24)
 
 The audio9 kernel (`bd6aa2bd...`, 0160+0161) booted cold at 23:10 with the
