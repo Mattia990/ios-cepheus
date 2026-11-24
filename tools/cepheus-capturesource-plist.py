@@ -33,13 +33,22 @@ def main():
     with open(src, 'rb') as f:
         plist = plistlib.load(f)
 
-    jobs = plist['LaunchDaemons'].values() if 'LaunchDaemons' in plist else [plist]
+    jobs = list(plist['LaunchDaemons'].values()) if 'LaunchDaemons' in plist else [plist]
     matches = [job for job in jobs if job.get('Label') == LABEL]
     if len(matches) != 1:
         raise SystemExit(f'{src}: {len(matches)} jobs with Label {LABEL}, expected 1')
     services = matches[0].get('MachServices')
     if not isinstance(services, dict) or KEY not in services:
         raise SystemExit(f'{src}: {KEY} is not in {LABEL} MachServices')
+    others = [
+        job.get('Label', '<no Label>')
+        for job in jobs
+        if job is not matches[0]
+        and isinstance(job.get('MachServices'), dict)
+        and KEY in job['MachServices']
+    ]
+    if others:
+        raise SystemExit(f'{src}: {KEY} is also advertised by {", ".join(others)}; refusing')
     del services[KEY]
 
     with open(dst, 'wb') as f:

@@ -65,38 +65,53 @@ Center are ignored while app touch continues through backboardd.
   gets launchd's placeholder port, sends its first message, and waits forever.
   `_csr_ensureClientEstablished` is a `dispatch_once`, so every later caller
   waits on the same hung block.
+- **Offline validation on the host (macOS launchd).** A temporary user
+  LaunchAgent with a `MachServices` entry and `/bin/sleep 600` (a program that
+  never checks in) reproduced the phone's behaviour: a
+  `xpc_connection_send_message_with_reply_sync` to the advertised name was
+  still blocked after 5 s. After removing the `MachServices` key and reloading
+  the job, the same call returned immediately with `Connection invalid`. In
+  the first setup, `bootstrap_check_in` from an independent process failed with
+  `0x44c` (`BOOTSTRAP_NOT_PRIVILEGED`), so a helper cannot claim the service
+  while launchd has it assigned to mediaserverd. This is macOS launchd/libxpc,
+  not the phone, but it exercises the same mechanism; the on-phone `machsvc
+  checkin` is now only a confirmation.
 - **Recovery.** Restarting the wedged SpringBoard and mediaserverd restored a
   normal UI; at the end SpringBoard 1781's thread 0 was back in `CFRunLoop`
   and mediaserverd 2016 was running, with VoiceMemos gone. This is a recovery,
   not a fix: the first capture event after a SpringBoard start should wedge
   again.
 
-**Next, in order (the phone is disconnected):**
+**Next, in order (the phone is disconnected; the plist edit needs approval):**
 
-1. Install `machsvc` (the fallback build is at `phone/tools/out/machsvc`;
-   rebuild with `phone/tools/build.sh` when the iOS SDK is back) as
-   `/var/local/bin/machsvc`. `machsvc lookup com.apple.coremedia.capturesource`
-   should return launchd's port; `machsvc checkin
-   com.apple.coremedia.capturesource 30` then shows whether a non-mediaserverd
-   process can claim it (a refusal means only the plist route is available).
-2. If check-in works, try a minimal stub that answers the CMCapture handshake
-   with an error. If it does not, remove only that key from the launchd job:
-   fetch the **current** `/System/Library/xpc/launchd.plist` first (the
-   existing `.orig` is the first-boot copy; do not restore
-   `work/daemons/launchd.plist.before`, which still has the removed vmd/dasd
-   jobs), run `tools/cepheus-capturesource-plist.py IN OUT` (it finds the job
-   by Label and handles both the cache and the per-job format), put OUT back
-   as the cache `0644`, and do the same for the per-job
-   `/System/Library/LaunchDaemons/com.apple.mediaserverd.plist` as a fallback
-   if launchd rescans. Reboot. A failed lookup makes
-   `_updateProprietaryDefaultsSource:` log `Tried to copy
-   proprietaryDefaultsSource but got NULL` and return. This is a persistent
-   rootfs edit; restoring the backups plus a reboot is the rollback. The error
-   path is real, not a guess: CMCapture's block stores the
-   `FigXPCRemoteClientCreate...` error at `[ctx+8]+0x18` and returns
-   (0x1a2030810-0x1a2030828), and AVFCapture tests the returned source for
-   NULL and only logs (0x19f0f53dc-0x19f0f54c0).
-3. The correct long-term fix is to make mediaserverd find and start
+1. With the phone connected and booted from the audio9 command below, fetch the
+   **current** `/System/Library/xpc/launchd.plist` and
+   `/System/Library/LaunchDaemons/com.apple.mediaserverd.plist` with
+   `tools/cepheus-files.py get`, and keep those two files as the backups (do
+   not use `work/daemons/launchd.plist.before`, which still has the removed
+   vmd/dasd jobs; the existing `.orig` is the first-boot copy). Run
+   `tools/cepheus-capturesource-plist.py IN OUT` on both, put the patched
+   files back as `0644`, and reboot. The tool removes only
+   `com.apple.coremedia.capturesource` from the mediaserverd job and leaves its
+   other MachServices alone. This is a persistent rootfs edit; the rollback
+   is putting the two fetched originals back and rebooting. A failed lookup
+   makes `_updateProprietaryDefaultsSource:` log `Tried to copy
+   proprietaryDefaultsSource but got NULL` and return. The error path is real,
+   not a guess: CMCapture's block stores the `FigXPCRemoteClientCreate...`
+   error at `[ctx+8]+0x18` and returns (0x1a2030810-0x1a2030828), and
+   AVFCapture tests the returned source for NULL and only logs
+   (0x19f0f53dc-0x19f0f54c0).
+2. Test a VoiceMemos recording: start, speak, stop. The expected log is
+   `Tried to copy proprietaryDefaultsSource but got NULL` from AVFCapture and
+   no `mach_msg` wait in SpringBoard; volume buttons, the home gesture and
+   Control Center must stay responsive. Then confirm speaker playback and mic
+   capture still work.
+3. Optional confirmation: install `machsvc` and `xpcsvc` from
+   `phone/tools/out/` as `/var/local/bin/` and run `machsvc lookup
+   com.apple.coremedia.capturesource` / `machsvc checkin ... 30`. On the host,
+   check-in was refused with `BOOTSTRAP_NOT_PRIVILEGED`, so a refusal on the
+   phone is expected and means the plist edit is the only fix.
+4. The correct long-term fix is to make mediaserverd find and start
    `com.apple.CMCapture` so it checks the service in. The framework directory
    has no top-level `CMCapture` binary (the image is in the shared cache), so
    first establish why `FigStartCaptureServers` reports it missing.
@@ -104,13 +119,15 @@ Center are ignored while app touch continues through backboardd.
 The standard build is blocked: `ios-flame/work/userland/bin/ios-cc` is
 present but `xcrun --sdk iphoneos` fails on this host (only
 `/Library/Developer/CommandLineTools` is installed; there is no Xcode or
-iPhoneOS SDK), so `phone/tools/build.sh` cannot run. `machsvc` was instead
-cross-built once with the macOS SDK
+iPhoneOS SDK), so `phone/tools/build.sh` cannot run. `machsvc` and `xpcsvc`
+were instead cross-built once with the macOS SDK
 (`clang -target arm64-apple-ios16.0 -isysroot "$(xcrun --sdk macosx
 --show-sdk-path)"`), which links `/usr/lib/libSystem.B.dylib` and emits an
-iOS-platform Mach-O; it is ad-hoc signed at `phone/tools/out/machsvc` but has
-not been loaded on the phone yet. If the phone rejects it, rebuild with the
-iOS SDK when Xcode is back. A boot of audio9 is:
+iOS-platform Mach-O; both are ad-hoc signed at `phone/tools/out/` but have not
+been loaded on the phone yet. `xpcsvc` resolves libxpc with `dlopen`/`dlsym`
+because the SDK marks `xpc_connection_create_mach_service` unavailable on iOS;
+it links only libSystem and was smoke-tested as a macOS build. If the phone
+rejects them, rebuild with the iOS SDK when Xcode is back. A boot of audio9 is:
 
 ```
 tools/cepheus-run.sh audio9 -k work/boot/kernel-audio/kernel.development.sweet \

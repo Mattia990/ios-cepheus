@@ -7,6 +7,7 @@
 #   netsvc   SystemConfiguration network service for an IF    nettest  DNS, TCP, then HTTPS
 #   oslog    stream the unified log                           prefs    CFPreferences read/write (no defaults)
 #   machsvc  look up or check in a launchd MachService
+#   xpcsvc   claim a MachService and log/reply to its clients
 #   imgtest  does ImageIO decode real pixels (HEIC: no)       membw    CPU memory bandwidth
 #   expt, exq, runmigrator: one-off probes of ExtensionFoundation and DataMigration (runmigrator needs
 #   com.apple.migrationpluginwrapper's entitlements, not in git)
@@ -25,6 +26,7 @@ build() {	# NAME SOURCE [FLAGS...]
 	fi
 }
 for c in machsvc membw pstack psx; do build $c $c.c; done
+build xpcsvc xpcsvc.c -fblocks
 for m in nettest openapp oslog prefs; do build $m $m.m -fobjc-arc -framework Foundation; done
 build imgtest imgtest.m -fobjc-arc -framework Foundation -framework ImageIO -framework CoreGraphics
 build lsreg lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
