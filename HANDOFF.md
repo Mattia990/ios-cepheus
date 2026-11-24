@@ -5,6 +5,44 @@ Last updated **2026-11-24** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Safari: deep-color `b3a8` surfaces fixed with `sweetsurf10=2` (2026-11-24)
+
+Safari live pages were black while the tab-view thumbnails were correct. The
+root cause is WebKit's deep-color backing store, not WebContent drawing.
+
+- **Surfaces.** With `screenSupportsExtendedColor()` true, WebKit's GPU process
+  allocated two-plane `kCVPixelFormatType_30RGBLE_8A_BiPlanar` (`'b3a8'`,
+  `planes 2`, 5 bytes/pixel) for non-opaque layers. Opaque layers used
+  one-plane `'w30r'`, which worked.
+- **Rejection.** SweetMetal2's
+  `newTextureWithDescriptor:iosurface:plane:` returns nil for any surface with
+  `IOSurfaceGetPlaneCount(surface) != 0` (and for any `plane != 0`). backboardd
+  then logged `Failed to allocate MTLTexture from IOSurface 0x..` and the page
+  stayed black. The tab-view thumbnail never took that path.
+- **MobileGestalt was not the lever.** `CacheExtra["Aixt/MEN2O2B7f+8m4TxUA"]`
+  (`HasExtendedColorDisplay`) set to false survived the `safari2-mg` cold boot
+  byte-for-byte, but WebKit still created `'b3a8'` `planes 2` surfaces. The
+  original cache was restored byte-for-byte; the copy is in
+  `backup/mobilegestalt-2026-11-24/` and is not an active change.
+- **The kernel already has the workaround.** `SweetSurface.cpp` remaps the
+  10-bit formats (`'w30r'`, `'l10r'`, `'w30R'`, `'b3a8'`) to one-plane BGRA.
+  Patch 0124 limits that to `com.apple.WebKit.WebContent` by default;
+  `sweetsurf10=2` applies it to every client, `=0` disables it.
+- **Proof.** `safari3-surf10` (warm boot of the same kernel/ADT/args plus
+  `sweetsurf10=2`) logged every `com.apple.WebKit.GPU` surface as
+  `fmt 0x42475241` (BGRA) `planes 0`, with no `'b3a8'` and no `planes 2` left.
+  Safari rendered its offline error page, and a local
+  `http://192.168.7.1:8000/test.html` served from the Mac rendered full-screen
+  red/green/blue with text:
+  `logs/runs/safari3-surf10/shot-local-colors.png`.
+- **Next.** `safari4-cold` boots the same image cold with `sweetsurf10=2` and
+  `cepheusreboot=1800`; join Wi-Fi and test Google/YouTube. Watch for the known
+  side effect of `=2`: clients that hard-code a 10-bit format (CA's software
+  renderer in chronod, widget extensions such as NewsToday2) can get wrong
+  colours because the remap is global. If that appears, restrict the remap to
+  the WebKit GPU and WebContent process names in `SweetSurface.cpp` instead of
+  using `=2` globally.
+
 ### audio11: the capture-source wedge is fixed; mic and speaker still work (2026-11-24)
 
 The stale `com.apple.coremedia.capturesource` MachService was removed from the
