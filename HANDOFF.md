@@ -41,6 +41,36 @@ Last updated **2026-11-25** (newest work first under "Start here"). Read this fi
   dispatch), copy the artifact's `phone/metal2/out/` into the checkout, install
   with `tools/cepheus-metal2-install.sh` or the staged-symlink swap, then
   relaunch Maps. Until then Maps still aborts at the missing selector.
+- **CloudKit abort was a stale signature, not an entitlement (ruled out).**
+  The 13:34/13:55 Maps runs aborted in
+  `-[PFCloudKitContainerProvider containerWithIdentifier:options:]` with the
+  standard `com.apple.developer.icloud-services` message. The cache globals
+  resolve to that entitlement name and to `CloudKit` / `CloudKit-Anonymous`
+  (`.27.dylddata` file offsets `0x7b7aee0`, `0x7b7ae20`, `0x7b7af00`; strings
+  at `0x18e32ddd7`, `0x18e32dcce`, `0x18e32ddfb`). Maps already has
+  `com.apple.developer.icloud-services = ['CloudKit']`, so no entitlement was
+  missing. The actual cause was `SweetMetal2.maps2`: it was 21,430,272 bytes
+  but still carried the 21,425,888-byte `.installed` CodeDirectory (cdhash
+  `648cc2a6...`), so `codesign --verify` reported "invalid signature (code or
+  signature have been modified)" and the kernel cleared `CS_VALID`
+  (`codeSigningFlags` `0x22000001` -> `0x22000000`); CloudKit's entitlement
+  lookup then returned nil. Re-signing the same image ad hoc (cdhash
+  `81ec8fba...`) restored `CS_VALID=1` and Maps 2109 got past CloudKit, only to
+  abort in `ggl::MetalResourceManager::newShaderFunction` on the missing legacy
+  function API (`logs/runs/maps2/Maps-2026-11-25-142120.ips`). Do not install
+  an unsigned or stale-signed shim.
+- **maps2 is not a daily stopgap.** Even correctly signed, `SweetMetal2.maps2`
+  burns ~24 CPU-seconds/10 s in SpringBoard (vs ~1-4 for `.revert`) with
+  logging off, and it does not fix the legacy function API. Keep the bundle
+  symlink on `/var/local/bin/SweetMetal2.revert` until the rebuilt bundle is
+  installed. The re-signed `Maps.new` with `com.apple.Maps.Sync.secure` is not
+  needed for this crash and remains unused.
+- **Cache offset correction.** VA `0x1df4ce168` is `.27.dylddata` file offset
+  `0x7bc6168` (mapping 2 base `0x1dcd14000`, file offset `0x540c000`), not the
+  flat `0x9bc6168`; the earlier "missing entitlement" reading came from using
+  the flat offset. The `.27.dylddata` mapping table is
+  `(0x1d5908000,0x5c000,0)`, `(0x1d5964000,0x53b0000,0x5c000)`,
+  `(0x1dcd14000,0x5df0000,0x540c000)`, `(0x1e4b04000,0x18000,0xb1fc000)`.
 
 ### Maps: hangs on locationd's CLInternalService sync call; service is startup-queue only (2026-11-25)
 
