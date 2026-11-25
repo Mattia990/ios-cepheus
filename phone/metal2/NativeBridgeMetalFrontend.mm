@@ -392,6 +392,12 @@ static std::string quartzCoreCallers();
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
  handler(function,error);
 }
+// Legacy MTLPipelineLibrary API (iOS 10-12): VectorKit/MapKit still call it. The pipeline library is only a cache
+// hint, so this is the sync variant; without it Maps aborts in ggl::MetalResourceManager.
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary error:(NSError **)error {
+ (void)pipelineLibrary;
+ return [self newFunctionWithName:name constantValues:values error:error];
+}
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
 // runtime does when the function is made.
@@ -674,6 +680,8 @@ static void waitForResource(id resource) {
 // reaches one anyway fails its command buffer.
 - (NSUInteger)tileWidth {return 0;}
 - (NSUInteger)tileHeight {return 0;}
+// VectorKit asks for the clip mode on every render encoder; Metal's default (clip) is what the encoder already uses.
+- (void)setDepthClipMode:(MTLDepthClipMode)mode {(void)mode;}
 - (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
@@ -1305,7 +1313,7 @@ static char sweetMemoryOwnerKey;
  // size its redraw context: zero makes it redraw a 1x1 transparent image at 0x0
  // and assert in PXGCreateContext. 16384 is the runtime's measured 2D limit
  // (private_properties.rs, MaxTextureWidth2D/Height2D).
- uint32_t *limits = (uint32_t *)((char *)self + 8);
+ uint32_t *limits = (uint32_t *)((uintptr_t)(__bridge void *)self + 8);
  limits[0x84 / 4] = 16384;
  limits[0x88 / 4] = 16384;
 }

@@ -1,9 +1,151 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-24** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-25** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Maps: locationd hang is fixed; next blocker is SweetMetal2's missing legacy function API (2026-11-25)
+
+- **The `.05` patch works.** `MKLocationManager isAuthorizedForPreciseLocation`
+  (`0x18e9ce0b0`), `MKLocationManager isLocationServicesEnabled`
+  (`0x18e9e7278`) and `MKCoreLocationProvider _updateAuthorizationStatus`
+  (`0x18e9f55a4`) are patched in
+  `/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.05`. The two
+  getters return 1; `_updateAuthorizationStatus` caches status 3
+  (`authorizedAlways`), accuracy 0 (`fullAccuracy`) and flag `0x41`, then
+  returns. 38 bytes changed in three ranges at file offsets `0xdea0b0`,
+  `0xe03278`, `0xe115a4`; patched sha256 `83e36569...`; original
+  `7e8c9229...` is in the host temp dir. The file was staged at
+  `/var/local/dyld_shared_cache_arm64.05.new`, verified byte-for-byte,
+  atomically renamed over the live path, and loaded after a reboot. Maps no
+  longer hangs in `CLInternalGetAuthorizationStatus`; it reaches VectorKit
+  rendering.
+- **Next crash: `NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error:`.**
+  VectorKit's `ggl::MetalResourceManager::newShaderFunction` calls the legacy
+  `MTLPipelineLibrary` API, which SweetMetal2 does not implement. A binary
+  rename of the unused-looking `SweetTextureLayout copyFromLinearBytes:...`
+  selector fixed Maps but broke ImageIO's ASTC decoder: SpringBoard aborted in
+  `ASTCTwiddlerImpl::decodeAndCopyFromLinearDataImp` with
+  `-[SweetTextureLayout copyFromLinearBytes:...]: unrecognized selector` when
+  Settings/Maps opened. That binary was reverted;
+  `/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2` now points to
+  `/var/local/bin/SweetMetal2.revert` (the pre-patch 21,425,888-byte binary)
+  and Settings is stable again.
+- **Proper fix (source, not binary).**
+  `phone/metal2/NativeBridgeMetalFrontend.mm` now adds
+  `newFunctionWithName:constantValues:pipelineLibrary:error:` (forwards to the
+  sync variant), `NBRenderEncoder setDepthClipMode:` (no-op; the binary patch
+  previously supplied it), and fixes the ARC cast in `initLimits` that blocked
+  `build.sh`. Rebuild SweetMetal2 with the `userland` GitHub workflow (manual
+  dispatch), copy the artifact's `phone/metal2/out/` into the checkout, install
+  with `tools/cepheus-metal2-install.sh` or the staged-symlink swap, then
+  relaunch Maps. Until then Maps still aborts at the missing selector.
+
+### Maps: hangs on locationd's CLInternalService sync call; service is startup-queue only (2026-11-25)
+
+Maps launches to a blank dark screen. The hang is a synchronous CoreLocation
+call, not a renderer crash: `MKMapView _commonInit` -> `goToDefaultLocation` ->
+`_rotationPossible` -> `isAuthorizedForPreciseLocation` ->
+`MKCoreLocationProvider accuracyAuthorization` ->
+`xpc_connection_send_message_with_reply_sync` on locationd's synchronous
+service. Maps logs `CL: CLInternalGetAuthorizationStatus` and
+`#Cohorting Cannot deduce toSilo serviceName:CLInternalService`, then nothing.
+locationd never replies.
+
+- **What serves it.** `CLInternalService` is the daemon side of
+  `com.apple.locationd.synchronous`. locationd only manufactures it when a
+  client connection is already pending when the daemon starts; the daemon then
+  creates an `NSXPCListener` for `com.apple.locationd.synchronous`, resumes the
+  queued connections, and handles `_CLDaemonGetAuthorizationStatus`.
+  Evidence: `logs/runs/maps1/oslog-location2.txt` (12:32:58.303, daemon 5441)
+  and `logs/runs/maps20-oslog.txt` (09:16:49.307, daemon 725).
+- **Manufacture trigger is reproducible.** Run
+  `synclient com.apple.locationd.synchronous` continuously so every new daemon
+  finds a pending connection. In the 09:16 test the daemon resumed the queue
+  and handled `_CLDaemonGetAuthorizationStatus`; in the 09:20 test a fresh
+  daemon (805) served `#Spi` authorization requests for MapsSupport,
+  networkserviceproxy, symptomsd and others. `killloop locationd 9 50` also
+  worked but is no longer allowed: the maps33 SIGKILL storm hung the phone (see
+  below).
+- **The post-startup request still hangs.** Maps 817 launched at 09:20:53.889
+  against live daemon 805 with the listener already serving the startup queue;
+  its `CLInternalGetAuthorizationStatus` was never logged or served. Empty
+  `synclient` probes at 09:24 did get `kCLConnectionMessageError` replies, so
+  the listener accepts new connections. The last served `#Spi` request before
+  Maps was `NetworkServiceProxy.framework` at 09:20:50.253; the startup queue
+  also contains stale connections from dead pids (`SecTaskCopyDebugDescription:
+  No such process[509]`, entitlement errors). Working theory: a stale handler
+  blocks the service's serial queue, or launchd stops delivering new
+  connections after the startup drain.
+- **SweetMetal2 patch is installed but unproven.** The VectorKit Metal crash
+  (`MISSING NBRenderEncoder -setDepthClipMode:`) is patched by repurposing the
+  unused `setTileTexture:atIndex:` method-list entry as `setDepthClipMode:`
+  (IMP -> `ret`). The phone now has
+  `/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2` patched (original
+  kept as `SweetMetal2.orig`); `mtltest` on the phone resolves
+  `NBRenderEncoder setDepthClipMode:` and dlopens the bundle. It has not been
+  reached at runtime because the location hang comes first.
+- **maps33: endService NOP crashed before it could be tested.** The original
+  `endService` releases the `NSXPCListener` at ivar `0x840`
+  (`0x1012cfdac`, `bl _objc_release_x8`) and does not nil it. The test binary
+  replaced that instruction with `nop` (`1f 20 03 d5`), re-signed with the
+  original identifier/entitlements, and was installed directly at
+  `/usr/libexec/locationd` (not via a symlink). The daemon served the startup
+  queue, but the eighth `killloop` SIGKILL hung the phone before the listener's
+  survival could be probed, so the NOP's effect is unproven.
+- **maps33 was a hang, not a panic or battery shutdown.** The last locationd
+  log ends at 10:45:08.989 mid-startup; SSH then returned `Host is down`. TWRP
+  recovery showed no panic header in the XNU ring
+  (`pram: no panic header (magic 0)`), the ring stops mid-USB logging, and
+  dmesg says `PMIC@SID0 Power-on reason: Triggered from KPD (Power Key Press)
+  and 'cold' boot`. The `imem 77665500` in the shim log is its own
+  `RESTART_BOOTLOADER` cookie, not a crash reason. The SIGKILL storm is the
+  trigger; do not use `killloop` for listener tests. At most one controlled
+  restart (`psx -k locationd 9`) per boot.
+- **Original locationd restored, detours reverted (2026-11-25).** The patched
+  binary is parked at `/var/local/bin/locationd` (inactive);
+  `/usr/libexec/locationd` is the original again (patch site `24 03 03 94`,
+  sha256 `75066240...`), restarted once as pid 289 after a cold boot of
+  `safari4-cold.img`. `AutoShutdownDelay` (`com.apple.locationd`) and
+  `MKRotateEnabled` (`com.apple.Maps`, `com.apple.MapKit`) were deleted via
+  `as501 cfprefs ... current`; all read back `(unset)`.
+- **Next test (needs a charged battery).** Cold boot with `safari4-cold.img`
+  (kernel `bd6aa2bd...`, 0160+0161; args in
+  `logs/runs/safari4-cold/cmdline`), start one
+  `synclient com.apple.locationd.synchronous 120 1000` from early boot, and
+  launch Maps once. If Maps still hangs, stop probing the daemon queue: the
+  listener is drained after startup, so patch MapKit's
+  `isAuthorizedForPreciseLocation` / `MKCoreLocationProvider
+  accuracyAuthorization` to return a fixed authorization instead of the
+  synchronous call. New phone tools this session: `rename`, `mtltest`,
+  `killloop` (do not use), `as501`, `cfprefs`, `lsdir`.
+- **Client-side bypass identified: patch `MKCoreLocationProvider
+  accuracyAuthorization` (2026-11-25).** The crash report
+  `logs/runs/maps1/Maps-2026-11-24-104552.ips` confirms the exact stack:
+  `-[MKMapView(MKHeadingAdditions) _rotationPossible]` ->
+  `-[MKLocationManager isAuthorizedForPreciseLocation]` ->
+  `-[MKCoreLocationProvider accuracyAuthorization]` ->
+  `_accuracyAuthorizationOnQueue` -> `_updateAuthorizationStatus` ->
+  `xpc_connection_send_message_with_reply_sync` on
+  `com.apple.locationd.synchronous`. The shared-cache relative method list
+  was decoded with the cache's own base, not a guessed one:
+  `objc_opt_t.relativeMethodSelectorBaseAddressOffset` at
+  `__objc_opt_ro` (`0x1800e8a18`) is `0x21b0d87`, so the selector base is
+  `0x18229979f`; method entries are 12 bytes (header `0xC000000F`), with
+  the name offset relative to that base and types/IMP relative to their
+  own fields. Results:
+  `MKLocationManager isAuthorizedForPreciseLocation` IMP
+  `0x18e9ce0b0` (list `0x18eb8ad20`), and
+  `MKCoreLocationProvider accuracyAuthorization` IMP `0x18e9f4128`
+  (type `q16@0:8`, class_ro `0x1d629eed8`, list `0x18eb8a9a0`).
+  The latter is in `.05` at file offset `0xe10128`. The first idea was a
+  one-site `mov x0,#0; ret` at `accuracyAuthorization`, but the final patch
+  is the three-site version at the top of this section: force status 3 and
+  full accuracy in `_updateAuthorizationStatus`, and make
+  `isAuthorizedForPreciseLocation` / `isLocationServicesEnabled` return true.
+  The `.05` was backed up, staged, verified byte-for-byte, atomically renamed,
+  and tested after a reboot; see the top section for hashes and offsets.
 
 ### Video decode: YouTube fails because the port has no H.264 decoder (2026-11-24)
 
