@@ -23,7 +23,7 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   every run reached 12 `multisample texture`, 8 presents, 4 probes, and the 900x900
   surface with no `OutOfMemory(Device)`, then went idle. The old OOM logs
   (`/tmp/mtl2-afterallow.log`, `/tmp/mtl2-tap1.log`) are from long-running sessions
-  (backboardd uptime 21,224 s / 27,834 s, 556-1685 command buffers, 90-134
+  (backboardd uptime 21,224 s / 27,834 s, 362-1685 command buffers, 84-134
   pipelines), so the pool was probably consumed over time, not by five fresh frames.
   The BO-cache trim comment records the earlier failure mode: backboardd held 3099 MiB
   once the kernel stopped refusing allocations. A short run cannot prove the
