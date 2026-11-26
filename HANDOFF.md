@@ -5,6 +5,50 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: `0103` removes the 45.3 MB BOs; the map is still grey (2026-11-26)
+
+- **Build tested.** The `7084089` build (`0103` after `0102`, plus the BO
+  telemetry) was installed over Wi-Fi and `backboardd` restarted. New hashes:
+  `SweetMetal2` `c0835caae1e4...` (21,586,400 bytes), dylib
+  `75ba3cb03009...` (17,294,896 bytes), `CodeResources`
+  `e84b5ed68114...` (2,042 bytes). The old `249213913505...` files remain
+  backed up under `/private/var/folders/.../cepheus-before-249213913505/`.
+- **The pool fix works.** A 150 s debugserver zoom-out capture
+  (`/tmp/maps-ds-zoom-0103.log`, 10,572 bytes) has **no 45,334,528-byte lazy
+  BOs**: only 2 x 4,505,600 and 25 x 8,388,608 (20 fresh, 5 reused). The app
+  log (`/tmp/mtl2-0103-final.log`, 52,384 bytes) has no `OutOfMemory` and no
+  `command buffer refused`; the 12 memoryless 1125x2436 4x MSAA textures are
+  still created.
+- **But the map is grey.** The user saw the same grey start and then a
+  uniform grey map, with no black patches. The surface probes still show map
+  content: commit 11 `mean 93.9 92.6 9.2`, commit 905 `125.7 75.5 44.7`,
+  commit 1805 `100.4 113.5 105.5`. The resolve pass logs `color 0 load 0
+  store 2 usage 4 samples 4 storage 3; resolve usage 23 storage 0`; the
+  in-pass resolve writes the resolve texture and the probe reads it, so the
+  GPU work is right. The failure is presentation or composition.
+- **Frontend fix prepared (local, not pushed).**
+  `phone/metal2/NativeBridgeMetalFrontend.mm` now runs a scheduled/completed
+  handler added after the command buffer already scheduled/finished, as Metal
+  does; the old code stored it and never ran it. This matters because the
+  in-pass resolve makes the command buffer finish sooner than the exact
+  resolve did, so an app callback added late can be lost. The same change logs
+  every 300th direct present with the presented surface and the last resolve
+  surface, the layer's bounds/hidden/opacity/superlayer and
+  `presentsWithTransaction`/`displaySyncEnabled`/`maximumDrawableCount`/
+  `drawableSize`/`pixelFormat`/`framebufferOnly`/`opaque`, the first 8
+  presented-vs-resolve surface mismatches, and resolving command buffers with
+  no presentation.
+- **Next.** Build and install this frontend, repeat the debugserver zoom-out
+  capture, and read `drawable direct present ... last resolve ...`, `drawable
+  layer ...`, `presented surface ... differs ...`, and `resolving command
+  buffer ... has no presentation`. If the presented surface is the resolve
+  surface and the layer is visible, the remaining suspect is the window server
+  sampling the in-pass-resolved surface (layout/modifier or GPU cache flush);
+  if not, the app is presenting a different surface than the runtime wrote.
+- **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log` and
+  `mtl2-bo.log` were truncated. `backboardd` 1796, `SpringBoard` 1798.
+  Battery 50% (1650/3300), `ExternalConnected=Yes`; keep it charging and cool.
+
 ### Maps: the exact resolve, not the store op, backs the 45.3 MB MSAA BOs (2026-11-26)
 
 - **Build tested.** The `e275bc7` build (the `0102` patch and the BO
@@ -30,7 +74,7 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   samples for the drawn resolve after it, and Turnip backs the lazy
   attachment. The `0102` `store_op` change only affects attachments whose
   samples the runtime does not need after the pass.
-- **Fix prepared (local, not pushed).**
+- **Fix built and tested.**
   `phone/metal2/bridge/patches/0103-memoryless-in-pass-resolve.patch` clears
   `resolve.shader` for a **memoryless** color attachment, so the pass resolves
   in-pass by the device's `AVERAGE` instead of drawing the exact resolve after
@@ -39,12 +83,11 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   `DONT_CARE` (`dont_care.unless(unheld)`), so no lazy BO. It announces
   `Degradation::DeviceRoundedResolve`: a texel can differ by one unit at a
   rounding tie. Non-memoryless attachments keep the exact resolve. `0103`
-  applies after `0102` (`git apply` checked in order).
-- **Next.** Dispatch the `userland` workflow, install the new bundle, and
-  repeat the debugserver zoom-out capture. Expect the 45,334,528-byte BO lines
-  to disappear and the black screen to stop. If they persist, check that the
-  attachment's storage mode is 3 and log the resolve choice (`shader` Some/None)
-  at `render_pass.rs::layout`.
+  applies after `0102` (`git apply` checked in order). The 150 s capture has no
+  45,334,528-byte BOs; the grey-screen result is in the section above.
+- **Result.** The BOs are gone and the OOM/black patches are gone, but the map
+  is still grey. The frontend fix and diagnostics in the section above are the
+  next test.
 - **Phone state.** Maps and debugserver were killed after the test;
   `/var/local/mtl2.log` and `mtl2-bo.log` were truncated. `backboardd` 1257,
   `SpringBoard` 1259. Battery 54% (1782/3300), `ExternalConnected=Yes`; keep it

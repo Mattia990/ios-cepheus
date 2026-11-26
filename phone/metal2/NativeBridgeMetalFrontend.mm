@@ -42,6 +42,12 @@ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gComp
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImportLogs,gPassProbes,gViewportProbes,gScissorProbes,gPresentCalls;
+// Handlers and presentations added after the runtime already scheduled or completed a command
+// buffer: Metal still runs them, and a first-frame callback that arrives late must not be lost.
+// The presented surface and the last resolve surface say whether the app presents the frame the
+// runtime wrote.
+static std::atomic<uint64_t> gLateScheduled,gLateCompleted,gMissingPresentations,gPresentSurfaceMismatches;
+static std::atomic<uint32_t> gLastResolveSurface;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -954,7 +960,7 @@ static void scheduled(void *context);
    [_resourceOwners addObject:resolve];
    out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    // The command buffer owns the surface through `_surfaces` until `finish` probes it.
-   if(resolve.surface){_probeSurface=resolve.surface;registerSurfaceCommand(resolve.surface,self);}
+   if(resolve.surface){_probeSurface=resolve.surface;registerSurfaceCommand(resolve.surface,self);gLastResolveSurface.store(IOSurfaceGetID(resolve.surface));}
    resolvingPass=true;
    if(gResolves++==0)NBLOG(@"native-metal: pass resolves into %lux%lu (surface %d, samples %lu)",
        (unsigned long)resolve.width,(unsigned long)resolve.height,resolve.surface!=nil,(unsigned long)texture.sampleCount);
@@ -1001,8 +1007,28 @@ static void scheduled(void *context);
  NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.resolves=resolvingPass;
  return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
-- (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
-- (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+- (void)addScheduledHandler:(MTLCommandBufferHandler)block {
+ if(!block)return;
+ BOOL late=NO;
+ @synchronized(self){if(_schedulingDelivered)late=YES;else [_scheduledHandlers addObject:[block copy]];}
+ // A handler added after the command buffer scheduled still runs, as Metal's does.
+ if(late){
+  if(gLateScheduled++<4)NBLOG(@"native-metal: scheduled handler added after scheduling");
+  block((id<MTLCommandBuffer>)self);
+ }
+}
+- (void)addCompletedHandler:(MTLCommandBufferHandler)block {
+ if(!block)return;
+ BOOL late=NO;
+ @synchronized(self){if(self.finished)late=YES;else [_completedHandlers addObject:[block copy]];}
+ // A handler added after the command buffer completed still runs, as Metal's does: the app's
+ // first-frame callbacks can arrive after a fast command buffer has already finished.
+ if(late){
+  if(gLateCompleted++<4)NBLOG(@"native-metal: completed handler added after completion");
+  dispatch_queue_t queue=_queue.completionQueue;
+  if(queue)dispatch_async(queue,^{block((id<MTLCommandBuffer>)self);});else block((id<MTLCommandBuffer>)self);
+ }
+}
 // QuartzCore's drawable is real and owns the IOSurface this command buffer resolves into. Presenting it is the only
 // way the window server learns the frame is ready: without it the layer's three drawables run out and the render
 // loop stops after its first frames. The runtime's completion orders the present after the GPU writes, so the
@@ -1074,6 +1100,8 @@ static void scheduled(void *context);
  // drawable still holds the caller's previous frame and must not be presented.
  NSArray *presentations;
  @synchronized(self){self.finished=YES;presentations=[_presentations copy];[_presentations removeAllObjects];}
+ if(_probeSurface && presentations.count==0 && gMissingPresentations++<8)
+  NBLOG(@"native-metal: resolving command buffer %u has no presentation",self.commitIndex);
  if(!self.failedLocally)for(void (^present)(void) in presentations)present();
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
@@ -1789,20 +1817,31 @@ static uint32_t drawableSurfaceID(id drawable) {
 }
 // The drawable's layer is what the window server composites. Its geometry and visibility say whether a
 // presented surface can appear at all, independently of the resolve.
+static id layerValue(id layer,NSString *key) {
+ return [layer respondsToSelector:NSSelectorFromString(key)]?[layer valueForKey:key]:@"?";
+}
 static void logDrawableLayer(id drawable) {
  id layer=[drawable valueForKey:@"layer"];   // CAMetalDrawable's layer, not in the MTLDrawable protocol
  if(!layer)return;
  id superlayer=[layer valueForKey:@"superlayer"];
- NBLOG(@"native-metal: drawable layer %@ bounds %@ position %@ hidden %@ opacity %@ superlayer %@",
-       NSStringFromClass([layer class]),[layer valueForKey:@"bounds"],[layer valueForKey:@"position"],
-       [layer valueForKey:@"hidden"],[layer valueForKey:@"opacity"],
-       superlayer?NSStringFromClass([superlayer class]):@"none");
+ NBLOG(@"native-metal: drawable layer %@ bounds %@ position %@ hidden %@ opacity %@ superlayer %@ presentsWithTransaction %@ displaySyncEnabled %@ maximumDrawableCount %@ drawableSize %@ pixelFormat %@ framebufferOnly %@ opaque %@",
+       NSStringFromClass([layer class]),layerValue(layer,@"bounds"),layerValue(layer,@"position"),
+       layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),
+       superlayer?NSStringFromClass([superlayer class]):@"none",
+       layerValue(layer,@"presentsWithTransaction"),layerValue(layer,@"displaySyncEnabled"),
+       layerValue(layer,@"maximumDrawableCount"),layerValue(layer,@"drawableSize"),
+       layerValue(layer,@"pixelFormat"),layerValue(layer,@"framebufferOnly"),layerValue(layer,@"opaque"));
 }
 static void presentDrawableDirect(id drawable,const char *kind,void (^present)(void)) {
  const uint32_t surface=drawableSurfaceID(drawable);
- if(gDirectPresents==0)logDrawableLayer(drawable);
+ const uint64_t present=gDirectPresents++;
+ const uint32_t resolved=gLastResolveSurface.load();
+ if(present==0 || present%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
- if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct %s %@ surface %u (%s)",kind,NSStringFromClass([drawable class]),surface,commandBuffer?"deferred to completion":"immediate");
+ if(present<8 || present%300==299)
+  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,commandBuffer?"deferred to completion":"immediate");
+ if(surface!=resolved && gPresentSurfaceMismatches++<8)
+  NBLOG(@"native-metal: presented surface %u differs from the last resolve surface %u",surface,resolved);
  if(commandBuffer)[commandBuffer queuePresentation:present];else present();
 }
 static void drawablePresent(id self, SEL _cmd) {
