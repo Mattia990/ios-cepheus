@@ -28,6 +28,19 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   and the cache-trim comment's earlier 3099 MiB backboardd cache). Proving
   multi-hour stability still needs a soak or free/live BO logging; the current
   short-run evidence is clean.
+- **The old OOM follows the 900x900 surface.** In `/tmp/mtl2-tap1.log` the 900x900
+  `drawable surface` appears at line 325, then `rp20 dr81` command buffers, then the
+  OOM at line 546. Every new launch also creates a 900x900 surface but goes idle
+  before rendering it. The likely repro is a view transition (Look Around/3D) that
+  renders the 900x900 target while the main map's MSAA textures are still live;
+  opening it needs touch, which needs a full power-off cold boot on this image.
+- **Pending cache telemetry (source only, not installed).**
+  `phone/metal2/SweetMetal2.mm` now exports `sm2_bo_cache_stats` and appends a
+  `BO cache: lookups=... hits=... cached=... MiB peak=...` line to backboardd's
+  10 s telemetry; `NativeBridgeMetalFrontend.mm` logs the same line after each
+  `surface probe commit`. The installed bundle is still `abd5e650`; this needs a
+  `userland` dispatch and install. It will show whether the 900x900 transition
+  grows the cache in a soak.
 - **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log`
   and `/var/local/mtl2-bo.log` are truncated, as are the m2v stress logs.
   `backboardd` 3367, `SpringBoard` 3369. Battery 67% (2211/3300),

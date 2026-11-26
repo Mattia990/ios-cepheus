@@ -28,6 +28,7 @@
 #include "NativeBridgeMetalFrontend.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
+extern "C" void sm2_bo_cache_stats(char *out, size_t size);
 
 static NmbDevice *gDevice;
 static id gDeviceObject;
@@ -325,6 +326,7 @@ static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool compl
        sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,sum[3]/(double)samples,
        (unsigned long long)nonblack,(unsigned long long)samples,
        center[0],center[1],center[2],center[3],top[0],top[1],top[2],top[3]);
+ char bo[256];sm2_bo_cache_stats(bo,sizeof(bo));if(bo[0])NBLOG(@"native-metal: %s",bo);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;

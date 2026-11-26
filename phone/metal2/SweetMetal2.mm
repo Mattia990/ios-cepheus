@@ -48,6 +48,28 @@ static void sm2_log(const char *fmt, ...)
 	sm2_logs(buf);
 }
 
+/* The bundle's Turnip handle, for the BO-cache counters; set once the bridge has loaded the dylib. */
+static void *sm2_turnip_handle;
+
+extern "C" void sm2_bo_cache_stats(char *out, size_t size)
+{
+	if (!out || !size)
+		return;
+	out[0] = 0;
+	if (!sm2_turnip_handle)
+		return;
+	void (*stats)(uint64_t *) = (void (*)(uint64_t *))dlsym(sm2_turnip_handle, "tu_darwin_bo_cache_stats");
+	if (!stats)
+		return;
+	uint64_t s[8] = { 0 };
+	stats(s);
+	snprintf(out, size,
+		 "BO cache: lookups=%llu hits=%llu inserts=%llu evictions=%llu flushes=%llu cached=%llu MiB peak=%llu MiB holes=%llu",
+		 (unsigned long long)s[0], (unsigned long long)s[1], (unsigned long long)s[2],
+		 (unsigned long long)s[3], (unsigned long long)s[4], (unsigned long long)(s[5] >> 20),
+		 (unsigned long long)(s[6] >> 20), (unsigned long long)s[7]);
+}
+
 /*
  * The A640 does not snoop the CPU caches: libSystem's sys_dcache_flush (a no-op where the GPU is coherent) must
  * really clean and invalidate here. User space may (SCTLR_EL1.UCI). This definition wins at link time, for the
@@ -219,6 +241,7 @@ static bool listed(void)
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
 		void *th = dlopen(turnip.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+		sm2_turnip_handle = th;
 		void *vk = th ? dlsym(th, "vk_icdGetInstanceProcAddr") : NULL;
 		if (vk)
 			dladdr(vk, &tu);
@@ -232,6 +255,14 @@ static bool listed(void)
 						continue;
 					static char text[8192];
 					native_bridge_metal_telemetry(text, sizeof(text));
+					text[sizeof(text) - 1] = 0;
+					char bo[256];
+					sm2_bo_cache_stats(bo, sizeof(bo));
+					if (bo[0]) {
+						size_t used = strlen(text);
+						if (used < sizeof(text) - 2)
+							snprintf(text + used, sizeof(text) - used, "%s\n", bo);
+					}
 					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
 					if (fd >= 0) {
 						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
