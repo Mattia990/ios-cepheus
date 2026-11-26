@@ -311,9 +311,11 @@ static void flushSurfaces(NSMutableSet *surfaces) {
 // A resolved drawable's bytes, read after the CPU cache invalidation `finish` does: a non-black
 // mean here means the GPU wrote the map into the surface the layer displays. BGRA byte order.
 static std::atomic<uint64_t> gSurfaceProbes;
-// The compositor's display target (backboardd imports a 1125x2436 format-80 surface with usage
-// ShaderRead|RenderTarget). Probing it says whether the window server's output holds the map.
-static IOSurfaceRef gDisplaySurface;
+// The compositor's display targets (backboardd imports 1125x2436 format-80 surfaces with usage
+// ShaderRead|RenderTarget). Probing them says whether the window server's output holds the map.
+static IOSurfaceRef gDisplaySurfaces[4];
+static unsigned gDisplaySurfaceCount;
+static std::mutex gDisplaySurfaceLock;
 static void probeSurface(IOSurfaceRef surface,const char *what,uint32_t commit,bool completed) {
  if(!surface)return;
  const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),row=IOSurfaceGetBytesPerRow(surface);
@@ -1066,16 +1068,19 @@ static void scheduled(void *context);
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
  if(!drawable)return;
  if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@",NSStringFromClass([drawable class]));
+ [self addDrawable:drawable];
  [self queuePresentation:^{[drawable present];}];
 }
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime {
  if(!drawable)return;
  if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@ at %.3f",NSStringFromClass([drawable class]),presentationTime);
+ [self addDrawable:drawable];
  [self queuePresentation:^{[drawable presentAtTime:presentationTime];}];
 }
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
  if(!drawable)return;
  if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@ after %.3f",NSStringFromClass([drawable class]),duration);
+ [self addDrawable:drawable];
  [self queuePresentation:^{[drawable presentAfterMinimumDuration:duration];}];
 }
 - (void)enqueue {}
@@ -1111,10 +1116,17 @@ static void scheduled(void *context);
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
- // The first few resolved frames, then one every five seconds at 60 Hz: does the drawable hold
- // the render at all, and does it change once the map has had time to draw?
+ // The first few resolved frames, then at most one every five seconds: does the drawable hold
+ // the render at all, and does it change once the map has had time to draw? Time-based, because
+ // Maps commits slowly and a frame-count cadence may never reach a later frame.
  const uint64_t probes=gSurfaceProbes.fetch_add(1);
- const bool probeNow=probes<4 || probes%300==299;
+ static std::atomic<uint64_t> lastProbeUs;
+ bool probeNow=probes<4;
+ if(!probeNow) {
+  const uint64_t now=nowUs();
+  uint64_t last=lastProbeUs.load();
+  probeNow=now-last>5000000 && lastProbeUs.compare_exchange_strong(last,now);
+ }
  if(_probeSurface) {
   if(probeNow)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
   unregisterSurfaceCommand(_probeSurface,self);
@@ -1675,14 +1687,20 @@ static char sweetMemoryOwnerKey;
  if(gSurfaceImportLogs++<4)NBLOG(@"native-metal: drawable surface %u %zux%zu row %zu format %lu usage %llu storage %lu",
      IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
      (unsigned long)d.pixelFormat,(unsigned long long)d.usage,(unsigned long)d.storageMode);
- // backboardd's display target: the window server composites every app layer into this surface and
- // the display engine scans it out. Its contents separate a compositor failure from a scanout one.
- if(!gDisplaySurface && d.pixelFormat==MTLPixelFormatBGRA8Unorm &&
+ // backboardd's display targets: the window server composites every app layer into one of these and
+ // the display engine scans it out. Their contents separate a compositor failure from a scanout one.
+ // There can be several (double/triple buffered), so keep the first four and probe each in telemetry.
+ if(d.pixelFormat==MTLPixelFormatBGRA8Unorm &&
     d.usage==(MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget) &&
     IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436) {
-  gDisplaySurface=(IOSurfaceRef)CFRetain(surface);
-  NBLOG(@"native-metal: display surface %u %zux%zu row %zu",IOSurfaceGetID(surface),
-        IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface));
+  std::lock_guard<std::mutex> lock(gDisplaySurfaceLock);
+  bool seen=false;
+  for(unsigned i=0;i<gDisplaySurfaceCount;i++)if(gDisplaySurfaces[i]==surface)seen=true;
+  if(!seen && gDisplaySurfaceCount<4) {
+   gDisplaySurfaces[gDisplaySurfaceCount++]=(IOSurfaceRef)CFRetain(surface);
+   NBLOG(@"native-metal: display surface %u %zux%zu row %zu",IOSurfaceGetID(surface),
+         IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface));
+  }
  }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
@@ -1925,7 +1943,7 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  const uint32_t resolved=gLastResolveSurface.load();
  const BOOL main=[NSThread isMainThread];
  if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);}
- else if(presentCount==1 || presentCount%300==299)logDrawableLayer(drawable);
+ else if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  if(presentCount<8 || presentCount%300==299)
   NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,commandBuffer?"deferred to completion":"immediate");
@@ -2124,23 +2142,26 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
- // backboardd's display target, read from the window server's own telemetry: map content here
+ // backboardd's display targets, read from the window server's own telemetry: map content here
  // with a grey screen points at scanout, not at the app or the compositor's input.
- if(gDisplaySurface) {
-  const size_t width=IOSurfaceGetWidth(gDisplaySurface),height=IOSurfaceGetHeight(gDisplaySurface),pitch=IOSurfaceGetBytesPerRow(gDisplaySurface);
-  const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(gDisplaySurface);
-  if(base && width && height && pitch>=width*4) {
-   uint64_t sum[4]={0},samples=0;
-   for(size_t y=0;y<height;y+=32)for(size_t x=0;x<width;x+=32){
-    const uint8_t *p=base+y*pitch+x*4;
-    sum[0]+=p[0];sum[1]+=p[1];sum[2]+=p[2];sum[3]+=p[3];samples++;
-   }
-   const uint8_t *center=base+(height/2)*pitch+(width/2)*4;
-   const uint8_t *top=base+(height/8)*pitch+(width/2)*4;
-   row("D display id %u mean %.1f %.1f %.1f center %u,%u,%u upper %u,%u,%u",IOSurfaceGetID(gDisplaySurface),
-       sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
-       center[0],center[1],center[2],top[0],top[1],top[2]);
+ IOSurfaceRef displays[4];unsigned displayCount;
+ {std::lock_guard<std::mutex> lock(gDisplaySurfaceLock);displayCount=gDisplaySurfaceCount;
+  for(unsigned i=0;i<displayCount;i++)displays[i]=gDisplaySurfaces[i];}
+ for(unsigned i=0;i<displayCount;i++) {
+  IOSurfaceRef surface=displays[i];
+  const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),pitch=IOSurfaceGetBytesPerRow(surface);
+  const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
+  if(!base || !width || !height || pitch<width*4)continue;
+  uint64_t sum[4]={0},samples=0;
+  for(size_t y=0;y<height;y+=32)for(size_t x=0;x<width;x+=32){
+   const uint8_t *p=base+y*pitch+x*4;
+   sum[0]+=p[0];sum[1]+=p[1];sum[2]+=p[2];sum[3]+=p[3];samples++;
   }
+  const uint8_t *center=base+(height/2)*pitch+(width/2)*4;
+  const uint8_t *top=base+(height/8)*pitch+(width/2)*4;
+  row("D display %u id %u mean %.1f %.1f %.1f center %u,%u,%u upper %u,%u,%u",i,IOSurfaceGetID(surface),
+      sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
+      center[0],center[1],center[2],top[0],top[1],top[2]);
  }
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));

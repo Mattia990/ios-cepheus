@@ -39,13 +39,17 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   a grey compositor. It also logs the layer's contents and background, the
   full superlayer chain and the MetalLayer's siblings, whether the app calls
   `nextDrawable` and when it returns nil, whether the direct present came from
-  the main thread, and the thread that runs the deferred present. In
-  `backboardd` it records a `D display` telemetry row reading the 1125x2436
-  format-80 display surface: map content there with a grey screen points at
+  the main thread, and the thread that runs the deferred present. Drawables
+  passed to `[commandBuffer presentDrawable:]` are tracked too, not only
+  direct `[drawable present]`. Probes run on the first four completed command
+  buffers and then at most once every five seconds (time-based, because Maps
+  commits slowly). In `backboardd` it records a `D display` telemetry row for
+  each of the first four 1125x2436 format-80 display surfaces it imports
+  (double/triple buffering): map content there with a grey screen points at
   scanout, not at the app or the compositor's input.
 - **Next.** Build and install this frontend, repeat the debugserver zoom-out
-  capture, and read `drawable probe`, `surface probe`, `D display`, `drawable
-  layer ...`, `layer chain`, `layer sibling`, `nextDrawable`, `presenting ...
+  capture, and read `drawable probe`, `surface probe`, `D display 0..3`,
+  `drawable layer ...`, `layer chain`, `layer sibling`, `nextDrawable`, `presenting ...
   on the ... thread`, `presented surface ... differs ...`, and `resolving
   command buffer ... has no presentation`. If the drawable probe is grey while
   the resolve probe is map, the app presents a surface it did not render into.
