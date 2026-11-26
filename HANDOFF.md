@@ -5,6 +5,34 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: 60 m2vtest runs and 7 rendered launches leave the pool healthy (2026-11-26)
+
+- **Repeated process exits do not leak the kernel pool.** Ran `m2vtest` 60 times
+  against `abd5e650...` (phone-side loop, no debugger). Every run exited 0 with
+  `NativeAdreno BO cache: 37 allocations, 10 reused (27.0%), 27 cached now
+  (17 MiB), 0 evicted, 0 flushed, 1 free GPU ranges`. That is 1.02 GB of cached
+  BOs over the run; if the kernel kept them after exit, the 944 MB pool would have
+  failed near run 55. It did not. A single run with `3f799fdc...` printed the same
+  line, so the cache code and statistics are present in both A/B dylibs.
+- **Seven fully rendered Maps launches also pass.** Killed and relaunched Maps
+  seven times (Croatia URL, 8 s each, PIDs 3916/3927/3938/3948/3959/3970/3981).
+  Every launch reached 12 `multisample texture`, 8 `drawable direct present`,
+  4 `surface probe commit`, and no `OutOfMemory(Device)`; 84/56/28 total. If every
+  logged 45 MB MSAA texture stayed live, seven launches would be ~3.8 GB; the pool
+  stayed healthy. The old OOM log already contains the deferred-present lines, so
+  the deferral alone is not the differentiator; the shared frontend, kernel, and
+  BO-cache trim are in all current runs.
+- **What this rules out.** A leak across app exits and a simple fifth-frame
+  exhaustion are not present in this build. The historical OOM remains a
+  long-session/pool-state event (backboardd uptime 27,834 s, 299+ command buffers,
+  and the cache-trim comment's earlier 3099 MiB backboardd cache). Proving
+  multi-hour stability still needs a soak or free/live BO logging; the current
+  short-run evidence is clean.
+- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log`
+  and `/var/local/mtl2-bo.log` are truncated, as are the m2v stress logs.
+  `backboardd` 3367, `SpringBoard` 3369. Battery 67% (2211/3300),
+  `ExternalConnected=Yes`, `IsCharging=No`; keep it charging and cool.
+
 ### Maps: large lazy BOs logged; old OOM not reproduced in short runs; debugserver skill (2026-11-26)
 
 - **Installed build.** `libvulkan_freedreno` `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d`
@@ -51,12 +79,10 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   swallowed), the FrontBoard launcher ignores `QSetSTDERR`/`QSetSTDOUT` and the CLI
   stdio paths, and debugserver serves one connection then exits. Use raw RSP, not
   lldb (the 28 KB target XML hangs).
-- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2-bo.log` is
-  empty and `/var/local/mtl2.log` has ~2 KB of backboardd telemetry after truncation
-  (safe to truncate again). `backboardd` 3367, `SpringBoard` 3369. Battery 70%
-  (2310/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep it charging. Wi-Fi SSH
-  works; USB 2222 accepts TCP but the SSH banner times out, and 2223 is not usable
-  because the kernel file server starts only with the USB gadget.
+- **Phone state.** See the newer section above for the current state; this
+  paragraph records the state at the end of the A/B test. Wi-Fi SSH works; USB 2222
+  accepts TCP but the SSH banner times out, and 2223 is not usable because the
+  kernel file server starts only with the USB gadget.
 
 ### Boot: `boot` partition flashed with the iOS image; normal power-on boots iOS (2026-11-26)
 
