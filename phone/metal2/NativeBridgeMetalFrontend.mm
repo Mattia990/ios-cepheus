@@ -38,7 +38,7 @@ static void (*gMissing)(const char *, const char *);
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
-static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImportLogs,gPassProbes,gViewportProbes,gScissorProbes;
+static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImportLogs,gPassProbes,gViewportProbes,gScissorProbes,gPresentCalls;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -536,10 +536,10 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
 @property(atomic,copy) NSString *encodeFailure;
-@property(atomic) BOOL committed,failedLocally;
+@property(atomic) BOOL committed,failedLocally,finished;
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
-@property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+@property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers,*presentations;
 @property(nonatomic,strong) NSMutableSet *surfaces;
 // The last surface a resolving store action wrote: a one-shot probe reads it back after
 // GPU completion, so a black canvas says whether the drawable holds the render or not.
@@ -823,7 +823,7 @@ static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentations=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -926,6 +926,33 @@ static void scheduled(void *context);
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+// QuartzCore's drawable is real and owns the IOSurface this command buffer resolves into. Presenting it is the only
+// way the window server learns the frame is ready: without it the layer's three drawables run out and the render
+// loop stops after its first frames. The runtime's completion orders the present after the GPU writes, so the
+// compositor never samples a half-resolved surface.
+- (void)queuePresentation:(void (^)(void))block {
+ BOOL late=NO;
+ @synchronized(self){
+  if(self.finished)late=YES;else [_presentations addObject:[block copy]];
+ }
+ // A caller that presents after completion (unusual but legal on the drawable) still gets its frame shown.
+ if(late)block();
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+ if(!drawable)return;
+ if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@",NSStringFromClass([drawable class]));
+ [self queuePresentation:^{[drawable present];}];
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime {
+ if(!drawable)return;
+ if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@ at %.3f",NSStringFromClass([drawable class]),presentationTime);
+ [self queuePresentation:^{[drawable presentAtTime:presentationTime];}];
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+ if(!drawable)return;
+ if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@ after %.3f",NSStringFromClass([drawable class]),duration);
+ [self queuePresentation:^{[drawable presentAfterMinimumDuration:duration];}];
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
@@ -965,6 +992,11 @@ static void scheduled(void *context);
   const uint64_t probes=gSurfaceProbes.fetch_add(1);
   if(probes<4 || probes%300==299)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
  }
+ // Present after the probe has read the completed surface. A local refusal never reached the GPU, so its
+ // drawable still holds the caller's previous frame and must not be presented.
+ NSArray *presentations;
+ @synchronized(self){self.finished=YES;presentations=[_presentations copy];[_presentations removeAllObjects];}
+ if(!self.failedLocally)for(void (^present)(void) in presentations)present();
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -1654,9 +1686,42 @@ static void adoptMetalProtocols(void) {
  NBLOG(@"native-metal: Metal protocols adopted %u, missing %u",adopted,missing);
 }
 
+// QuartzCore's drawable can be presented directly ([drawable present]) rather than through the command buffer.
+// Log the first direct presents with the surface they carry: the phone log then says which path the app takes
+// and whether it presents the same surface the resolve probe reads. The wrappers call the original methods.
+static IMP gOriginalDrawablePresent,gOriginalDrawablePresentAtTime,gOriginalDrawablePresentAfterMinimumDuration;
+static std::atomic<uint64_t> gDirectPresents;
+static uint64_t drawableSurfaceID(id drawable) {
+ id texture=[(id)drawable texture];   // CAMetalDrawable's texture, not in the MTLDrawable protocol
+ if(![texture isKindOfClass:[NBTexture class]])return 0;
+ IOSurfaceRef surface=((NBTexture *)texture).surface;
+ return surface?IOSurfaceGetID(surface):0;
+}
+static void drawablePresent(id self, SEL _cmd) {
+ if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self));
+ ((void(*)(id,SEL))gOriginalDrawablePresent)(self,_cmd);
+}
+static void drawablePresentAtTime(id self, SEL _cmd, CFTimeInterval time) {
+ if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu at %.3f",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self),time);
+ ((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAtTime)(self,_cmd,time);
+}
+static void drawablePresentAfterMinimumDuration(id self, SEL _cmd, CFTimeInterval duration) {
+ if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu after %.3f",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self),duration);
+ ((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAfterMinimumDuration)(self,_cmd,duration);
+}
+static void installDrawablePresentHooks(void) {
+ Class cls=NSClassFromString(@"CAMetalDrawable");
+ if(!cls){NBLOG(@"native-metal: CAMetalDrawable not loaded; direct presents are not logged");return;}
+ Method m=class_getInstanceMethod(cls,@selector(present));
+ if(m){gOriginalDrawablePresent=method_getImplementation(m);method_setImplementation(m,(IMP)drawablePresent);}
+ m=class_getInstanceMethod(cls,@selector(presentAtTime:));
+ if(m){gOriginalDrawablePresentAtTime=method_getImplementation(m);method_setImplementation(m,(IMP)drawablePresentAtTime);}
+ m=class_getInstanceMethod(cls,@selector(presentAfterMinimumDuration:));
+ if(m){gOriginalDrawablePresentAfterMinimumDuration=method_getImplementation(m);method_setImplementation(m,(IMP)drawablePresentAfterMinimumDuration);}
+}
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
- gMissing=missing;gInFlight=[NSMutableSet set];
+ gMissing=missing;gInFlight=[NSMutableSet set];installDrawablePresentHooks();
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}

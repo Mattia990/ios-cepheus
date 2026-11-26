@@ -5,6 +5,40 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the resolve now writes the drawable; presentation is the gap (2026-11-26)
+
+- **The probe reads real content.** With the probe build installed (`4bab4e6b...` bundle,
+  `m2vtest` reports `resolve bad 0/4096`), a Maps launch logs drawable surfaces 188, 189,
+  and 190 at 1125x2436 row 4608, and the completed probe reads mean BGRA
+  `47.2 45.1 43.1 255.0`, `nonblack 43005/43005`, centre `51,49,45,255`, upper
+  `47,45,43,255`. The GPU is writing the resolved surface; this is no longer a black
+  drawable.
+- **But the panel is unchanged.** `/tmp/probe-shot.png` vs the pre-probe `burst-10.png`:
+  rows 127..2340 are channel-identical (0/7,170,120 differ, max delta 2); only the status
+  bar clock changed (10,469/411,480 channels, max delta 129). The drawable content never
+  reaches the window server, so the map area stays black and the top 127-row band remains
+  the stale launch snapshot.
+- **Why presentation is missing.** `NBCommandBuffer` implements no `presentDrawable:`;
+  Maps does not crash and logs no missing selector, so it checks `respondsToSelector:`
+  and skips presentation. The layer hands out three full-screen drawables (188/189/190)
+  and the render loop stalls, the classic exhausted `CAMetalLayer` pool.
+- **Fix (local, needs a workflow build).** `NBCommandBuffer` now implements
+  `presentDrawable:`, `presentDrawable:atTime:`, and
+  `presentDrawable:afterMinimumDuration:`. The drawable is presented in `finish` after
+  the probe, i.e. after GPU completion, so the compositor never samples a half-resolved
+  surface; a late present after completion is shown immediately. A diagnostic swizzle on
+  `CAMetalDrawable` logs the first direct `present` / `presentAtTime:` /
+  `presentAfterMinimumDuration:` calls with the drawable's surface ID, so the log says
+  whether Maps presents through the command buffer (new path) or the drawable directly.
+- **Next.** Rebuild with the `userland` workflow, install with
+  `tools/cepheus-metal2-install.sh`, relaunch Maps (Croatia URL), tap `Allow While Using
+  App`, then pull `/var/local/mtl2.log` and look for `present drawable` vs
+  `drawable direct present` and the surface IDs. Screenshot after the tap.
+- **Phone state at handoff.** Installed bundle is the probe build
+  `4bab4e6b389747980af1ed830504cbaa98b35e1e8df7c7562b544eb2cb734039`; `m2vtest` is
+  `1963eb07...`; Maps 5643 is running with the TCC alert up. Wi-Fi SSH and the file server
+  are reachable at 192.168.1.100; the USB Ethernet link (`en7`) is inactive on the host.
+
 ### Maps: black canvas is an unresolved 4x MSAA drawable; resolve plumbing added (2026-11-26)
 
 - **Where it stands.** The resolve plumbing works end to end: the installed bundle logs
