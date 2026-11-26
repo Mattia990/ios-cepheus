@@ -12,6 +12,10 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   `/System/Library/Extensions/SweetMetal2.bundle/libvulkan_freedreno.dylib` and
   `/var/local/bin/libvulkan_freedreno.dylib`; the bundle executable is the regular
   21,586,336-byte `SweetMetal2`, the same size as the previous build.
+- **Kernel/boot args unchanged.** `safari4-cold.img` (kernel `bd6aa2bd...`, 0160+0161);
+  the full args are in `logs/runs/safari4-cold/cmdline` (including `sweetmtl=2`,
+  `sweetgpu=1`, `cepheusreboot=1800`). These Maps tests changed only the userland
+  dylib, not the kernel or boot args.
 - **25 s debugserver run (Maps 2508, Croatia URL).** Captured 26 × 45,334,528-byte
   `lazy` BOs (`props=0`, `name=lazy vkAllocateMemory()`), 6 × 8,388,608 (`props=0x7`,
   one `reused`), and 2 × 4,505,600; 12 `multisample texture` lines (2 per frame),
