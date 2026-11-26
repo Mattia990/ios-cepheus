@@ -31,20 +31,26 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   handler added after the command buffer already scheduled/finished, as Metal
   does; the old code stored it and never ran it. This matters because the
   in-pass resolve makes the command buffer finish sooner than the exact
-  resolve did, so an app callback added late can be lost. The same change logs
-  every 300th direct present with the presented surface and the last resolve
-  surface, the layer's bounds/hidden/opacity/superlayer and
-  `presentsWithTransaction`/`displaySyncEnabled`/`maximumDrawableCount`/
-  `drawableSize`/`pixelFormat`/`framebufferOnly`/`opaque`, the first 8
-  presented-vs-resolve surface mismatches, and resolving command buffers with
-  no presentation.
+  resolve did, so an app callback added late can be lost. This is commit
+  `7519952` (local, not pushed).
+- **Presentation diagnostics added (local, not pushed).** The same file now
+  probes the **presented drawable's** IOSurface (not only the last resolve,
+  which can be an offscreen tile), so a grey drawable is distinguishable from
+  a grey compositor. It also logs the layer's contents and background, the
+  full superlayer chain and the MetalLayer's siblings, whether the app calls
+  `nextDrawable` and when it returns nil, whether the direct present came from
+  the main thread, and the thread that runs the deferred present. In
+  `backboardd` it records a `D display` telemetry row reading the 1125x2436
+  format-80 display surface: map content there with a grey screen points at
+  scanout, not at the app or the compositor's input.
 - **Next.** Build and install this frontend, repeat the debugserver zoom-out
-  capture, and read `drawable direct present ... last resolve ...`, `drawable
-  layer ...`, `presented surface ... differs ...`, and `resolving command
-  buffer ... has no presentation`. If the presented surface is the resolve
-  surface and the layer is visible, the remaining suspect is the window server
-  sampling the in-pass-resolved surface (layout/modifier or GPU cache flush);
-  if not, the app is presenting a different surface than the runtime wrote.
+  capture, and read `drawable probe`, `surface probe`, `D display`, `drawable
+  layer ...`, `layer chain`, `layer sibling`, `nextDrawable`, `presenting ...
+  on the ... thread`, `presented surface ... differs ...`, and `resolving
+  command buffer ... has no presentation`. If the drawable probe is grey while
+  the resolve probe is map, the app presents a surface it did not render into.
+  If the drawable probe is map but `D display` is grey, the compositor is not
+  sampling the layer. If both are map, the remaining suspect is scanout.
 - **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log` and
   `mtl2-bo.log` were truncated. `backboardd` 1796, `SpringBoard` 1798.
   Battery 50% (1650/3300), `ExternalConnected=Yes`; keep it charging and cool.

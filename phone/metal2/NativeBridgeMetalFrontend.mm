@@ -311,12 +311,15 @@ static void flushSurfaces(NSMutableSet *surfaces) {
 // A resolved drawable's bytes, read after the CPU cache invalidation `finish` does: a non-black
 // mean here means the GPU wrote the map into the surface the layer displays. BGRA byte order.
 static std::atomic<uint64_t> gSurfaceProbes;
-static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool completed) {
+// The compositor's display target (backboardd imports a 1125x2436 format-80 surface with usage
+// ShaderRead|RenderTarget). Probing it says whether the window server's output holds the map.
+static IOSurfaceRef gDisplaySurface;
+static void probeSurface(IOSurfaceRef surface,const char *what,uint32_t commit,bool completed) {
  if(!surface)return;
  const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),row=IOSurfaceGetBytesPerRow(surface);
  const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
  if(!base || !width || !height || row<width*4){
-  NBLOG(@"native-metal: surface probe commit %u: id %u has no mapping (%zux%zu row %zu)",commit,IOSurfaceGetID(surface),width,height,row);
+  NBLOG(@"native-metal: %s probe commit %u: id %u has no mapping (%zux%zu row %zu)",what,commit,IOSurfaceGetID(surface),width,height,row);
   return;
  }
  uint64_t sum[4]={0},samples=0,nonblack=0;
@@ -327,12 +330,18 @@ static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool compl
  }
  const uint8_t *center=base+(height/2)*row+(width/2)*4;
  const uint8_t *top=base+(height/8)*row+(width/2)*4;
- NBLOG(@"native-metal: surface probe commit %u%s id %u %zux%zu row %zu mean %.1f %.1f %.1f %.1f nonblack %llu/%llu center %u,%u,%u,%u upper %u,%u,%u,%u",
-       commit,completed?" (completed)":" (unsubmitted)",IOSurfaceGetID(surface),width,height,row,
+ NBLOG(@"native-metal: %s probe commit %u%s id %u %zux%zu row %zu mean %.1f %.1f %.1f %.1f nonblack %llu/%llu center %u,%u,%u,%u upper %u,%u,%u,%u",
+       what,commit,completed?" (completed)":" (unsubmitted)",IOSurfaceGetID(surface),width,height,row,
        sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,sum[3]/(double)samples,
        (unsigned long long)nonblack,(unsigned long long)samples,
        center[0],center[1],center[2],center[3],top[0],top[1],top[2],top[3]);
  char bo[256];sm2_bo_cache_stats(bo,sizeof(bo));if(bo[0])NBLOG(@"native-metal: %s",bo);
+}
+static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool completed) {
+ probeSurface(surface,"surface",commit,completed);
+}
+static void probeDrawableSurface(IOSurfaceRef surface,uint32_t commit,bool completed) {
+ probeSurface(surface,"drawable",commit,completed);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -579,6 +588,9 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers,*presentations;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+// The drawables this command buffer was asked to present: probing them after completion says
+// whether the surface the layer displays holds the frame, apart from any offscreen resolve.
+@property(nonatomic,strong) NSMutableSet *drawables;
 // The last surface a resolving store action wrote: a one-shot probe reads it back after
 // GPU completion, so a black canvas says whether the drawable holds the render or not.
 @property(nonatomic) IOSurfaceRef probeSurface;
@@ -590,6 +602,7 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
 - (void)queuePresentation:(void (^)(void))block;
+- (void)addDrawable:(id)drawable;
 @end
 // The app presents QuartzCore's drawable itself, immediately after commit, before the GPU has written the
 // resolved surface; the window server then samples the previous (cleared) frame. Map each resolved surface to
@@ -883,7 +896,7 @@ static void completed(void *context);
 static void scheduled(void *context);
 @implementation NBCommandBuffer
 - (instancetype)init {
- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentations=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentations=[NSMutableArray array];_surfaces=[NSMutableSet set];_drawables=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self)createdUs=nowUs();
  return self;
 }
@@ -1041,6 +1054,15 @@ static void scheduled(void *context);
  // A caller that presents after completion (unusual but legal on the drawable) still gets its frame shown.
  if(late)block();
 }
+// The drawable's texture is the IOSurface the layer shows. Keep it (and its surface) through
+// completion so `finish` can probe the exact bytes the compositor will sample.
+- (void)addDrawable:(id)drawable {
+ id texture=[(id)drawable texture];
+ if(![texture isKindOfClass:[NBTexture class]])return;
+ NBTexture *t=(NBTexture *)texture;
+ if(!t.surface)return;
+ @synchronized(self){[_drawables addObject:t];[_surfaces addObject:t];}
+}
 - (void)presentDrawable:(id<MTLDrawable>)drawable {
  if(!drawable)return;
  if(gPresentCalls++<8)NBLOG(@"native-metal: present drawable %@",NSStringFromClass([drawable class]));
@@ -1091,17 +1113,28 @@ static void scheduled(void *context);
  flushSurfaces(_surfaces);
  // The first few resolved frames, then one every five seconds at 60 Hz: does the drawable hold
  // the render at all, and does it change once the map has had time to draw?
+ const uint64_t probes=gSurfaceProbes.fetch_add(1);
+ const bool probeNow=probes<4 || probes%300==299;
  if(_probeSurface) {
-  const uint64_t probes=gSurfaceProbes.fetch_add(1);
-  if(probes<4 || probes%300==299)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
+  if(probeNow)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
   unregisterSurfaceCommand(_probeSurface,self);
  }
+ // The surface the app actually presents, which may not be the last resolve (offscreen tiles
+ // resolve too). A grey drawable here means the frame never reached the layer's IOSurface.
+ NSArray *drawables;
+ @synchronized(self){drawables=[_drawables copy];[_drawables removeAllObjects];}
+ if(drawables.count && probeNow)
+  for(NBTexture *texture in drawables)probeDrawableSurface(texture.surface,self.commitIndex,!self.failedLocally);
  // Present after the probe has read the completed surface. A local refusal never reached the GPU, so its
  // drawable still holds the caller's previous frame and must not be presented.
  NSArray *presentations;
  @synchronized(self){self.finished=YES;presentations=[_presentations copy];[_presentations removeAllObjects];}
  if(_probeSurface && presentations.count==0 && gMissingPresentations++<8)
   NBLOG(@"native-metal: resolving command buffer %u has no presentation",self.commitIndex);
+ static std::atomic<uint64_t> presentationThreadLogs;
+ if(presentations.count && presentationThreadLogs++<4)
+  NBLOG(@"native-metal: presenting %lu frame(s) on the %s thread",(unsigned long)presentations.count,
+        [NSThread isMainThread]?"main":"completion");
  if(!self.failedLocally)for(void (^present)(void) in presentations)present();
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
@@ -1642,6 +1675,15 @@ static char sweetMemoryOwnerKey;
  if(gSurfaceImportLogs++<4)NBLOG(@"native-metal: drawable surface %u %zux%zu row %zu format %lu usage %llu storage %lu",
      IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
      (unsigned long)d.pixelFormat,(unsigned long long)d.usage,(unsigned long)d.storageMode);
+ // backboardd's display target: the window server composites every app layer into this surface and
+ // the display engine scans it out. Its contents separate a compositor failure from a scanout one.
+ if(!gDisplaySurface && d.pixelFormat==MTLPixelFormatBGRA8Unorm &&
+    d.usage==(MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget) &&
+    IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436) {
+  gDisplaySurface=(IOSurfaceRef)CFRetain(surface);
+  NBLOG(@"native-metal: display surface %u %zux%zu row %zu",IOSurfaceGetID(surface),
+        IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface));
+ }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);
@@ -1820,29 +1862,88 @@ static uint32_t drawableSurfaceID(id drawable) {
 static id layerValue(id layer,NSString *key) {
  return [layer respondsToSelector:NSSelectorFromString(key)]?[layer valueForKey:key]:@"?";
 }
+// The layer's contents after a present is the surface the compositor samples; the class and
+// IOSurface ID say whether it is the drawable this command buffer just presented.
+static NSString *layerContents(id layer) {
+ id contents=[layer respondsToSelector:NSSelectorFromString(@"contents")]?[layer valueForKey:@"contents"]:nil;
+ if(!contents)return @"none";
+ const CFTypeID type=CFGetTypeID((__bridge CFTypeRef)contents);
+ if(type==IOSurfaceGetTypeID())
+  return [NSString stringWithFormat:@"IOSurface %u",IOSurfaceGetID((__bridge IOSurfaceRef)contents)];
+ return [NSString stringWithFormat:@"CFType %lu",(unsigned long)type];
+}
+// A layer's background colour is what shows where the layer has no contents: a grey map view
+// background behind an empty MetalLayer is the grey screen.
+static NSString *layerColor(id layer) {
+ id color=[layer respondsToSelector:NSSelectorFromString(@"backgroundColor")]?[layer valueForKey:@"backgroundColor"]:nil;
+ if(!color)return @"none";
+ return [NSString stringWithFormat:@"%@",color];   // a CGColor's description lists its components
+}
 static void logDrawableLayer(id drawable) {
  id layer=[drawable valueForKey:@"layer"];   // CAMetalDrawable's layer, not in the MTLDrawable protocol
  if(!layer)return;
  id superlayer=[layer valueForKey:@"superlayer"];
- NBLOG(@"native-metal: drawable layer %@ bounds %@ position %@ hidden %@ opacity %@ superlayer %@ presentsWithTransaction %@ displaySyncEnabled %@ maximumDrawableCount %@ drawableSize %@ pixelFormat %@ framebufferOnly %@ opaque %@",
+ NBLOG(@"native-metal: drawable layer %@ bounds %@ position %@ hidden %@ opacity %@ superlayer %@ presentsWithTransaction %@ displaySyncEnabled %@ maximumDrawableCount %@ drawableSize %@ pixelFormat %@ framebufferOnly %@ opaque %@ contents %@ bg %@",
        NSStringFromClass([layer class]),layerValue(layer,@"bounds"),layerValue(layer,@"position"),
        layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),
        superlayer?NSStringFromClass([superlayer class]):@"none",
        layerValue(layer,@"presentsWithTransaction"),layerValue(layer,@"displaySyncEnabled"),
        layerValue(layer,@"maximumDrawableCount"),layerValue(layer,@"drawableSize"),
-       layerValue(layer,@"pixelFormat"),layerValue(layer,@"framebufferOnly"),layerValue(layer,@"opaque"));
+       layerValue(layer,@"pixelFormat"),layerValue(layer,@"framebufferOnly"),layerValue(layer,@"opaque"),
+       layerContents(layer),layerColor(layer));
+}
+// Walk from the drawable's MetalLayer up to the window: a hidden or masked superlayer, or a
+// sibling drawn over it, hides a surface that presented correctly.
+static void logLayerChain(id drawable) {
+ id layer=[drawable valueForKey:@"layer"];
+ for(unsigned depth=0;depth<5 && layer;depth++) {
+  NBLOG(@"native-metal: layer chain %u %@ bounds %@ position %@ hidden %@ opacity %@ bg %@ contents %@",
+        depth,NSStringFromClass([layer class]),layerValue(layer,@"bounds"),layerValue(layer,@"position"),
+        layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),layerColor(layer),layerContents(layer));
+  // Siblings drawn after the MetalLayer hide it even when its own surface is correct.
+  if(depth==0) {
+   id superlayer=[layer valueForKey:@"superlayer"];
+   NSArray *sublayers=[superlayer valueForKey:@"sublayers"];
+   if([sublayers isKindOfClass:[NSArray class]]) {
+    const NSUInteger index=[sublayers indexOfObjectIdenticalTo:layer];
+    NBLOG(@"native-metal: layer siblings superlayer %@ index %lu count %lu",NSStringFromClass([superlayer class]),
+          (unsigned long)index,(unsigned long)sublayers.count);
+    for(NSUInteger i=0;i<sublayers.count && i<12;i++) {
+     id sibling=sublayers[i];
+     NBLOG(@"native-metal: layer sibling %lu %@ bounds %@ hidden %@ opacity %@ bg %@ contents %@",
+           (unsigned long)i,NSStringFromClass([sibling class]),layerValue(sibling,@"bounds"),
+           layerValue(sibling,@"hidden"),layerValue(sibling,@"opacity"),layerColor(sibling),layerContents(sibling));
+    }
+   }
+  }
+  layer=[layer valueForKey:@"superlayer"];
+ }
 }
 static void presentDrawableDirect(id drawable,const char *kind,void (^present)(void)) {
  const uint32_t surface=drawableSurfaceID(drawable);
- const uint64_t present=gDirectPresents++;
+ const uint64_t presentCount=gDirectPresents++;
  const uint32_t resolved=gLastResolveSurface.load();
- if(present==0 || present%300==299)logDrawableLayer(drawable);
+ const BOOL main=[NSThread isMainThread];
+ if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);}
+ else if(presentCount==1 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
- if(present<8 || present%300==299)
-  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,commandBuffer?"deferred to completion":"immediate");
+ if(presentCount<8 || presentCount%300==299)
+  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,commandBuffer?"deferred to completion":"immediate");
  if(surface!=resolved && gPresentSurfaceMismatches++<8)
   NBLOG(@"native-metal: presented surface %u differs from the last resolve surface %u",surface,resolved);
- if(commandBuffer)[commandBuffer queuePresentation:present];else present();
+ if(commandBuffer){[commandBuffer addDrawable:drawable];[commandBuffer queuePresentation:present];}else present();
+}
+// The layer's nextDrawable says whether the app still gets a drawable from CoreAnimation's
+// three-deep pool; a nil after the first frames means a deferred present never returned one.
+static IMP gOriginalNextDrawable;
+static std::atomic<uint64_t> gNextDrawables;
+static id layerNextDrawable(id self, SEL _cmd) {
+ id drawable=((id(*)(id,SEL))gOriginalNextDrawable)(self,_cmd);
+ const uint32_t surface=drawable?drawableSurfaceID(drawable):0;
+ const uint64_t n=gNextDrawables++;
+ if(n<12 || !drawable || n%120==119)
+  NBLOG(@"native-metal: nextDrawable %@ surface %u",drawable?NSStringFromClass([drawable class]):@"nil",surface);
+ return drawable;
 }
 static void drawablePresent(id self, SEL _cmd) {
  presentDrawableDirect(self,"present",^{((void(*)(id,SEL))gOriginalDrawablePresent)(self,_cmd);});
@@ -1854,6 +1955,8 @@ static void drawablePresentAfterMinimumDuration(id self, SEL _cmd, CFTimeInterva
  presentDrawableDirect(self,"present after",^{((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAfterMinimumDuration)(self,_cmd,duration);});
 }
 static void installDrawablePresentHooks(void) {
+ Class layer=NSClassFromString(@"CAMetalLayer");
+ if(layer){Method m=class_getInstanceMethod(layer,@selector(nextDrawable));if(m){gOriginalNextDrawable=method_getImplementation(m);method_setImplementation(m,(IMP)layerNextDrawable);}}
  Class cls=NSClassFromString(@"CAMetalDrawable");
  if(!cls){NBLOG(@"native-metal: CAMetalDrawable not loaded; direct presents are not logged");return;}
  Method m=class_getInstanceMethod(cls,@selector(present));
@@ -2021,6 +2124,24 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
+ // backboardd's display target, read from the window server's own telemetry: map content here
+ // with a grey screen points at scanout, not at the app or the compositor's input.
+ if(gDisplaySurface) {
+  const size_t width=IOSurfaceGetWidth(gDisplaySurface),height=IOSurfaceGetHeight(gDisplaySurface),pitch=IOSurfaceGetBytesPerRow(gDisplaySurface);
+  const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(gDisplaySurface);
+  if(base && width && height && pitch>=width*4) {
+   uint64_t sum[4]={0},samples=0;
+   for(size_t y=0;y<height;y+=32)for(size_t x=0;x<width;x+=32){
+    const uint8_t *p=base+y*pitch+x*4;
+    sum[0]+=p[0];sum[1]+=p[1];sum[2]+=p[2];sum[3]+=p[3];samples++;
+   }
+   const uint8_t *center=base+(height/2)*pitch+(width/2)*4;
+   const uint8_t *top=base+(height/8)*pitch+(width/2)*4;
+   row("D display id %u mean %.1f %.1f %.1f center %u,%u,%u upper %u,%u,%u",IOSurfaceGetID(gDisplaySurface),
+       sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
+       center[0],center[1],center[2],top[0],top[1],top[2]);
+  }
+ }
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
  row("T function n=%llu total=%llums max=%llums",
