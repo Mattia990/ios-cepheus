@@ -5,6 +5,48 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: BO-cache telemetry build installed; clean launch (2026-11-26)
+
+- **Installed build.** The user built the bundle in `phone/metal2/out/`; it
+  contains the `6178cb2` telemetry. Installed over Wi-Fi: `SweetMetal2`
+  `c7e0cf9e872a54786ee0e6add44234e15e0cf4eabf351c88d179d95d5c7ab57b`
+  (21,586,400 bytes), `libvulkan_freedreno.dylib`
+  `02fc875eeda7fc786c46d8cc93fb7e002087683a49605776478cb52506d63bc1`
+  (17,294,896 bytes, `tu_darwin_bo_cache_stats` at `0x10a4c4`), and the matching
+  `_CodeSignature/CodeResources` (2,042 bytes). `Info.plist` is unchanged
+  (`82f7230b...`). Both the bundle dylib and
+  `/var/local/bin/libvulkan_freedreno.dylib` are `02fc875e...`; the old
+  `abd5e650...` is saved as
+  `/var/local/bin/libvulkan_freedreno.abd5e650f9f1.dylib`, the old executable as
+  `/var/local/bin/SweetMetal2.before-c7e0cf9e`, and the old resource seal as
+  `/var/local/bin/CodeResources.before-c7e0cf9e`.
+- **Wi-Fi install path.** The kernel file server is not available over Wi-Fi, so
+  the files were uploaded with the phone's own `scp` in sink mode (`scp-put.py` in
+  the debugserver skill) to content-addressed names under `/var/local/bin`,
+  hash-checked by pulling them back, then swapped with the phone's atomic
+  `rename`. No running mapped file was overwritten. `backboardd` was restarted
+  (new PIDs 4738, `SpringBoard` 4740).
+- **New telemetry works.** backboardd's first 10 s line:
+  `BO cache: lookups=67 hits=8 inserts=14 evictions=6 flushes=0 cached=0 MiB
+  peak=0 MiB holes=1`. A Maps launch (PID 4779, Croatia URL) logged the same line
+  after each probe: lookups 34→44→45→51, hits 9→11→12→14, inserts 13→15→17→18,
+  evictions 0→0→0→3, `cached=0 MiB`, `peak=0 MiB`, holes 1→1→1→4. The cache is
+  empty at each probe; `peak` stays 0 despite inserts, so either the CI dylib's
+  stats layout/peak tracking differs from the local source or the field is not
+  the one labeled. The first four counters and `holes` are usable; do not read
+  `cached`/`peak` as proof of no growth yet.
+- **Launch result.** 12 `multisample texture`, 8 `drawable direct present`,
+  4 `surface probe commit`, 900x900 surface 315 after the probes, no
+  `OutOfMemory(Device)`, probe commit 11 mean `93.9 92.6 9.2 255.0`. The app
+  stayed alive; it was killed after the test and both logs were truncated.
+- **Open.** The 900x900 transition still needs touch (full power-off cold boot).
+  The new `BO cache:` line should show whether it grows the cache/holes; battery
+  is low, so a soak is deferred.
+- **Phone state.** Maps/debugserver off; `backboardd` 4738, `SpringBoard` 4740;
+  `/var/local/mtl2.log` has only post-truncate backboardd telemetry,
+  `/var/local/mtl2-bo.log` empty. Battery 64% (2112/3300),
+  `ExternalConnected=Yes`, `IsCharging=No`; keep it charging and cool.
+
 ### Maps: 60 m2vtest runs and 7 rendered launches leave the pool healthy (2026-11-26)
 
 - **Repeated process exits do not leak the kernel pool.** Ran `m2vtest` 60 times
@@ -34,18 +76,15 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   before rendering it. The likely repro is a view transition (Look Around/3D) that
   renders the 900x900 target while the main map's MSAA textures are still live;
   opening it needs touch, which needs a full power-off cold boot on this image.
-- **Pending cache telemetry (source only, not installed).**
-  `phone/metal2/SweetMetal2.mm` now exports `sm2_bo_cache_stats` and appends a
-  `BO cache: lookups=... hits=... cached=... MiB peak=...` line to backboardd's
-  10 s telemetry; `NativeBridgeMetalFrontend.mm` logs the same line after each
-  `surface probe commit`. The installed bundle is still `abd5e650`; this needs a
-  `userland` dispatch and install. It will show whether the 900x900 transition
-  grows the cache in a soak.
-- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log`
-  is truncated (backboardd telemetry regrows it), `/var/local/mtl2-bo.log` is
-  empty, and the m2v stress logs are truncated. `backboardd` 3367, `SpringBoard`
-  3369. Battery 66% (2178/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep
-  it charging and cool.
+- **Cache telemetry is now installed.** The source change in `6178cb2` built
+  into `c7e0cf9e`/`02fc875e` and logs a `BO cache:` line after each probe; see
+  the newest section for the first results.
+- **Phone state at the end of this stress test.** Maps and debugserver were not
+  running; `/var/local/mtl2.log` was truncated (backboardd telemetry regrows it),
+  `/var/local/mtl2-bo.log` was empty, and the m2v stress logs were truncated.
+  `backboardd` 3367, `SpringBoard` 3369. Battery 66% (2178/3300),
+  `ExternalConnected=Yes`, `IsCharging=No`; current state is in the newest
+  section.
 
 ### Maps: large lazy BOs logged; old OOM not reproduced in short runs; debugserver skill (2026-11-26)
 
