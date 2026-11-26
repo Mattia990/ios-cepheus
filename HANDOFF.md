@@ -5,7 +5,7 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Maps: large lazy BOs logged; no fifth-frame OOM; debugserver skill (2026-11-26)
+### Maps: large lazy BOs logged; old OOM not reproduced in short runs; debugserver skill (2026-11-26)
 
 - **Installed build.** `libvulkan_freedreno` `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d`
   (17,294,896 bytes, contains `NativeAdreno BO:`) is in
@@ -17,16 +17,26 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   one `reused`), and 2 × 4,505,600; 12 `multisample texture` lines (2 per frame),
   8 `drawable direct present` lines, 4 probes, 900x900 surface 146, and no
   `OutOfMemory(Device)`. Probe commit 11 read mean BGRA `93.9 92.6 9.2 255.0`.
-- **The old build OOM'd at this point.** The `3f799fdc...` dylib failed at the fifth
-  frame with a 900x900 BGRA8 surface and `endEncoding: OutOfMemory(Device)`; the
-  `abd5e650...` build reached the same surface/probe point. A full-speed `openapp`
-  run (Maps 2832/2859) also reached 8 presents/4 probes and the 900x900 surface with
-  no OOM, then Maps went idle; it did not exercise continuous rendering.
+- **Short A/B test: the old OOM does not reproduce.** The old `3f799fdc...` dylib was
+  swapped back into the bundle and tested at full speed with the Croatia URL, a
+  driving-directions URL, and a 12-step camera URL loop (Maps 3044/3076/3179/3237):
+  every run reached 12 `multisample texture`, 8 presents, 4 probes, and the 900x900
+  surface with no `OutOfMemory(Device)`, then went idle. The old OOM logs
+  (`/tmp/mtl2-afterallow.log`, `/tmp/mtl2-tap1.log`) are from long-running sessions
+  (backboardd uptime 21,224 s / 27,834 s, 556-1685 command buffers, 90-134
+  pipelines), so the pool was probably consumed over time, not by five fresh frames.
+  The BO-cache trim comment records the earlier failure mode: backboardd held 3099 MiB
+  once the kernel stopped refusing allocations. A short run cannot prove the
+  `abd5e650...` build fixes that; a multi-hour soak or free/live BO logging is needed.
+- **Restored build.** The bundle was swapped back to `abd5e650...`; the pulled bundle
+  dylib hashes to `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d`
+  (17,294,896 bytes). `/var/local/bin/libvulkan_freedreno.dylib` is the same build;
+  `/var/local/bin/libvulkan_freedreno.3f799fdcf46e.dylib` is the old one for A/B tests.
 - **Caveat.** 26 × 45,334,528 is 1.18 GB, more than the 944 MB pool, so the lazy VMAs
   cannot all be physically backed. The depth attachment (`load 0 store 0`) should
-  never be backed. The next step is to log BO free/live transitions or the first
-  backing event, and to repeat the run without debugserver stderr logging (the pty
-  write slows the app and may mask a timing-dependent pool exhaustion).
+  never be backed; the 45 MB number is the requested image size, not live memory.
+  The next step is to log BO free/live transitions (per process, shared file) and
+  run a long soak; a short run without the debugger's pty is not enough.
 - **Debugserver skill.** Workspace `.opencode/skills/cepheus-debugserver/SKILL.md`
   documents the tested raw-RSP workflow: `--launch=frontboard [::1]:PORT`, SSH `-L`,
   `A`, `qLaunchSuccess`, `c`, O-packet stderr capture, `^C`, `D`; scripts
@@ -35,11 +45,11 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   swallowed), the FrontBoard launcher ignores `QSetSTDERR`/`QSetSTDOUT` and the CLI
   stdio paths, and debugserver serves one connection then exits. Use raw RSP, not
   lldb (the 28 KB target XML hangs).
-- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log` is
-  truncated. `backboardd` 591, `SpringBoard` 593. Battery 72% (2376/3300),
-  `ExternalConnected=Yes`, `IsCharging=No`; keep it charging. Wi-Fi SSH works; USB
-  2222 accepts TCP but the SSH banner times out, and 2223 is not usable because the
-  kernel file server starts only with the USB gadget.
+- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log` and
+  `/var/local/mtl2-bo.log` are truncated. `backboardd` 3367, `SpringBoard` 3369.
+  Battery 70% (2310/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep it charging.
+  Wi-Fi SSH works; USB 2222 accepts TCP but the SSH banner times out, and 2223 is not
+  usable because the kernel file server starts only with the USB gadget.
 
 ### Boot: `boot` partition flashed with the iOS image; normal power-on boots iOS (2026-11-26)
 
