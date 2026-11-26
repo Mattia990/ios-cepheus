@@ -42,9 +42,10 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   `userland` dispatch and install. It will show whether the 900x900 transition
   grows the cache in a soak.
 - **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log`
-  and `/var/local/mtl2-bo.log` are truncated, as are the m2v stress logs.
-  `backboardd` 3367, `SpringBoard` 3369. Battery 67% (2211/3300),
-  `ExternalConnected=Yes`, `IsCharging=No`; keep it charging and cool.
+  is truncated (backboardd telemetry regrows it), `/var/local/mtl2-bo.log` is
+  empty, and the m2v stress logs are truncated. `backboardd` 3367, `SpringBoard`
+  3369. Battery 66% (2178/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep
+  it charging and cool.
 
 ### Maps: large lazy BOs logged; old OOM not reproduced in short runs; debugserver skill (2026-11-26)
 
