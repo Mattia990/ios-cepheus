@@ -23,6 +23,22 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   git. The general rule for future images/partitions is still `fastboot boot` only; this
   was a deliberate one-device exception.
 
+### Maps: large-BO logging added to the Darwin backend (2026-11-26)
+
+- **Patch (working tree, Turnip subrepo).** `work/turnip/mesa/src/freedreno/vulkan/tu_knl_darwin.cc`
+  now logs every BO of 2 MiB or more:
+  `NativeAdreno BO: <size> bytes (alloc <n>)[ lazy][ reused] props=<flags> name=<name>`.
+  A memoryless MSAA target that is only resolved should stay a lazy VMA; a 43.8 MB `lazy` BO
+  means the runtime backed it. The file is untracked in the Turnip subrepo (as before), so the
+  build must take the working tree.
+- **Next.** Build/install the userland bundle, launch Maps with the Croatia URL, allow location,
+  and pull `/var/local/mtl2.log`. Count the 43.8 MB `lazy` BOs and compare with the 12
+  `multisample texture` lines; if all 12 are backed, the fix is in the memoryless
+  resolve/attachment path, not the descriptor. If no large lazy BOs appear, the pool is consumed
+  by other BOs (the log lists them).
+- **Phone state.** iOS boots from the flashed `boot` partition; Maps is not running. Keep it
+  charging before the next GPU test.
+
 ### Maps: the app already requests Memoryless MSAA; the fifth frame still OOMs (2026-11-26)
 
 - **New bundle installed.** `601e3d640fb8675a3ce65589bec3eb216edafaa2673342e426935ef0f3e1ee1a`
