@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 #include <sys/mman.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -191,6 +193,34 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ return true;
+}
+// Maps' 4x MSAA render targets are the largest GPU allocations the map makes: 43.8 MB each at
+// 1125x2436, against the kernel's 944 MB GPU pool. A transient multisample attachment needs no RAM
+// between passes: Turnip's Darwin backend gives a lazily allocated image a GPU range alone until a
+// pass loads or stores it (the same memory Metal's memoryless storage uses). Opt in with this file,
+// so a pass whose store action needs the attachment's contents is not refused before the store
+// actions have been read from the log. The check is cached per process: create the file, then
+// relaunch the app.
+static std::atomic<uint64_t> gMultisampleLogs;
+static bool memorylessMultisampleEnabled(void) {
+ static int enabled=-1;
+ if(enabled<0) {
+  const char *name=getprogname();
+  enabled=access("/var/local/mtl2-memoryless-msaa",F_OK)==0 && name && strstr(name,"Maps")?1:0;
+ }
+ return enabled==1;
+}
+// Rewrite only a texture that is a multisample render target and nothing else: a color attachment
+// Metal cannot sample (multisample textures are not sampled), whose contents the app can only
+// resolve. A depth or stencil attachment is left alone: its pass may store it for a later test.
+static bool memorylessMultisampleDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
+ if(!memorylessMultisampleEnabled() || d.sampleCount<2)return false;
+ if(d.textureType!=MTLTextureType2DMultisample && d.textureType!=MTLTextureType2DMultisampleArray)return false;
+ if(d.usage!=MTLTextureUsageRenderTarget)return false;
+ const MTLStorageMode storage=(MTLStorageMode)((d.resourceOptions&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);
+ if(storage!=MTLStorageModePrivate)return false;
+ out->options=(out->options&~(uint64_t)MTLResourceStorageModeMask)|((uint64_t)MTLStorageModeMemoryless<<MTLResourceStorageModeShift);
  return true;
 }
 @implementation NBTexture
@@ -937,7 +967,30 @@ static void scheduled(void *context);
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
- if(resolvingPass && gPassProbes++<4)NBLOG(@"native-metal: resolve pass %lux%lu raster samples %lu",(unsigned long)pass.width,(unsigned long)pass.height,(unsigned long)pass.samples);
+ if(resolvingPass && gPassProbes++<4) {
+  NBLOG(@"native-metal: resolve pass %lux%lu raster samples %lu",(unsigned long)pass.width,(unsigned long)pass.height,(unsigned long)pass.samples);
+  // The store actions decide whether a memoryless multisample attachment can stand in for the
+  // app's private one: `MultisampleResolve` and `DontCare` need no contents, `Store` and
+  // `StoreAndMultisampleResolve` do.
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   if(!c.texture || ![c.texture isKindOfClass:[NBTexture class]])continue;
+   NBTexture *t=(NBTexture *)c.texture,*r=[c.resolveTexture isKindOfClass:[NBTexture class]]?(NBTexture *)c.resolveTexture:nil;
+   NmbTextureDescriptor td={},rd={};nmb_texture_describe(t.handle,&td);if(r)nmb_texture_describe(r.handle,&rd);
+   NBLOG(@"native-metal: resolve pass color %u load %lu store %lu usage %llu samples %lu storage %u; resolve usage %llu storage %u",
+         i,(unsigned long)c.loadAction,(unsigned long)c.storeAction,(unsigned long long)t.descriptor.usage,
+         (unsigned long)td.samples,(unsigned)((td.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift),
+         r?(unsigned long long)r.descriptor.usage:0ULL,
+         r?(unsigned)((rd.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift):0U);
+  }
+  if(d.depthAttachment.texture && [d.depthAttachment.texture isKindOfClass:[NBTexture class]]) {
+   NBTexture *t=(NBTexture *)d.depthAttachment.texture;NmbTextureDescriptor td={};nmb_texture_describe(t.handle,&td);
+   NBLOG(@"native-metal: resolve pass depth load %lu store %lu usage %llu samples %lu storage %u",
+         (unsigned long)d.depthAttachment.loadAction,(unsigned long)d.depthAttachment.storeAction,
+         (unsigned long long)t.descriptor.usage,(unsigned long)td.samples,
+         (unsigned)((td.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift));
+  }
+ }
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
   [_resourceOwners addObject:d.visibilityResultBuffer];
@@ -1536,9 +1589,21 @@ static char sweetMemoryOwnerKey;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ const NmbTextureDescriptor original=descriptor;
+ const bool memoryless=memorylessMultisampleDescriptor(d,&descriptor);
+ if(d.sampleCount>1 && gMultisampleLogs++<12) {
+  const unsigned storage=(unsigned)((original.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);
+  NBLOG(@"native-metal: multisample texture %lux%lu type %lu samples %lu usage %llu storage %u%s",
+        (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.textureType,(unsigned long)d.sampleCount,
+        (unsigned long long)d.usage,storage,memoryless?" -> memoryless":"");
+ }
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+ NBTexture *texture=[NBTexture new];texture.handle=handle;
+ // The app sees the descriptor it asked for; only the runtime's image is memoryless.
+ if(memoryless)texture.descriptor=original;
+ else {nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;}
+ return (id<MTLTexture>)texture;
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.

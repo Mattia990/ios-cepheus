@@ -5,6 +5,37 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the fifth frame exhausts the kernel's 944 MB GPU pool (2026-11-26)
+
+- **Presentation is fixed; the map is black because the GPU pool is full.** With the
+  deferral build installed, the app's drawable is composited, but after the location grant
+  the fifth frame's `endEncoding` fails with `OutOfMemory(Device)`.
+- **Not an app memory limit.** `footprint` says Maps 7201 is 287 MB (RSS 408 MB);
+  SpringBoard 153 MB and backboardd 217 MB. The OOM is a Vulkan device allocation, not
+  jetsam.
+- **The kernel GPU pool is 944 MB.** xnu patch 0115 (`sweet_gpu_pool_alloc`) gives the GPU
+  448 MB at `0xc4000000` and 496 MB at `0xe1000000`; a failed allocation logs
+  `pool: no <n> bytes free (<m> MB in use)`. A 4x MSAA colour target at 1125x2436 is
+  43.8 MB; the app renders about three full-screen passes per frame, so four frames
+  exhaust the pool and the fifth allocation fails.
+- **Turnip supports lazy allocation.** The Darwin backend's
+  `VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT` type gives a transient attachment a GPU range
+  alone until a pass loads or stores it. The new build logs every multisample texture and
+  each resolving pass's colour/depth load/store actions, and converts a `Private`
+  multisample colour render target to `Memoryless` for Maps only when
+  `/var/local/mtl2-memoryless-msaa` exists (checked once per process).
+- **Next.** Build `userland`, install, launch Maps with the Croatia URL. First run without
+  the file: the log should show `multisample texture ... samples 4 usage 4 storage 2` and
+  `resolve pass color 0 load 2 store 2 ...` (load Clear, store MultisampleResolve). If the
+  store action is `MultisampleResolve` (2) or `DontCare` (0), create
+  `/var/local/mtl2-memoryless-msaa`, kill and relaunch Maps, and check whether the fifth
+  frame still OOMs and whether the map draws. If it does, make the conversion
+  unconditional.
+- **Phone state at handoff.** Installed bundle is `8291cfa948e858c80643ff1a96f08a6e5df18b82969f1155df326511b674a090`;
+  `m2vtest` is `f85261bba2495a9f338b9f91dd48cee44016ca5e5db550e69306ed32feb8dd17`.
+  Maps 7201 is running with the black map. Wi-Fi SSH and the file server are reachable at
+  192.168.1.100.
+
 ### Maps: presentation is fixed; the map itself is still uniform gray (2026-11-26)
 
 - **The deferral works.** The `8291cfa9...` bundle (contains `deferred to completion` and
