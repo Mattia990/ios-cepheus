@@ -5,6 +5,47 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Boot: `boot` partition flashed with the iOS image; normal power-on boots iOS (2026-11-26)
+
+- **One-time exception, user-approved.** The phone had been running only from
+  `fastboot boot`; after it shut down on low battery the user asked to flash the current
+  image so a normal power-on boots iOS. Only the `boot` partition was written:
+  `fastboot flash boot work/boot/runs/safari4-cold.img` (19,128,320 bytes, SHA256
+  `cc5b747b8a32fc406f985932016bdd2f8db6d4ace489b75e9ba89ba214c694a1`), output
+  `Sending 'boot' (18680 KB) OKAY 0.439s`, `Writing 'boot' OKAY 0.053s`. No ABL, XBL, TZ,
+  modem, `vbmeta`, or other partition was touched; the bootloader remains unlocked.
+- **Verified.** `fastboot reboot` came up in iOS and SSH answered over Wi-Fi
+  (`SpringBoard` pid 25, `backboardd` pid 58). The phone now boots iOS from internal
+  storage without a host; the user still joins Wi-Fi manually after each boot.
+- **Restore.** The stock boot partition backup is `downloads/cepheus/boot.img` (134,217,728
+  bytes, SHA256 `2a09b86ae730bfef2b1d5d2861a5fe09e480ecfbfc902e3fb5a1736b568b6a28`).
+  Restore with `fastboot flash boot downloads/cepheus/boot.img`; keep the backup out of
+  git. The general rule for future images/partitions is still `fastboot boot` only; this
+  was a deliberate one-device exception.
+
+### Maps: the app already requests Memoryless MSAA; the fifth frame still OOMs (2026-11-26)
+
+- **New bundle installed.** `601e3d640fb8675a3ce65589bec3eb216edafaa2673342e426935ef0f3e1ee1a`
+  (`libvulkan_freedreno` `3f799fdc...`). With location allowed, the log shows 12
+  `multisample texture 1125x2436 type 4 samples 4 usage 4 storage 3` lines: Maps itself
+  requests `MTLStorageModeMemoryless` (3); the opt-in conversion did not run and no
+  `/var/local/mtl2-memoryless-msaa` file was needed. Colour passes are
+  `load 0 store 2` (DontCare -> MultisampleResolve), depth `load 0 store 0`; the runtime
+  accepts them (no `MemorylessStore`).
+- **The map draws at least once.** Probe commit 11 reads mean BGRA `92.0 96.3 18.2 255.0`
+  (green/terrain), unlike the earlier uniform `47.3 45.3 43.2`; the permission gate was
+  the blocker for content. But after four probes/eight presents the fifth frame still
+  fails: a 900x900 BGRA8 render target (`surface 487`, `usage 4 storage 0`) is created,
+  then `command buffer refused: endEncoding: end encoding: OutOfMemory(Device)`.
+- **The remaining OOM is not fixed by the descriptor's storage mode.** The app already
+  asks for Memoryless; the pool still fills. The next step is to find what consumes it:
+  instrument the runtime's image/backing allocations (size and memory class) or run a
+  minimal loop that creates and resolves 4x memoryless MSAA targets. The 900x900 surface
+  and the app's 12 MSAA textures are the first suspects; the runtime may be giving a
+  memoryless attachment a real stand-in/backing, or the Darwin BO cache may retain it.
+- **Phone state.** iOS booted from the flashed `boot` partition; Maps is not running.
+  Installed bundle is `601e3d64...`; SSH and the file server answer over Wi-Fi.
+
 ### Maps: the fifth frame exhausts the kernel's 944 MB GPU pool (2026-11-26)
 
 - **Presentation is fixed; the map is black because the GPU pool is full.** With the

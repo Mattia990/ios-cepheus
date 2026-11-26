@@ -14,3 +14,8 @@ into `backup/` before starting iOS bring-up; they contain your IMEI and calibrat
 
 Never flash ABL, XBL, TZ, modem or other firmware partitions with modified software. Only use
 `fastboot boot` for temporary bring-up images; never `fastboot flash boot` with a custom image.
+
+> **Current device exception (2026-11-26):** the `boot` partition on this phone now contains
+> `safari4-cold.img` so a normal power-on boots iOS. Restore the stock boot image with
+> `fastboot flash boot downloads/cepheus/boot.img` before following the factory-image steps.
+> The general rule above still applies to every other image and partition.
