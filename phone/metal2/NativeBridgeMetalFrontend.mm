@@ -38,7 +38,7 @@ static void (*gMissing)(const char *, const char *);
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
-static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves;
+static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImports,gPassProbes,gViewportProbes,gScissorProbes;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -270,6 +270,31 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
   gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
  }
+}
+// A resolved drawable's bytes, read after the CPU cache invalidation `finish` does: a non-black
+// mean here means the GPU wrote the map into the surface the layer displays. BGRA byte order.
+static std::atomic<uint64_t> gSurfaceProbes;
+static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool completed) {
+ if(!surface)return;
+ const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),row=IOSurfaceGetBytesPerRow(surface);
+ const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
+ if(!base || !width || !height || row<width*4){
+  NBLOG(@"native-metal: surface probe commit %u: id %u has no mapping (%zux%zu row %zu)",commit,IOSurfaceGetID(surface),width,height,row);
+  return;
+ }
+ uint64_t sum[4]={0},samples=0,nonblack=0;
+ for(size_t y=0;y<height;y+=8)for(size_t x=0;x<width;x+=8){
+  const uint8_t *p=base+y*row+x*4;
+  sum[0]+=p[0];sum[1]+=p[1];sum[2]+=p[2];sum[3]+=p[3];samples++;
+  if(p[0]+p[1]+p[2]>24)nonblack++;
+ }
+ const uint8_t *center=base+(height/2)*row+(width/2)*4;
+ const uint8_t *top=base+(height/8)*row+(width/2)*4;
+ NBLOG(@"native-metal: surface probe commit %u%s id %u %zux%zu row %zu mean %.1f %.1f %.1f %.1f nonblack %llu/%llu center %u,%u,%u,%u upper %u,%u,%u,%u",
+       commit,completed?" (completed)":" (unsubmitted)",IOSurfaceGetID(surface),width,height,row,
+       sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,sum[3]/(double)samples,
+       (unsigned long long)nonblack,(unsigned long long)samples,
+       center[0],center[1],center[2],center[3],top[0],top[1],top[2],top[3]);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -516,6 +541,9 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
+// The last surface a resolving store action wrote: a one-shot probe reads it back after
+// GPU completion, so a black canvas says whether the drawable holds the render or not.
+@property(nonatomic) IOSurfaceRef probeSurface;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -527,6 +555,8 @@ static void notified(void *context,uint64_t value) {
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+// This pass has a resolving store action: the probe logs its size, viewport and scissor.
+@property(nonatomic) BOOL resolves;
 @end
 static void waitForResource(id resource) {
  const uint64_t began=nowUs();
@@ -652,10 +682,14 @@ static void waitForResource(id resource) {
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
+ if(self.resolves && gViewportProbes++<3)
+  NBLOG(@"native-metal: resolve pass viewport %.1f,%.1f %.1fx%.1f z %.3f..%.3f",v.originX,v.originY,v.width,v.height,v.znear,v.zfar);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
+ if(self.resolves && gScissorProbes++<3)
+  NBLOG(@"native-metal: resolve pass scissor %llu,%llu %llux%llu",(unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
@@ -851,6 +885,7 @@ static void scheduled(void *context);
    if(pixels>=2000000)gFullScreenPasses++;
   }
  }
+ bool resolvingPass=false;
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
@@ -864,6 +899,9 @@ static void scheduled(void *context);
    NBTexture *resolve=(NBTexture *)a.resolveTexture;if(resolve.surface)[_surfaces addObject:resolve];
    [_resourceOwners addObject:resolve];
    out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   // The command buffer owns the surface through `_surfaces` until `finish` probes it.
+   if(resolve.surface)_probeSurface=resolve.surface;
+   resolvingPass=true;
    if(gResolves++==0)NBLOG(@"native-metal: pass resolves into %lux%lu (surface %d, samples %lu)",
        (unsigned long)resolve.width,(unsigned long)resolve.height,resolve.surface!=nil,(unsigned long)texture.sampleCount);
   }
@@ -877,12 +915,14 @@ static void scheduled(void *context);
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
+ if(resolvingPass && gPassProbes++<4)NBLOG(@"native-metal: resolve pass %lux%lu raster samples %lu",(unsigned long)pass.width,(unsigned long)pass.height,(unsigned long)pass.samples);
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.resolves=resolvingPass;
+ return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -919,6 +959,12 @@ static void scheduled(void *context);
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
+ // The first few resolved frames, then one every five seconds at 60 Hz: does the drawable hold
+ // the render at all, and does it change once the map has had time to draw?
+ if(_probeSurface) {
+  const uint64_t probes=gSurfaceProbes.fetch_add(1);
+  if(probes<4 || probes%300==299)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
+ }
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -1443,6 +1489,9 @@ static char sweetMemoryOwnerKey;
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
+ if(gSurfaceImports++<4)NBLOG(@"native-metal: drawable surface %u %zux%zu row %zu format %lu usage %llu storage %lu",
+     IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
+     (unsigned long)d.pixelFormat,(unsigned long long)d.usage,(unsigned long)d.storageMode);
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);

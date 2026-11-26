@@ -7,48 +7,45 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ### Maps: black canvas is an unresolved 4x MSAA drawable; resolve plumbing added (2026-11-26)
 
-- **Where it stands.** The legacy `newFunctionWithName:constantValues:pipelineLibrary:error:`
-  fix works: Maps launches, the `.05` CoreLocation patches hold, and VectorKit renders. The
-  remaining symptom is a map canvas that is pure black while Maps' own dark UI (bottom sheet,
-  buttons) renders normally. A cold URL launch
-  (`http://maps.apple.com/?ll=44.926381,16.238129&z=14`) moves the camera and VectorKit requests
-  Roads, Buildings, Polygons and labels (`Flat` tile set), not just RegionalResource.
-- **Map data is arriving.** A pulled `MapTiles.sqlitedb` has 17 tiles in 3 tilesets
-  (`8388865` 7, `8393729` 5, `8406017` 5), `failed_tiles` is empty, newest insert
-  `2026-11-25 23:10:22 UTC`. So the canvas is not black for lack of tiles.
-- **Pipelines are not the problem either.** `/var/local/m2v-cache/Maps/pipelines.log` has 256
-  lines and zero refusals; all 92 color attachments are `c0=81` (`BGRA8Unorm_sRGB`) and 76
-  passes are `samples=4` (16 are `samples=1`). The screenshot's map band is 100% `#000000`.
-- **Root cause: the resolving store action was dropped.** VectorKit renders 4x MSAA into an
-  offscreen texture and relies on `MTLStoreActionMultisampleResolve` to write the
-  CAMetalLayer drawable. `renderCommandEncoderWithDescriptor:` copied
-  `texture/level/slice/load/store` but never `resolveTexture/resolveLevel/resolveSlice/
-  resolveDepthPlane`, and `NmbPassAttachment` had no resolve fields, so the runtime saw a
-  plain `Store` and the drawable was never written. The runtime at the pinned
-  `metal2vulkan` commit `720ef1ce` already supports color/depth/stencil resolves, including
-  linear resolve targets through a scratch image plus copy (`resolve.rs`).
+- **Where it stands.** The resolve plumbing works end to end: the installed bundle logs
+  `native-metal: pass resolves into 1125x2436 (surface 1, samples 4)`, Maps keeps running,
+  and there are no missing selectors or `vkpipe` failures. The canvas is still black.
+- **The visible band is a stale launch snapshot.** `shot-maps-15s` vs `shot-georestart`: the
+  top 80 rows are channel-identical (0/132000 differ); the band ends at row 126 and rows
+  127+ are pure black, exactly the 44 pt status-bar height scaled to 1080. The full Europe
+  map at 2 s is the launch snapshot, not live rendering; the Croatia URL camera never
+  applied. A 10-shot burst caught one transition frame (map band mid-screen, doubled clock)
+  and then identical static frames: the launch transition is frozen because Maps never
+  presents a live frame.
+- **Live drawable is black; presentation is unverified.** The resolve is reached, but the
+  frontend has no `presentDrawable:` / `CAMetalLayer` implementation and no `MISSING`
+  selector was ever logged, so Maps either presents through the real drawable's `present`
+  or never presents at all.
 - **Rejected: the `sweetsurf10=2` / XR10 mismatch.** Every VectorKit pipeline is BGRA8_sRGB,
   not a 10-bit format, so deep-color surface handling is not the cause.
-- **Fix (uncommitted).** `NmbPassAttachment` gains `resolve`, `resolve_level`,
-  `resolve_slice`, `resolve_depth_plane`; `nmb_render_encoder_new` populates them for color,
-  depth and stencil; the ObjC frontend forwards `a.resolveTexture` and retains the resolve
-  texture in `_surfaces`/`_resourceOwners`; a one-time log line reads
-  `native-metal: pass resolves into WxH (surface %d, samples %lu)`. The same frontend now
-  adopts the public MTL protocols on the bridge classes with `class_addProtocol` (conformance
-  only; dispatch is unchanged) to silence the `is not a MTLBuffer`/`is not a MTLFunction`
-  validation warnings.
-- **Self-test proves it without Maps.** `NativeMetalBridge.rs` has a new `resolve` step at
-  marker `0x6506` (QuartzCore moved to `0x6507`): a 4x MSAA RGBA8 pass resolves into a linear
-  texture over imported host pages, exactly the CAMetalLayer drawable path, and checks the
-  same 4096 texels as `import`. `m2vtest` prints `resolve bad n/4096`.
-- **Next.** Rebuild SweetMetal2 with the `userland` GitHub workflow (manual dispatch; it
-  fetches `metal2vulkan` at `720ef1ce`), install the artifact with
-  `tools/cepheus-metal2-install.sh`, cold-boot, launch the URL above, then check
-  `/var/local/mtl2.log` for `pass resolves into` and screenshot the canvas. If it is still
-  black, inspect the resolve path and runtime errors next.
+- **Committed fix.** Resolve plumbing is local commit `1e6e38c` (7 files, 178 insertions),
+  installed from the workflow artifact as a 21,569,440-byte bundle, sha256
+  `7a2a8e36c56541cf8273731a8292561362079c73cf4f8f79f88b10998475231e`.
+- **Self-test bug found and fixed in the working tree.** The resolve step created the 4x
+  source as `Type2D` with `sample_count=4`; Metal requires `Type2DMultisample`, so the
+  failure was the fixture, not the runtime. The fixture now uses `Type2DMultisample` and
+  BGRA8 (the drawable format), the pipeline format follows the target, the expected texels
+  follow the byte order, and `m2vtest` labels `0x6506` as resolve and `0x6507` as
+  QuartzCore.
+- **New probe (working tree, needs the workflow build).** One-shot logs of the drawable
+  import (IOSurface ID, size, row bytes, format, usage, storage), the resolving pass's
+  render size and raster sample count, its viewport and scissor; after GPU completion the
+  first four resolved surfaces (then every 300th, ~5 s at 60 Hz) are read back through the
+  invalidated CPU mapping and logged as mean BGRA, non-black fraction, and centre/upper
+  texels. That separates "GPU never wrote the drawable" from "written but not presented".
+- **Next.** Rebuild SweetMetal2 with the `userland` workflow, install with
+  `tools/cepheus-metal2-install.sh`, cold-boot, launch the URL, tap `Allow While Using
+  App`, screenshot, and read the `drawable surface` / `resolve pass` / `surface probe`
+  lines. If the probe shows content, the remaining gap is presentation; if black, the
+  resolve/copy path.
 - **Phone state at handoff.** USB SSH reachable; FlameBridge relay on 127.0.0.1:2223;
-  installed `SweetMetal2` is 21,569,232 bytes and does not include the resolve fix or the
-  protocol conformance. Maps is not running.
+  installed bundle is 21,569,440 bytes with the resolve fix (no probe, no self-test fix).
+  Maps was killed to cool the phone and `/var/local/mtl2.log` was truncated.
 
 ### Maps: locationd hang is fixed; next blocker is SweetMetal2's missing legacy function API (2026-11-25)
 

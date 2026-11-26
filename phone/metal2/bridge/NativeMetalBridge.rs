@@ -11,7 +11,7 @@
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 
-use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
+use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
     BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction, MetalLevel,
@@ -128,7 +128,8 @@ fn draw_quad(device: &Device, library: &metal2vulkan_runtime::Library, target: &
     let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
     descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
     descriptor.raster_sample_count = target.sample_count() as u32;
-    descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
+    // Metal requires the pipeline's attachment format to equal the render target's exactly.
+    descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(target.pixel_format()));
     let state = device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()).map_err(|e| format!("pipeline: {e:?}"))?;
     let positions: [[f32; 2]; 6] = [[-1.0, 1.0], [0.0, 1.0], [-1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [-1.0, 0.0]];
     let positions: Vec<u8> = positions.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
@@ -162,14 +163,20 @@ fn draw_quad(device: &Device, library: &metal2vulkan_runtime::Library, target: &
     finish(&command_buffer)
 }
 
-/// Texels off the expected picture: the top-left quarter drawn (255, 51, 0, 255), the rest cleared blue.
-fn wrong_texels(bytes: &[u8], row: usize, side: usize) -> u32 {
+/// Texels off the expected picture: the top-left quarter drawn (255, 51, 0, 255), the rest cleared blue,
+/// in the target format's byte order (BGRA stores red last).
+fn wrong_texels(bytes: &[u8], row: usize, side: usize, format: PixelFormat) -> u32 {
     let mut bad = 0;
     for y in 0..side {
         for x in 0..side {
             let at = y * row + x * 4;
             let inside = x < side / 2 && y < side / 2;
-            let expected: [u8; 4] = if inside { [255, 51, 0, 255] } else { [0, 0, 255, 255] };
+            let rgb: [u8; 3] = if inside { [255, 51, 0] } else { [0, 0, 255] };
+            let expected: [u8; 4] = if format == PixelFormat::BGRA8Unorm {
+                [rgb[2], rgb[1], rgb[0], 255]
+            } else {
+                [rgb[0], rgb[1], rgb[2], 255]
+            };
             if bytes[at..at + 4] != expected {
                 bad += 1;
             }
@@ -189,7 +196,7 @@ fn render(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
     let contents = readback.contents().ok_or("no contents")?;
     // SAFETY: SIDE rows of SIDE * 4 bytes, no longer written.
     let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), (SIDE * 4 * SIDE) as usize) };
-    Ok(wrong_texels(bytes, (SIDE * 4) as usize, SIDE as usize))
+    Ok(wrong_texels(bytes, (SIDE * 4) as usize, SIDE as usize, PixelFormat::RGBA8Unorm))
 }
 
 /// The IOSurface path without an IOSurface: page-aligned host pages imported without a copy (the kernel pins them, Turnip maps
@@ -224,7 +231,7 @@ fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
         unsafe { sys_dcache_flush(pages, bytes) };
         // SAFETY: the pages hold `bytes` bytes and no command buffer writes them now.
         let view = unsafe { std::slice::from_raw_parts(pages as *const u8, bytes) };
-        let bad = wrong_texels(view, ROW as usize, SIDE as usize);
+        let bad = wrong_texels(view, ROW as usize, SIDE as usize, PixelFormat::RGBA8Unorm);
         drop(target);
         drop(buffer);
         Ok(bad)
@@ -234,9 +241,10 @@ fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
     result
 }
 
-/// A 4x multisampled pass resolving into a linear texture over imported host pages: the CAMetalLayer
-/// drawable path (`MTLStoreActionMultisampleResolve` into an IOSurface-backed texture), through the
-/// bridge's resolve fields.
+/// A 4x multisampled BGRA8 pass resolving into a linear BGRA8 texture over imported host pages: the
+/// CAMetalLayer drawable path (`MTLStoreActionMultisampleResolve` into an IOSurface-backed texture),
+/// through the bridge's resolve fields. The source must be `Type2DMultisample`, as Metal requires for
+/// a texture of more than one sample.
 fn resolve(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
     const SIDE: u64 = 64;
     const ROW: u64 = 256;
@@ -256,11 +264,12 @@ fn resolve(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u
         // SAFETY: as above, for `bytes` bytes.
         let buffer = unsafe { device.new_buffer_with_bytes_no_copy(memory, bytes as u64, ResourceOptions::shared(), None) }
             .map_err(|e| format!("no-copy buffer: {e:?}"))?;
-        let mut resolved = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+        let mut resolved = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, SIDE, SIDE, false);
         resolved.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
         resolved.resource_options = ResourceOptions::shared();
         let target = buffer.new_texture(&resolved, 0, ROW).map_err(|e| format!("texture over pages: {e:?}"))?;
-        let mut samples = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+        let mut samples = TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, SIDE, SIDE, false);
+        samples.texture_type = TextureType::Type2DMultisample;
         samples.sample_count = 4;
         samples.usage = TextureUsage::RENDER_TARGET;
         samples.resource_options = ResourceOptions::private();
@@ -272,7 +281,7 @@ fn resolve(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u
         unsafe { sys_dcache_flush(pages, bytes) };
         // SAFETY: the pages hold `bytes` bytes and no command buffer writes them now.
         let view = unsafe { std::slice::from_raw_parts(pages as *const u8, bytes) };
-        let bad = wrong_texels(view, ROW as usize, SIDE as usize);
+        let bad = wrong_texels(view, ROW as usize, SIDE as usize, PixelFormat::BGRA8Unorm);
         drop(target);
         drop(buffer);
         Ok(bad)

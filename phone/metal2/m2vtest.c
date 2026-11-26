@@ -34,9 +34,9 @@ static double now(void)
 
 static void mark(uint32_t m)
 {
-	static const char *const names[] = { "", "device", "fixture library", "compute", "render", "import", "QuartzCore" };
+	static const char *const names[] = { "", "device", "fixture library", "compute", "render", "import", "resolve", "QuartzCore" };
 	unsigned i = m & 0xff;
-	printf("[%7.2f s] step %x %s\n", now() - t0, m, i < 7 ? names[i] : (i == 0xf ? "done" : "?"));
+	printf("[%7.2f s] step %x %s\n", now() - t0, m, i < 8 ? names[i] : (i == 0xf ? "done" : "?"));
 	fflush(stdout);
 }
 
