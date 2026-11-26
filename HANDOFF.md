@@ -29,8 +29,10 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   once the kernel stopped refusing allocations. A short run cannot prove the
   `abd5e650...` build fixes that; a multi-hour soak or free/live BO logging is needed.
 - **Restored build.** The bundle was swapped back to `abd5e650...`; the pulled bundle
-  dylib hashes to `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d`
-  (17,294,896 bytes). `/var/local/bin/libvulkan_freedreno.dylib` is the same build;
+  dylib and `/var/local/bin/libvulkan_freedreno.dylib` both hash to
+  `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d` (17,294,896
+  bytes). A final 8 s `openapp` launch after the restore reached 12 `multisample
+  texture`, 8 presents, 4 probes, the 900x900 surface, and no OOM.
   `/var/local/bin/libvulkan_freedreno.3f799fdcf46e.dylib` is the old one for A/B tests.
 - **Caveat.** 26 × 45,334,528 is 1.18 GB, more than the 944 MB pool, so the lazy VMAs
   cannot all be physically backed. The depth attachment (`load 0 store 0`) should
@@ -45,11 +47,12 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   swallowed), the FrontBoard launcher ignores `QSetSTDERR`/`QSetSTDOUT` and the CLI
   stdio paths, and debugserver serves one connection then exits. Use raw RSP, not
   lldb (the 28 KB target XML hangs).
-- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log` and
-  `/var/local/mtl2-bo.log` are truncated. `backboardd` 3367, `SpringBoard` 3369.
-  Battery 70% (2310/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep it charging.
-  Wi-Fi SSH works; USB 2222 accepts TCP but the SSH banner times out, and 2223 is not
-  usable because the kernel file server starts only with the USB gadget.
+- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2-bo.log` is
+  empty and `/var/local/mtl2.log` has ~2 KB of backboardd telemetry after truncation
+  (safe to truncate again). `backboardd` 3367, `SpringBoard` 3369. Battery 70%
+  (2310/3300), `ExternalConnected=Yes`, `IsCharging=No`; keep it charging. Wi-Fi SSH
+  works; USB 2222 accepts TCP but the SSH banner times out, and 2223 is not usable
+  because the kernel file server starts only with the USB gadget.
 
 ### Boot: `boot` partition flashed with the iOS image; normal power-on boots iOS (2026-11-26)
 
