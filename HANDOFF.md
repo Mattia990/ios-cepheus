@@ -5,6 +5,27 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: presentation is fixed; the map itself is still uniform gray (2026-11-26)
+
+- **The deferral works.** The `8291cfa9...` bundle (contains `deferred to completion` and
+  `drawable layer`) is installed. Maps 7201 logs
+  `drawable layer MetalLayer bounds NSRect: {{0, 0}, {375, 812}} position NSPoint: {187.5, 406} hidden 0 opacity 1 superlayer VKMapView`
+  and `drawable direct present CAMetalDrawable surface 238 (deferred to completion)`.
+  A fourth drawable (241) appears, so the three-drawable pool is no longer stalled.
+- **The panel now shows the drawable.** `defer-shot.png` vs `present-shot.png`: 75.6% of
+  the channels below the status bar differ (max delta 39); the map area is the drawable's
+  gray (row 400 ≈ `32,33,35`) instead of black (`2,2,2`). The stale top band is gone.
+- **The map is still uniform gray.** The probe reads `47.0 45.0 43.0 255.0` on surfaces
+  238/239/240, i.e. the clear colour, and there are only four probes: Maps renders its
+  first frames and then stops at the TCC location alert. The tiles/camera are not drawn.
+- **Next.** Tap `Allow While Using App` on the alert, then pull `/var/local/mtl2.log` and
+  screenshot again. If the probe content starts changing, the permission gate was the
+  blocker and the next issue is the camera/tile fetch; if it stays uniform gray, the
+  VectorKit draw path needs the same treatment.
+- **Phone state at handoff.** Installed bundle is `8291cfa948e858c80643ff1a96f08a6e5df18b82969f1155df326511b674a090`;
+  Maps 7201 is running at the alert. Wi-Fi SSH and the file server are reachable at
+  192.168.1.100.
+
 ### Maps presents the drawable directly, before the GPU has written it (2026-11-26)
 
 - **The app does not use `presentDrawable:`.** With the presentation-log build
