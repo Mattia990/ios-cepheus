@@ -5,6 +5,42 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: large lazy BOs logged; no fifth-frame OOM; debugserver skill (2026-11-26)
+
+- **Installed build.** `libvulkan_freedreno` `abd5e650f9f171c88aa602824d297a5015657e3e8e60146f578164f8a7b6931d`
+  (17,294,896 bytes, contains `NativeAdreno BO:`) is in
+  `/System/Library/Extensions/SweetMetal2.bundle/libvulkan_freedreno.dylib` and
+  `/var/local/bin/libvulkan_freedreno.dylib`; the bundle executable is the regular
+  21,586,336-byte `SweetMetal2`, the same size as the previous build.
+- **25 s debugserver run (Maps 2508, Croatia URL).** Captured 26 × 45,334,528-byte
+  `lazy` BOs (`props=0`, `name=lazy vkAllocateMemory()`), 6 × 8,388,608 (`props=0x7`,
+  one `reused`), and 2 × 4,505,600; 12 `multisample texture` lines (2 per frame),
+  8 `drawable direct present` lines, 4 probes, 900x900 surface 146, and no
+  `OutOfMemory(Device)`. Probe commit 11 read mean BGRA `93.9 92.6 9.2 255.0`.
+- **The old build OOM'd at this point.** The `3f799fdc...` dylib failed at the fifth
+  frame with a 900x900 BGRA8 surface and `endEncoding: OutOfMemory(Device)`; the
+  `abd5e650...` build reached the same surface/probe point. A full-speed `openapp`
+  run (Maps 2832/2859) also reached 8 presents/4 probes and the 900x900 surface with
+  no OOM, then Maps went idle; it did not exercise continuous rendering.
+- **Caveat.** 26 × 45,334,528 is 1.18 GB, more than the 944 MB pool, so the lazy VMAs
+  cannot all be physically backed. The depth attachment (`load 0 store 0`) should
+  never be backed. The next step is to log BO free/live transitions or the first
+  backing event, and to repeat the run without debugserver stderr logging (the pty
+  write slows the app and may mask a timing-dependent pool exhaustion).
+- **Debugserver skill.** Workspace `.opencode/skills/cepheus-debugserver/SKILL.md`
+  documents the tested raw-RSP workflow: `--launch=frontboard [::1]:PORT`, SSH `-L`,
+  `A`, `qLaunchSuccess`, `c`, O-packet stderr capture, `^C`, `D`; scripts
+  `scripts/rsp-launch-capture.py` and `scripts/scp-get.py`. Gotchas: do a
+  `qSupported` round-trip before `A` (the first packet after `QStartNoAckMode` can be
+  swallowed), the FrontBoard launcher ignores `QSetSTDERR`/`QSetSTDOUT` and the CLI
+  stdio paths, and debugserver serves one connection then exits. Use raw RSP, not
+  lldb (the 28 KB target XML hangs).
+- **Phone state.** Maps and debugserver are not running; `/var/local/mtl2.log` is
+  truncated. `backboardd` 591, `SpringBoard` 593. Battery 72% (2376/3300),
+  `ExternalConnected=Yes`, `IsCharging=No`; keep it charging. Wi-Fi SSH works; USB
+  2222 accepts TCP but the SSH banner times out, and 2223 is not usable because the
+  kernel file server starts only with the USB gadget.
+
 ### Boot: `boot` partition flashed with the iOS image; normal power-on boots iOS (2026-11-26)
 
 - **One-time exception, user-approved.** The phone had been running only from
