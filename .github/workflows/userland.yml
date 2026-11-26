@@ -87,6 +87,9 @@ jobs:
           # case-insensitive filesystem it shadows <endian.h>.
           git -C work/turnip/mesa apply "$PWD/tools/patches/mesa-ios-endian.patch"
 
+          # Diagnostic: log large Darwin BOs (Maps memoryless MSAA).
+          git -C work/turnip/mesa apply "$PWD/tools/patches/mesa-darwin-bo-log.patch"
+
           # metal2vulkan plus the bridge patches that carry our kernel's
           # 8 MB memory blocks and padded writers (phone/metal2/bridge/patches).
           git init -q work/metal2vulkan

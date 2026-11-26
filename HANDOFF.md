@@ -25,12 +25,13 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ### Maps: large-BO logging added to the Darwin backend (2026-11-26)
 
-- **Patch (working tree, Turnip subrepo).** `work/turnip/mesa/src/freedreno/vulkan/tu_knl_darwin.cc`
-  now logs every BO of 2 MiB or more:
+- **Patch (CI).** `tools/patches/mesa-darwin-bo-log.patch` adds the logging to
+  `src/freedreno/vulkan/tu_knl_darwin.cc`, and `.github/workflows/userland.yml` applies it
+  after the UniXNU Mesa series. The patch was checked against a clean Mesa 85fda3b +
+  UniXNU-patched tree; the local working-tree file carries the same edit. The line is
   `NativeAdreno BO: <size> bytes (alloc <n>)[ lazy][ reused] props=<flags> name=<name>`.
   A memoryless MSAA target that is only resolved should stay a lazy VMA; a 43.8 MB `lazy` BO
-  means the runtime backed it. The file is untracked in the Turnip subrepo (as before), so the
-  build must take the working tree.
+  means the runtime backed it.
 - **Next.** Build/install the userland bundle, launch Maps with the Croatia URL, allow location,
   and pull `/var/local/mtl2.log`. Count the 43.8 MB `lazy` BOs and compare with the 12
   `multisample texture` lines; if all 12 are backed, the fix is in the memoryless

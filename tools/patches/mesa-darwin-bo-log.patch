@@ -1,0 +1,28 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -954,6 +954,7 @@
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+    assert(bo && bo->gem_handle == 0);
+ 
++   const char *alloc_name = name;
+    name = tu_debug_bos_add(dev, size, name);
+ 
+    *bo = (struct tu_bo) {
+@@ -977,6 +978,17 @@
+    if (lazy_vma) {
+       lazy_vma->msm.backs_lazy_bo = true;   /* the range now goes back with the BO */
+       bo->lazy = true;
++   }
++
++   /* Diagnostic: which large BOs take real memory. A memoryless MSAA target that is only
++    * resolved should stay a lazy VMA; a 43.8 MB "lazy" BO here means the runtime backed it. */
++   if (size >= (2u << 20)) {
++      static uint32_t large_bo_logs;
++      if (p_atomic_inc_return(&large_bo_logs) <= 1024)
++         fprintf(stderr, "NativeAdreno BO: %llu bytes (alloc %llu)%s%s props=%#x name=%s\n",
++                 (unsigned long long)size, (unsigned long long)alloc_size,
++                 lazy_vma ? " lazy" : "", reused ? " reused" : "",
++                 (unsigned)mem_property, alloc_name ? alloc_name : "-");
+    }
+ 
+    tu_dump_bo_init(dev, bo);
