@@ -1,0 +1,47 @@
+diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
+index 55c2602..0e229e7 100644
+--- a/crates/metal2vulkan-runtime/src/render_pass.rs
++++ b/crates/metal2vulkan-runtime/src/render_pass.rs
+@@ -1320,17 +1320,37 @@ pub(super) fn layout(
+                 None,
+                 resolve::color_copy(call, device, which, &target, &wanted)?,
+             ),
+-            _ => (
+-                resolve::color(
++            _ => {
++                let mut resolve = resolve::color(
+                     call,
+                     maker,
+                     which,
+                     &target,
+                     &wanted,
+                     (color.load_action, clear),
+-                )?,
+-                None,
+-            ),
++                )?;
++                // A memoryless attachment's samples live only in the pass's tile memory: the
++                // exact resolve drawn after the pass would make the pass store them, backing
++                // the lazy attachment (43.2 MiB at 1125x2436, 4 samples). Resolve in the pass
++                // by the device's average instead, which keeps the attachment in tile memory
++                // (`Degradation::DeviceRoundedResolve`).
++                if memoryless {
++                    if let Some(resolve) = &mut resolve {
++                        if resolve.shader.take().is_some() {
++                            device.degrade(Degradation::DeviceRoundedResolve, || {
++                                (
++                                    "a memoryless color attachment that resolves".to_owned(),
++                                    "its samples live only in the pass's tile memory, so the \
++                                     pass resolves them by the device's average instead of \
++                                     storing them for the exact resolve drawn after it"
++                                        .to_owned(),
++                                )
++                            });
++                        }
++                    }
++                }
++                (resolve, None)
++            }
+         };
+         extents.push((target.extent, target.samples));
+         colors.push(Some(ColorTarget {

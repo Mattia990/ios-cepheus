@@ -5,6 +5,51 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the exact resolve, not the store op, backs the 45.3 MB MSAA BOs (2026-11-26)
+
+- **Build tested.** The `e275bc7` build (the `0102` patch and the BO
+  telemetry) was installed over Wi-Fi and `backboardd` restarted. New hashes:
+  `SweetMetal2` `249213913505...` (21,586,400 bytes), dylib
+  `5c228ad0ea79...` (17,294,896 bytes), `CodeResources` `edcaaead6621...`.
+  The old `c7e0cf9e`/`02fc875e` files are backed up locally under
+  `/private/var/folders/.../cepheus-before-249213913505/`.
+- **Result: unchanged.** With the phone cold-booted and Maps launched under
+  debugserver, the user saw the same grey start, then a black screen with a
+  piece of map after zooming out. The 150 s capture
+  (`/tmp/maps-ds-zoom-0102.log`, 26,562 bytes) has **175 x 45,334,528-byte
+  lazy BOs** (up from 61 in the earlier run), 24 x 8,388,608, 2 x 4,505,600;
+  no `OutOfMemory`. The app log (`/tmp/mtl2-0102.log`, 49,158 bytes) has the
+  same 12 `multisample texture 1125x2436 ... samples 4 storage 3` lines and
+  `BO cache: lookups=2365 hits=207 inserts=242 evictions=35 cached=0
+  peak=36 MiB holes=11-13`; the lazy BOs bypass that cache.
+- **Why `0102` did not help.** `render_target.rs::color_ops` forces
+  `STORE` whenever the runtime draws the exact shader resolve
+  (`color.resolve.shader.is_some()`). Turnip has no
+  `DriverFact::ColorResolveAverageIsMetals`, so `resolve.rs::color` sets
+  `shader` from `color_resolve::of_attachment`; the pass must store the
+  samples for the drawn resolve after it, and Turnip backs the lazy
+  attachment. The `0102` `store_op` change only affects attachments whose
+  samples the runtime does not need after the pass.
+- **Fix prepared (local, not pushed).**
+  `phone/metal2/bridge/patches/0103-memoryless-in-pass-resolve.patch` clears
+  `resolve.shader` for a **memoryless** color attachment, so the pass resolves
+  in-pass by the device's `AVERAGE` instead of drawing the exact resolve after
+  it. A memoryless attachment's samples live only in tile memory, so this is
+  the only way to keep it unbacked; the memoryless flag also makes the store
+  `DONT_CARE` (`dont_care.unless(unheld)`), so no lazy BO. It announces
+  `Degradation::DeviceRoundedResolve`: a texel can differ by one unit at a
+  rounding tie. Non-memoryless attachments keep the exact resolve. `0103`
+  applies after `0102` (`git apply` checked in order).
+- **Next.** Dispatch the `userland` workflow, install the new bundle, and
+  repeat the debugserver zoom-out capture. Expect the 45,334,528-byte BO lines
+  to disappear and the black screen to stop. If they persist, check that the
+  attachment's storage mode is 3 and log the resolve choice (`shader` Some/None)
+  at `render_pass.rs::layout`.
+- **Phone state.** Maps and debugserver were killed after the test;
+  `/var/local/mtl2.log` and `mtl2-bo.log` were truncated. `backboardd` 1257,
+  `SpringBoard` 1259. Battery 54% (1782/3300), `ExternalConnected=Yes`; keep it
+  charging and cool.
+
 ### Maps: zoom-out reproduces the black screen; 45.3 MB lazy MSAA BOs are the likely pool load (2026-11-26)
 
 - **Kernel/boot args unchanged.** `safari4-cold.img` (kernel `bd6aa2bd...`,
