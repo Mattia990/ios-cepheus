@@ -5,6 +5,55 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: zoom-out reproduces the black screen; 45.3 MB lazy MSAA BOs are the likely pool load (2026-11-26)
+
+- **Kernel/boot args unchanged.** `safari4-cold.img` (kernel `bd6aa2bd...`,
+  `sweetmtl=2`, `sweetgpu=1`, `cepheusreboot=1800`); this test changed only the
+  userland dylib.
+- **Reproduced with touch on the cold boot.** After the user zoomed out, Maps
+  (PID 585, launched under debugserver) created the 900x900 surface, then the
+  screen went black. `mtl2.log` ended with the 900x900 `drawable surface` and
+  backboardd telemetry; this run did not log `OutOfMemory(Device)`.
+- **BO stream.** The debugserver capture (`/tmp/maps-ds-zoom.log`, 14,926 bytes)
+  has 73 `NativeAdreno BO:` lines: **61 x 45,334,528 bytes**, all
+  `lazy ... props=0 name=lazy vkAllocateMemory()`; 10 x 8,388,608 (`props=0x7`,
+  one `reused`); 2 x 4,505,600 (lazy). The 45.3 MB size is the 1125x2436 4x MSAA
+  colour attachment (the app logs `multisample texture 1125x2436 ... samples 4
+  storage 3`). Lazy BOs bypass the BO cache, so the `BO cache:` lines
+  (lookups 34->55, inserts 13->18, `cached=0`, `peak=0`, holes 1) do not count
+  them.
+- **Why they are backed.** `metal2vulkan`'s `render_target.rs::store_op` maps
+  Metal's `MultisampleResolve` to `dont_care.op()`. `DontCare::of` returns
+  `Stored` unless the driver has `DriverFact::DontCareStoreIsMetals` (or
+  `OneOfMetals`); Turnip/Adreno does not, so the Vulkan store op is `STORE`.
+  Turnip's `tu_allocate_transient_attachments` then calls
+  `tu_allocate_lazy_memory` for the attachment, creating the 45.3 MB BO. The BO
+  is freed only after its last submission, so a burst of passes holds many at
+  once. The old OOM log had 12 `multisample texture` lines; if those colour
+  attachments were backed, they alone are 540 MB, and the other BOs plus the
+  next frame would reach the 944 MB pool. The next build's BO capture will
+  confirm the count drops.
+- **Fix prepared (local, not pushed).**
+  `phone/metal2/bridge/patches/0102-resolve-source-dont-care.patch` changes
+  `store_op` so `MultisampleResolve` always maps to `DONT_CARE`; `DontCare`
+  keeps the measured answer, and `Store`/`StoreAndMultisampleResolve` stay
+  `STORE`. Metal leaves a `MultisampleResolve` attachment's samples undefined,
+  so `DONT_CARE` is exact; the exact-resolve-after-pass path
+  (`color_resolve.rs`) already forces `STORE` when it reads the samples.
+  `git apply --check` passes against the pinned `metal2vulkan` checkout.
+- **Next.** Dispatch the `userland` workflow, install the resulting bundle, and
+  repeat the debugserver zoom-out capture. Expect the 45,334,528-byte BO lines to
+  disappear or drop sharply and the 900x900 transition to stop blacking out. If
+  they persist, log the Vulkan store op/attachment identity at
+  `tu_allocate_lazy_memory` and check the main pass's store action.
+- **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log` and
+  `mtl2-bo.log` were truncated after the test. Last known `backboardd` 58,
+  `SpringBoard` 25; battery 56% (1848/3300), `ExternalConnected=Yes`,
+  `IsCharging=No`; keep it charging and cool. The Wi-Fi address stopped
+  responding after the test (`No route to host`), probably the 30-minute
+  `cepheusreboot` reset; rejoin Wi-Fi after it boots. The debugserver capture is
+  in `/tmp/maps-ds-zoom.log`; the final device log was pulled to the temp dir.
+
 ### Maps: BO-cache telemetry build installed; clean launch (2026-11-26)
 
 - **Installed build.** The user built the bundle in `phone/metal2/out/`; it

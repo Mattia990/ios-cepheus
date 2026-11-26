@@ -1,0 +1,19 @@
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 0310edd..0f7f000 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -325,10 +325,12 @@ fn load_op(load: LoadAction) -> vk::AttachmentLoadOp {
+ }
+ 
+ /// The Vulkan store operation of Metal's known `store`: `MultisampleResolve` leaves the samples
+-/// undefined, as `DontCare` does (`resolve.rs`), and both are `dont_care`'s.
++/// undefined, so `DONT_CARE` is exact and lets a lazily allocated attachment stay in tile memory.
++/// `DontCare` alone takes the device's measured answer (`dont_care`).
+ fn store_op(store: StoreAction, dont_care: DontCare) -> vk::AttachmentStoreOp {
+     match store {
+-        StoreAction::DontCare | StoreAction::MultisampleResolve => dont_care.op(),
++        StoreAction::MultisampleResolve => vk::AttachmentStoreOp::DONT_CARE,
++        StoreAction::DontCare => dont_care.op(),
+         _ => vk::AttachmentStoreOp::STORE,
+     }
+ }
