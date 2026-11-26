@@ -61,8 +61,8 @@ int main(int argc, char **argv)
 	struct NmbSelftest out = { 0 };
 	t0 = now();
 	uint32_t r = nmb_selftest(lib, cache, bytes, n, mark, &out);
-	printf("result %x stage %x: compute bad %u/1000, render bad %u/64, import bad %u/4096\n", r, out.stage, out.compute_bad,
-	       out.render_bad, out.import_bad);
+	printf("result %x stage %x: compute bad %u/1000, render bad %u/64, import bad %u/4096, resolve bad %u/4096\n", r,
+	       out.stage, out.compute_bad, out.render_bad, out.import_bad, out.resolve_bad);
 	printf("QuartzCore: %u functions, kernels %u ok %u failed, vertex/fragment pairs %u ok %u failed (%.1f s)\n",
 	       out.qc_functions, out.qc_kernels_ok, out.qc_kernels_failed, out.qc_pairs_ok, out.qc_pairs_failed, now() - t0);
 	printf("message: %.96s\n", out.message);

@@ -38,7 +38,7 @@ static void (*gMissing)(const char *, const char *);
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
-static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -857,6 +857,16 @@ static void scheduled(void *context);
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  /* The resolving store action writes this texture at the end of the pass; without it the MSAA
+     render (VectorKit draws 4x) never reaches the drawable and the canvas stays black. */
+  if(a.resolveTexture) {
+   if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+   NBTexture *resolve=(NBTexture *)a.resolveTexture;if(resolve.surface)[_surfaces addObject:resolve];
+   [_resourceOwners addObject:resolve];
+   out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   if(gResolves++==0)NBLOG(@"native-metal: pass resolves into %lux%lu (surface %d, samples %lu)",
+       (unsigned long)resolve.width,(unsigned long)resolve.height,resolve.surface!=nil,(unsigned long)texture.sampleCount);
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -1569,6 +1579,32 @@ static void installAnswers(Class cls) {
  }
 }
 
+// The target's Metal validation asks each object it stores whether it conforms to the public protocol
+// (NSLog "buffer is not a MTLBuffer.", "vertexFunction is not a MTLFunction."). Conformance only answers
+// conformsToProtocol:; methods are still looked up one by one, and optional methods still answer
+// respondsToSelector:, so this changes no dispatch. Protocol names are looked up at runtime so the file
+// still builds against an SDK that predates one of them.
+static void adoptMetalProtocols(void) {
+ static const struct {Class cls;const char *name;} rows[]={
+  {[NBBuffer class],"MTLBuffer"},{[NBTexture class],"MTLTexture"},
+  {[NBLibrary class],"MTLLibrary"},{[NBFunction class],"MTLFunction"},
+  {[NBComputePipeline class],"MTLComputePipelineState"},{[NBRenderPipeline class],"MTLRenderPipelineState"},
+  {[NBSampler class],"MTLSamplerState"},{[NBDepthStencil class],"MTLDepthStencilState"},
+  {[NBEvent class],"MTLEvent"},{[NBSharedEvent class],"MTLSharedEvent"},{[NBFence class],"MTLFence"},
+  {[NBQueue class],"MTLCommandQueue"},{[NBCommandBuffer class],"MTLCommandBuffer"},
+  {[NBEncoder class],"MTLCommandEncoder"},{[NBComputeEncoder class],"MTLComputeCommandEncoder"},
+  {[NBRenderEncoder class],"MTLRenderCommandEncoder"},{[NBBlitEncoder class],"MTLBlitCommandEncoder"},
+  {[NBHeap class],"MTLHeap"},{[NBBinaryArchive class],"MTLBinaryArchive"},
+ };
+ unsigned adopted=0,missing=0;
+ for(auto &row:rows) {
+  Protocol *p=objc_getProtocol(row.name);
+  if(!p){missing++;continue;}
+  class_addProtocol(row.cls,p);adopted++;
+ }
+ NBLOG(@"native-metal: Metal protocols adopted %u, missing %u",adopted,missing);
+}
+
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
@@ -1602,6 +1638,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
+ adoptMetalProtocols();
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;

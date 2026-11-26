@@ -38,6 +38,7 @@ pub struct NmbSelftest {
     pub compute_bad: u32,
     pub render_bad: u32,
     pub import_bad: u32,
+    pub resolve_bad: u32,
     pub qc_functions: u32,
     pub qc_kernels_ok: u32,
     pub qc_kernels_failed: u32,
@@ -117,13 +118,16 @@ fn compute(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u
     Ok(values.iter().enumerate().filter(|(i, v)| **v != 3.0 * *i as f32).count() as u32)
 }
 
-/// Draws the fixture's top-left-quarter quad into `target` (cleared blue) and returns the encoded command buffer's result.
+/// Draws the fixture's top-left-quarter quad into `target` (cleared blue), resolving the samples into
+/// `resolve` where given, and returns the encoded command buffer's result.
 fn draw_quad(device: &Device, library: &metal2vulkan_runtime::Library, target: &metal2vulkan_runtime::Texture,
+             resolve: Option<&metal2vulkan_runtime::Texture>,
              readback: Option<(&metal2vulkan_runtime::Buffer, u64, u64)>) -> Result<(), String> {
     let vertex = library.new_function_with_name("colored_vertex").map_err(|e| format!("{e:?}"))?;
     let fragment = library.new_function_with_name("colored_fragment").map_err(|e| format!("{e:?}"))?;
     let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
     descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
+    descriptor.raster_sample_count = target.sample_count() as u32;
     descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
     let state = device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()).map_err(|e| format!("pipeline: {e:?}"))?;
     let positions: [[f32; 2]; 6] = [[-1.0, 1.0], [0.0, 1.0], [-1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [-1.0, 0.0]];
@@ -136,6 +140,10 @@ fn draw_quad(device: &Device, library: &metal2vulkan_runtime::Library, target: &
     color.texture = Some(target.clone());
     color.load_action = LoadAction::Clear;
     color.store_action = StoreAction::Store;
+    if let Some(resolve) = resolve {
+        color.resolve_texture = Some(resolve.clone());
+        color.store_action = StoreAction::MultisampleResolve;
+    }
     color.clear_color = ClearColor::new(0.0, 0.0, 1.0, 1.0);
     let queue = device.new_command_queue().map_err(|e| format!("{e:?}"))?;
     let command_buffer = queue.command_buffer().map_err(|e| format!("{e:?}"))?;
@@ -177,7 +185,7 @@ fn render(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
     texture.resource_options = ResourceOptions::private();
     let target = device.new_texture(&texture).map_err(|e| format!("{e:?}"))?;
     let readback = device.new_buffer(SIDE * 4 * SIDE, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    draw_quad(device, library, &target, Some((&readback, SIDE * 4, SIDE)))?;
+    draw_quad(device, library, &target, None, Some((&readback, SIDE * 4, SIDE)))?;
     let contents = readback.contents().ok_or("no contents")?;
     // SAFETY: SIDE rows of SIDE * 4 bytes, no longer written.
     let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), (SIDE * 4 * SIDE) as usize) };
@@ -211,7 +219,55 @@ fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
         let target = buffer.new_texture(&texture, 0, ROW).map_err(|e| format!("texture over pages: {e:?}"))?;
         // SAFETY: the range is this mapping.
         unsafe { sys_dcache_flush(pages, bytes) };
-        draw_quad(device, library, &target, None)?;
+        draw_quad(device, library, &target, None, None)?;
+        // SAFETY: the GPU finished writing; drop any line the CPU fetched meanwhile.
+        unsafe { sys_dcache_flush(pages, bytes) };
+        // SAFETY: the pages hold `bytes` bytes and no command buffer writes them now.
+        let view = unsafe { std::slice::from_raw_parts(pages as *const u8, bytes) };
+        let bad = wrong_texels(view, ROW as usize, SIDE as usize);
+        drop(target);
+        drop(buffer);
+        Ok(bad)
+    })();
+    // SAFETY: the buffer and texture over the pages are gone.
+    unsafe { libc::munmap(pages, bytes) };
+    result
+}
+
+/// A 4x multisampled pass resolving into a linear texture over imported host pages: the CAMetalLayer
+/// drawable path (`MTLStoreActionMultisampleResolve` into an IOSurface-backed texture), through the
+/// bridge's resolve fields.
+fn resolve(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
+    const SIDE: u64 = 64;
+    const ROW: u64 = 256;
+    let bytes = (ROW * SIDE) as usize;
+    // SAFETY: an anonymous private mapping of whole pages, unmapped below after every GPU use completed.
+    let pages = unsafe {
+        libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+    };
+    if pages == libc::MAP_FAILED {
+        return Err("mmap".into());
+    }
+    let result = (|| {
+        // SAFETY: the pages were just mapped; nothing else uses them.
+        unsafe { std::ptr::write_bytes(pages as *mut u8, 0x5a, bytes) };
+        // SAFETY: the mapping is writable, page aligned and outlives the buffer (dropped before the unmap).
+        let memory = unsafe { HostMemory::new(NonNull::new(pages as *mut u8).ok_or("null")?) };
+        // SAFETY: as above, for `bytes` bytes.
+        let buffer = unsafe { device.new_buffer_with_bytes_no_copy(memory, bytes as u64, ResourceOptions::shared(), None) }
+            .map_err(|e| format!("no-copy buffer: {e:?}"))?;
+        let mut resolved = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+        resolved.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+        resolved.resource_options = ResourceOptions::shared();
+        let target = buffer.new_texture(&resolved, 0, ROW).map_err(|e| format!("texture over pages: {e:?}"))?;
+        let mut samples = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
+        samples.sample_count = 4;
+        samples.usage = TextureUsage::RENDER_TARGET;
+        samples.resource_options = ResourceOptions::private();
+        let multisampled = device.new_texture(&samples).map_err(|e| format!("multisampled texture: {e:?}"))?;
+        // SAFETY: the range is this mapping.
+        unsafe { sys_dcache_flush(pages, bytes) };
+        draw_quad(device, library, &multisampled, Some(&target), None)?;
         // SAFETY: the GPU finished writing; drop any line the CPU fetched meanwhile.
         unsafe { sys_dcache_flush(pages, bytes) };
         // SAFETY: the pages hold `bytes` bytes and no command buffer writes them now.
@@ -328,10 +384,15 @@ fn selftest(run: &mut Run, loader: &CStr, cache: &CStr, qc: &[u8]) -> u32 {
         Ok(bad) => run.out.import_bad = bad,
         Err(why) => return run.fail(0x6505, why),
     }
+    run.step(0x6506);
+    match resolve(&device, &library) {
+        Ok(bad) => run.out.resolve_bad = bad,
+        Err(why) => return run.fail(0x6506, why),
+    }
     if !qc.is_empty() {
-        run.step(0x6506);
+        run.step(0x6507);
         if let Err(why) = quartzcore(run, &device, qc) {
-            return run.fail(0x6506, why);
+            return run.fail(0x6507, why);
         }
     }
     run.step(0x650f);

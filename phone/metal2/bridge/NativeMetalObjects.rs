@@ -1623,6 +1623,10 @@ pub struct NmbPassAttachment {
     pub depth_plane: u64,
     pub load: u64,
     pub store: u64,
+    pub resolve: *mut NmbTexture,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
     pub clear: [f64; 4],
 }
 
@@ -1638,8 +1642,8 @@ pub struct NmbRenderPassDescriptor {
     pub visibility: *const NmbBuffer,
 }
 
-fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
-    if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+fn texture_of(texture: *mut NmbTexture) -> Result<Option<Texture>, String> {
+    if texture.is_null() { Ok(None) } else { Ok(Some(get(texture)?.0.clone())) }
 }
 
 #[unsafe(no_mangle)]
@@ -1649,27 +1653,39 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         let d = get(descriptor)?;
         let mut pass = RenderPassDescriptor::new();
         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
-            slot.texture = texture_of(a)?;
+            slot.texture = texture_of(a.texture)?;
             slot.level = a.level;
             slot.slice = a.slice;
             slot.depth_plane = a.depth_plane;
+            slot.resolve_texture = texture_of(a.resolve)?;
+            slot.resolve_level = a.resolve_level;
+            slot.resolve_slice = a.resolve_slice;
+            slot.resolve_depth_plane = a.resolve_depth_plane;
             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
         }
         let depth = &mut pass.depth_attachment;
-        depth.texture = texture_of(&d.depth)?;
+        depth.texture = texture_of(d.depth.texture)?;
         depth.level = d.depth.level;
         depth.slice = d.depth.slice;
         depth.depth_plane = d.depth.depth_plane;
+        depth.resolve_texture = texture_of(d.depth.resolve)?;
+        depth.resolve_level = d.depth.resolve_level;
+        depth.resolve_slice = d.depth.resolve_slice;
+        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
         depth.clear_depth = d.depth.clear[0];
         let stencil = &mut pass.stencil_attachment;
-        stencil.texture = texture_of(&d.stencil)?;
+        stencil.texture = texture_of(d.stencil.texture)?;
         stencil.level = d.stencil.level;
         stencil.slice = d.stencil.slice;
         stencil.depth_plane = d.stencil.depth_plane;
+        stencil.resolve_texture = texture_of(d.stencil.resolve)?;
+        stencil.resolve_level = d.stencil.resolve_level;
+        stencil.resolve_slice = d.stencil.resolve_slice;
+        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
         stencil.clear_stencil = d.stencil.clear[0] as u32;

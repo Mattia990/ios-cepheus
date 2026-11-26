@@ -206,6 +206,8 @@ NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
 struct NmbPassAttachment {
     NmbTexture *texture;
     uint64_t level, slice, depth_plane, load, store;
+    NmbTexture *resolve; /* the single-sample texture of a resolving store action, or null */
+    uint64_t resolve_level, resolve_slice, resolve_depth_plane;
     double clear[4]; /* color, or clear[0] depth / stencil */
 };
 struct NmbRenderPassDescriptor {

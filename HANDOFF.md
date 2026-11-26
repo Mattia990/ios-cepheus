@@ -1,9 +1,54 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-25** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-26** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Maps: black canvas is an unresolved 4x MSAA drawable; resolve plumbing added (2026-11-26)
+
+- **Where it stands.** The legacy `newFunctionWithName:constantValues:pipelineLibrary:error:`
+  fix works: Maps launches, the `.05` CoreLocation patches hold, and VectorKit renders. The
+  remaining symptom is a map canvas that is pure black while Maps' own dark UI (bottom sheet,
+  buttons) renders normally. A cold URL launch
+  (`http://maps.apple.com/?ll=44.926381,16.238129&z=14`) moves the camera and VectorKit requests
+  Roads, Buildings, Polygons and labels (`Flat` tile set), not just RegionalResource.
+- **Map data is arriving.** A pulled `MapTiles.sqlitedb` has 17 tiles in 3 tilesets
+  (`8388865` 7, `8393729` 5, `8406017` 5), `failed_tiles` is empty, newest insert
+  `2026-11-25 23:10:22 UTC`. So the canvas is not black for lack of tiles.
+- **Pipelines are not the problem either.** `/var/local/m2v-cache/Maps/pipelines.log` has 256
+  lines and zero refusals; all 92 color attachments are `c0=81` (`BGRA8Unorm_sRGB`) and 76
+  passes are `samples=4` (16 are `samples=1`). The screenshot's map band is 100% `#000000`.
+- **Root cause: the resolving store action was dropped.** VectorKit renders 4x MSAA into an
+  offscreen texture and relies on `MTLStoreActionMultisampleResolve` to write the
+  CAMetalLayer drawable. `renderCommandEncoderWithDescriptor:` copied
+  `texture/level/slice/load/store` but never `resolveTexture/resolveLevel/resolveSlice/
+  resolveDepthPlane`, and `NmbPassAttachment` had no resolve fields, so the runtime saw a
+  plain `Store` and the drawable was never written. The runtime at the pinned
+  `metal2vulkan` commit `720ef1ce` already supports color/depth/stencil resolves, including
+  linear resolve targets through a scratch image plus copy (`resolve.rs`).
+- **Rejected: the `sweetsurf10=2` / XR10 mismatch.** Every VectorKit pipeline is BGRA8_sRGB,
+  not a 10-bit format, so deep-color surface handling is not the cause.
+- **Fix (uncommitted).** `NmbPassAttachment` gains `resolve`, `resolve_level`,
+  `resolve_slice`, `resolve_depth_plane`; `nmb_render_encoder_new` populates them for color,
+  depth and stencil; the ObjC frontend forwards `a.resolveTexture` and retains the resolve
+  texture in `_surfaces`/`_resourceOwners`; a one-time log line reads
+  `native-metal: pass resolves into WxH (surface %d, samples %lu)`. The same frontend now
+  adopts the public MTL protocols on the bridge classes with `class_addProtocol` (conformance
+  only; dispatch is unchanged) to silence the `is not a MTLBuffer`/`is not a MTLFunction`
+  validation warnings.
+- **Self-test proves it without Maps.** `NativeMetalBridge.rs` has a new `resolve` step at
+  marker `0x6506` (QuartzCore moved to `0x6507`): a 4x MSAA RGBA8 pass resolves into a linear
+  texture over imported host pages, exactly the CAMetalLayer drawable path, and checks the
+  same 4096 texels as `import`. `m2vtest` prints `resolve bad n/4096`.
+- **Next.** Rebuild SweetMetal2 with the `userland` GitHub workflow (manual dispatch; it
+  fetches `metal2vulkan` at `720ef1ce`), install the artifact with
+  `tools/cepheus-metal2-install.sh`, cold-boot, launch the URL above, then check
+  `/var/local/mtl2.log` for `pass resolves into` and screenshot the canvas. If it is still
+  black, inspect the resolve path and runtime errors next.
+- **Phone state at handoff.** USB SSH reachable; FlameBridge relay on 127.0.0.1:2223;
+  installed `SweetMetal2` is 21,569,232 bytes and does not include the resolve fix or the
+  protocol conformance. Maps is not running.
 
 ### Maps: locationd hang is fixed; next blocker is SweetMetal2's missing legacy function API (2026-11-25)
 
