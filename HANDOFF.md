@@ -30,11 +30,15 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   `BO cache: lookups=67 hits=8 inserts=14 evictions=6 flushes=0 cached=0 MiB
   peak=0 MiB holes=1`. A Maps launch (PID 4779, Croatia URL) logged the same line
   after each probe: lookups 34→44→45→51, hits 9→11→12→14, inserts 13→15→17→18,
-  evictions 0→0→0→3, `cached=0 MiB`, `peak=0 MiB`, holes 1→1→1→4. The cache is
-  empty at each probe; `peak` stays 0 despite inserts, so either the CI dylib's
-  stats layout/peak tracking differs from the local source or the field is not
-  the one labeled. The first four counters and `holes` are usable; do not read
-  `cached`/`peak` as proof of no growth yet.
+  evictions 0→0→0→3, `cached=0 MiB`, `peak=0 MiB`, holes 1→1→1→4.
+- **backboardd baseline after the Maps kill.** The same build's 10 s telemetry
+  reached `lookups=663 hits=50 inserts=97 evictions=47 flushes=0 cached=0 MiB
+  peak=13 MiB holes=25-26` after a few minutes idle. So the peak field works in
+  backboardd; the Maps process's `peak=0` is a per-process/cache-path difference,
+  not proof the field is broken. `cached=0` at every sample means the cache was
+  empty at that instant, not that it never held BOs. Holes fluctuate 25/26 rather
+  than growing monotonically; use this as the idle baseline for the 900x900
+  transition test.
 - **Launch result.** 12 `multisample texture`, 8 `drawable direct present`,
   4 `surface probe commit`, 900x900 surface 315 after the probes, no
   `OutOfMemory(Device)`, probe commit 11 mean `93.9 92.6 9.2 255.0`. The app
@@ -43,7 +47,7 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   The new `BO cache:` line should show whether it grows the cache/holes; battery
   is low, so a soak is deferred.
 - **Phone state.** Maps/debugserver off; `backboardd` 4738, `SpringBoard` 4740;
-  `/var/local/mtl2.log` has only post-truncate backboardd telemetry,
+  `/var/local/mtl2.log` has only post-truncate backboardd telemetry (~42 KB),
   `/var/local/mtl2-bo.log` empty. Battery 64% (2112/3300),
   `ExternalConnected=Yes`, `IsCharging=No`; keep it charging and cool.
 
