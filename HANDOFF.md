@@ -32,7 +32,7 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
   BGRA8 (the drawable format), the pipeline format follows the target, the expected texels
   follow the byte order, and `m2vtest` labels `0x6506` as resolve and `0x6507` as
   QuartzCore.
-- **New probe (working tree, needs the workflow build).** One-shot logs of the drawable
+- **New probe (committed in `f84cb2b`; build fix `25500e0`).** One-shot logs of the drawable
   import (IOSurface ID, size, row bytes, format, usage, storage), the resolving pass's
   render size and raster sample count, its viewport and scissor; after GPU completion the
   first four resolved surfaces (then every 300th, ~5 s at 60 Hz) are read back through the

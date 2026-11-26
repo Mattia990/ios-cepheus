@@ -38,7 +38,7 @@ static void (*gMissing)(const char *, const char *);
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
-static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImports,gPassProbes,gViewportProbes,gScissorProbes;
+static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses,gResolves,gSurfaceImportLogs,gPassProbes,gViewportProbes,gScissorProbes;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -1489,7 +1489,7 @@ static char sweetMemoryOwnerKey;
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
  if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
- if(gSurfaceImports++<4)NBLOG(@"native-metal: drawable surface %u %zux%zu row %zu format %lu usage %llu storage %lu",
+ if(gSurfaceImportLogs++<4)NBLOG(@"native-metal: drawable surface %u %zux%zu row %zu format %lu usage %llu storage %lu",
      IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
      (unsigned long)d.pixelFormat,(unsigned long long)d.usage,(unsigned long)d.storageMode);
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
