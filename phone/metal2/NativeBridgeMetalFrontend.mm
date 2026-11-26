@@ -551,7 +551,29 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
+- (void)queuePresentation:(void (^)(void))block;
 @end
+// The app presents QuartzCore's drawable itself, immediately after commit, before the GPU has written the
+// resolved surface; the window server then samples the previous (cleared) frame. Map each resolved surface to
+// the command buffer that wrote it so a direct present can be deferred to that buffer's completion.
+static std::mutex gSurfaceCommandLock;
+static NSMapTable<NSNumber *,NBCommandBuffer *> *gSurfaceCommands;
+static void registerSurfaceCommand(IOSurfaceRef surface,NBCommandBuffer *commandBuffer) {
+ if(!surface)return;
+ std::lock_guard<std::mutex> lock(gSurfaceCommandLock);
+ if(!gSurfaceCommands)gSurfaceCommands=[NSMapTable strongToWeakObjectsMapTable];
+ [gSurfaceCommands setObject:commandBuffer forKey:@(IOSurfaceGetID(surface))];
+}
+static NBCommandBuffer *surfaceCommand(uint32_t surface) {
+ std::lock_guard<std::mutex> lock(gSurfaceCommandLock);
+ return [gSurfaceCommands objectForKey:@(surface)];
+}
+static void unregisterSurfaceCommand(IOSurfaceRef surface,NBCommandBuffer *commandBuffer) {
+ if(!surface)return;
+ std::lock_guard<std::mutex> lock(gSurfaceCommandLock);
+ NSNumber *key=@(IOSurfaceGetID(surface));
+ if([gSurfaceCommands objectForKey:key]==commandBuffer)[gSurfaceCommands removeObjectForKey:key];
+}
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
@@ -900,7 +922,7 @@ static void scheduled(void *context);
    [_resourceOwners addObject:resolve];
    out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    // The command buffer owns the surface through `_surfaces` until `finish` probes it.
-   if(resolve.surface)_probeSurface=resolve.surface;
+   if(resolve.surface){_probeSurface=resolve.surface;registerSurfaceCommand(resolve.surface,self);}
    resolvingPass=true;
    if(gResolves++==0)NBLOG(@"native-metal: pass resolves into %lux%lu (surface %d, samples %lu)",
        (unsigned long)resolve.width,(unsigned long)resolve.height,resolve.surface!=nil,(unsigned long)texture.sampleCount);
@@ -991,6 +1013,7 @@ static void scheduled(void *context);
  if(_probeSurface) {
   const uint64_t probes=gSurfaceProbes.fetch_add(1);
   if(probes<4 || probes%300==299)probeResolvedSurface(_probeSurface,self.commitIndex,!self.failedLocally);
+  unregisterSurfaceCommand(_probeSurface,self);
  }
  // Present after the probe has read the completed surface. A local refusal never reached the GPU, so its
  // drawable still holds the caller's previous frame and must not be presented.
@@ -1691,23 +1714,38 @@ static void adoptMetalProtocols(void) {
 // and whether it presents the same surface the resolve probe reads. The wrappers call the original methods.
 static IMP gOriginalDrawablePresent,gOriginalDrawablePresentAtTime,gOriginalDrawablePresentAfterMinimumDuration;
 static std::atomic<uint64_t> gDirectPresents;
-static uint64_t drawableSurfaceID(id drawable) {
+static uint32_t drawableSurfaceID(id drawable) {
  id texture=[(id)drawable texture];   // CAMetalDrawable's texture, not in the MTLDrawable protocol
  if(![texture isKindOfClass:[NBTexture class]])return 0;
  IOSurfaceRef surface=((NBTexture *)texture).surface;
  return surface?IOSurfaceGetID(surface):0;
 }
+// The drawable's layer is what the window server composites. Its geometry and visibility say whether a
+// presented surface can appear at all, independently of the resolve.
+static void logDrawableLayer(id drawable) {
+ id layer=[drawable valueForKey:@"layer"];   // CAMetalDrawable's layer, not in the MTLDrawable protocol
+ if(!layer)return;
+ id superlayer=[layer valueForKey:@"superlayer"];
+ NBLOG(@"native-metal: drawable layer %@ bounds %@ position %@ hidden %@ opacity %@ superlayer %@",
+       NSStringFromClass([layer class]),[layer valueForKey:@"bounds"],[layer valueForKey:@"position"],
+       [layer valueForKey:@"hidden"],[layer valueForKey:@"opacity"],
+       superlayer?NSStringFromClass([superlayer class]):@"none");
+}
+static void presentDrawableDirect(id drawable,const char *kind,void (^present)(void)) {
+ const uint32_t surface=drawableSurfaceID(drawable);
+ if(gDirectPresents==0)logDrawableLayer(drawable);
+ NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
+ if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct %s %@ surface %u (%s)",kind,NSStringFromClass([drawable class]),surface,commandBuffer?"deferred to completion":"immediate");
+ if(commandBuffer)[commandBuffer queuePresentation:present];else present();
+}
 static void drawablePresent(id self, SEL _cmd) {
- if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self));
- ((void(*)(id,SEL))gOriginalDrawablePresent)(self,_cmd);
+ presentDrawableDirect(self,"present",^{((void(*)(id,SEL))gOriginalDrawablePresent)(self,_cmd);});
 }
 static void drawablePresentAtTime(id self, SEL _cmd, CFTimeInterval time) {
- if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu at %.3f",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self),time);
- ((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAtTime)(self,_cmd,time);
+ presentDrawableDirect(self,"present at time",^{((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAtTime)(self,_cmd,time);});
 }
 static void drawablePresentAfterMinimumDuration(id self, SEL _cmd, CFTimeInterval duration) {
- if(gDirectPresents++<8)NBLOG(@"native-metal: drawable direct present %@ surface %llu after %.3f",NSStringFromClass([self class]),(unsigned long long)drawableSurfaceID(self),duration);
- ((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAfterMinimumDuration)(self,_cmd,duration);
+ presentDrawableDirect(self,"present after",^{((void(*)(id,SEL,CFTimeInterval))gOriginalDrawablePresentAfterMinimumDuration)(self,_cmd,duration);});
 }
 static void installDrawablePresentHooks(void) {
  Class cls=NSClassFromString(@"CAMetalDrawable");

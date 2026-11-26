@@ -5,6 +5,32 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps presents the drawable directly, before the GPU has written it (2026-11-26)
+
+- **The app does not use `presentDrawable:`.** With the presentation-log build
+  (`d026e2aa...` bundle) installed, Maps 6266 logs
+  `drawable direct present CAMetalDrawable surface 212` (then 213, 214), and each present
+  precedes the matching `surface probe commit N (completed)`. The app calls the real
+  drawable's `present` itself, immediately after commit.
+- **The probe still reads uniform gray.** Mean BGRA `47.0 45.0 43.0 255.0`,
+  `nonblack 43005/43005`, centre/upper `47,45,43,255`. The panel below the status bar is
+  still the pre-probe frame: 41/7,170,120 channels differ (max delta 9); only the status
+  bar changed. The window server samples the drawable before the GPU has written it, so
+  every presented frame is the cleared surface.
+- **Fix (local, needs a workflow build).** Each resolving command buffer registers its
+  resolve surface in a surface→command-buffer table. The `CAMetalDrawable` present hook
+  now defers the original present to that command buffer's completion
+  (`queuePresentation:`), instead of calling it immediately. A late present after
+  completion is shown immediately. The hook also logs the drawable layer's class, bounds,
+  position, hidden, opacity, and superlayer once, so a hidden or detached layer is
+  distinguishable from a sampling race.
+- **Next.** Rebuild with the `userland` workflow, install, relaunch Maps, and check the
+  log for `drawable direct present ... (deferred to completion)` plus the `drawable layer`
+  line. The screenshot should change; if it does not, the layer line says why.
+- **Phone state at handoff.** Installed bundle is `d026e2aa423bed88a76d62e9934596767a63da47b52e95190c84406a47ef4aba`
+  (presentation-log build, no deferral); Maps 6266 is running at the TCC alert. Wi-Fi SSH
+  and the file server are reachable at 192.168.1.100.
+
 ### Maps: the resolve now writes the drawable; presentation is the gap (2026-11-26)
 
 - **The probe reads real content.** With the probe build installed (`4bab4e6b...` bundle,
