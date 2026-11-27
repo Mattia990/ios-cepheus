@@ -2043,6 +2043,36 @@ static void logLayerChain(id drawable) {
   layer=[layer valueForKey:@"superlayer"];
  }
 }
+// The map's MetalLayer sits in a VKMapView whose own contents is a full-screen CABackingStore.
+// When the compositor shows that backing store instead of the drawable, its buffer is the black
+// frame. SWEETMTL_INTROSPECT=1 dumps the private accessors once, and the IOSurface behind them.
+static void logBackingStore(id drawable) {
+ const char *value=getenv("SWEETMTL_INTROSPECT");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ id superlayer=[layer valueForKey:@"superlayer"];
+ id contents=layerContentsValue(superlayer);
+ if(!contents)return;
+ static std::once_flag once;
+ std::call_once(once,[contents]{
+  NBLOG(@"native-metal: superlayer contents class %@ desc %@",NSStringFromClass([contents class]),contents);
+  for(NSString *key in @[@"buffer",@"iosurface",@"surface",@"imageQueue",@"width",@"height"]) {
+   SEL sel=NSSelectorFromString(key);
+   if(![contents respondsToSelector:sel])continue;
+   @try {
+    id value=((id(*)(id,SEL))objc_msgSend)(contents,sel);
+    NBLOG(@"native-metal: superlayer contents -%@ -> %@ %@",key,value?NSStringFromClass([value class]):@"nil",value?value:@"nil");
+    if(value && CFGetTypeID((__bridge CFTypeRef)value)==IOSurfaceGetTypeID()) {
+     double mean[3];
+     if(surfaceMean((__bridge IOSurfaceRef)value,mean))
+      NBLOG(@"native-metal: superlayer surface %u mean %.1f %.1f %.1f",IOSurfaceGetID((__bridge IOSurfaceRef)value),mean[0],mean[1],mean[2]);
+    }
+   } @catch(id error) {
+    NBLOG(@"native-metal: superlayer contents -%@ raised %@",key,error);
+   }
+  }
+ });
+}
 // A layer with presentsWithTransaction expects the present in a Core Animation transaction. The
 // app's transaction has usually committed by the time the GPU finishes, so a completion-thread
 // present can be dropped; a background transaction or the main queue gives it one. The env file
@@ -2066,6 +2096,18 @@ static PresentMode presentModeForDrawable(id drawable) {
 }
 static const char *presentModeName(PresentMode mode) {
  return mode==PresentImmediate?"immediate":mode==PresentTransaction?"transaction":mode==PresentMain?"main":mode==PresentWait?"wait":"deferred";
+}
+// SWEETMTL_HOLD=<ms> keeps the app's thread in presentDrawable after the real present, so the
+// drawable cannot come back from nextDrawable and be cleared before the window server samples it.
+// A test knob, not a fix: it trades frame rate for a stable handoff.
+static int presentHoldMs(void) {
+ static int hold=-1;
+ if(hold<0) {
+  const char *value=getenv("SWEETMTL_HOLD");
+  hold=value?atoi(value):0;
+  if(hold<0)hold=0;
+ }
+ return hold;
 }
 // Core Animation transactions are per-thread; a completion thread has no run loop to commit an
 // implicit one, so an explicit begin/commit is what lets a presentsWithTransaction layer update.
@@ -2101,7 +2143,7 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  const uint32_t resolved=gLastResolveSurface.load();
  const BOOL main=[NSThread isMainThread];
  const PresentMode mode=presentModeForDrawable(drawable);
- if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);}
+ if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);logBackingStore(drawable);}
  else if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  const char *placement=mode==PresentWait?"waited on the app's thread":commandBuffer?"deferred to completion":"immediate";
@@ -2109,12 +2151,14 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
   NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d mode %s (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,presentModeName(mode),placement);
  if(surface!=resolved && gPresentSurfaceMismatches++<8)
   NBLOG(@"native-metal: presented surface %u differs from the last resolve surface %u",surface,resolved);
+ const bool queueLog=presentCount<8 || presentCount%60==59;
  void (^afterPresent)(void)=^{
   present();
   if(presentCount<8) {
    id layer=[drawable valueForKey:@"layer"];
    NBLOG(@"native-metal: present %llu layer contents after %@",presentCount,layerContents(layer));
   }
+  if(queueLog)logImageQueue(layerContentsValue([drawable valueForKey:@"layer"]),"after present");
  };
  void (^show)(void)=afterPresent;
  if(mode==PresentTransaction)show=^{presentInTransaction(afterPresent);};
@@ -2127,8 +2171,19 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  // run: otherwise the app can get the same surface from nextDrawable and clear it while the window
  // server still samples the frame, which shows up as black frames with a moving fragment.
  if(mode==PresentWait) {
-  if(commandBuffer)[commandBuffer waitUntilCompleted];
+  if(commandBuffer) {
+   [commandBuffer waitUntilCompleted];
+   if(presentCount<8)NBLOG(@"native-metal: present %llu waited for command buffer completion",presentCount);
+  } else if(presentCount<8) {
+   NBLOG(@"native-metal: present %llu had no command buffer to wait for",presentCount);
+  }
   afterPresent();
+  const int hold=strcmp(getprogname(),"backboardd")?presentHoldMs():0;
+  if(hold>0) {
+   if(presentCount<8)NBLOG(@"native-metal: present %llu holding %d ms",presentCount,hold);
+   usleep((useconds_t)hold*1000);
+   if(queueLog)logImageQueue(layerContentsValue([drawable valueForKey:@"layer"]),"after hold");
+  }
   return;
  }
  if(mode==PresentImmediate){afterPresent();return;}
