@@ -26,21 +26,24 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 - **No texture import.** `backboardd` never logged `compositor drawable surface`; only
   the app imported its own drawables. The window server consumes the `CAImageQueue`
   directly, so the Metal import probe cannot see the handoff.
-- **Diagnostics prepared (local, not pushed).** `SWEETMTL_DUMP_DISPLAY=1` makes
-  `backboardd` write the display surface to
-  `/var/local/display-<id>-<w>x<h>-<pitch>.raw` from its 10 s telemetry thread. The
-  telemetry now also has a `G display` 4x4 luminance grid, the layer's `frame`,
-  `anchorPoint`, `contentsScale`, `contentsRect`, `contentsGravity`, `transform` and
-  `masksToBounds`, the `CAImageQueue` size/displayed surface, a log of every other
-  1125x2436 surface `backboardd` imports, and `SWEETMTL_TX=0` to clear
-  `presentsWithTransaction` for a normal-path A/B. `NativeBridgeMetalFrontend.mm`
-  passes a local `clang -fsyntax-only` against the macOS SDK.
-- **Next.** Push, run the GitHub `userland` workflow, install the artifact, create
-  `/var/local/mtl2-env` with `SWEETMTL_DUMP_DISPLAY=1`, restart
-  `backboardd`/`SpringBoard`, launch Maps, then pull `/var/local/display-*.raw` and
-  `/var/local/mtl2.log`. Measure the grid and the piece; if the dump is a 1/3-size
-  top-left map, fix the compositor's queue geometry/scale. If the dump is the full map,
-  the panel/scanout path is next.
+- **Diagnostics.** `d96416e` (pushed) adds `SWEETMTL_DUMP_DISPLAY=1` (the bright display
+  surface to `/var/local/display-<id>-<w>x<h>-<pitch>.raw` every 10 s), the `G display`
+  4x4 luminance grid, the layer's `frame`, `anchorPoint`, `contentsScale`,
+  `contentsRect`, `contentsGravity`, `transform` and `masksToBounds`, the
+  `CAImageQueue` size/displayed surface, a log of every other 1125x2436 surface
+  `backboardd` imports, and `SWEETMTL_TX=0`. A local follow-up (not pushed) adds the
+  `H display` change-hash and dumps all four surfaces in a 40 s cycle, so the black
+  live pair is captured too. `NativeBridgeMetalFrontend.mm` passes a local
+  `clang -fsyntax-only` against the macOS SDK.
+- **Next.** If the `d96416e` artifact is already built, start with its bright-surface
+  dump and `G` grids. Otherwise push the follow-up (fast-forward), run the GitHub
+  `userland` workflow, install the artifact, create `/var/local/mtl2-env` with
+  `SWEETMTL_DUMP_DISPLAY=1`, restart `backboardd`/`SpringBoard`, launch Maps, then pull
+  `/var/local/display-*.raw` and `/var/local/mtl2.log`. Compare the `H display` hashes
+  (live vs stale) and the `G` grids; if the live surface has a 1/3-size top-left map,
+  fix the compositor's queue geometry/scale. If the live surface is black and the map is
+  only in a stale pair, the map is a separate IOMFB/direct-display layer and the
+  panel/scanout path is next.
 - **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log`,
   `mtl2-bo.log` and `ds.log` are truncated; `backboardd` 1497, `SpringBoard` 1503;
   battery ~50% and charging.

@@ -2348,6 +2348,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   row("D display %u id %u mean %.1f %.1f %.1f center %u,%u,%u upper %u,%u,%u",i,IOSurfaceGetID(surface),
       sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
       center[0],center[1],center[2],top[0],top[1],top[2]);
+  // A sparse hash says which of the four surfaces the compositor is actually updating: the stale
+  // pair stays constant while the live pair changes on a pan, even when both have some content.
+  uint32_t hash=2166136261u;
+  for(size_t y=0;y<height;y+=64)for(size_t x=0;x<width;x+=64) {
+   const uint8_t *p=base+y*pitch+x*4;
+   hash=(hash^p[0])*16777619u;hash=(hash^p[1])*16777619u;hash=(hash^p[2])*16777619u;
+  }
+  static uint32_t lastHash[4];static bool haveHash[4];
+  const bool changed=haveHash[i] && lastHash[i]!=hash;
+  lastHash[i]=hash;haveHash[i]=true;
+  row("H display %u id %u hash %08x chg %d",i,IOSurfaceGetID(surface),hash,changed?1:0);
   // 4x4 luminance grid: a map piece at 1/3 scale lights one cell, a full map lights every cell.
   uint32_t grid[16]={0};
   for(unsigned gy=0;gy<4;gy++)for(unsigned gx=0;gx<4;gx++) {
@@ -2363,13 +2374,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
       grid[0],grid[1],grid[2],grid[3],grid[4],grid[5],grid[6],grid[7],
       grid[8],grid[9],grid[10],grid[11],grid[12],grid[13],grid[14],grid[15]);
   // The exact pixels, for measuring the piece offline instead of inferring it from three samples.
-  // Once per 10 s is enough; the file is overwritten so a pull after the map renders is current.
+  // One surface per 10 s in turn, so the black live pair is dumped as well as the bright stale one.
   const char *dumpEnv=getenv("SWEETMTL_DUMP_DISPLAY");
-  if(dumpEnv && *dumpEnv!='0' && !strcmp(getprogname(),"backboardd") && sum[0]/(double)samples>20.0) {
-   static std::atomic<uint64_t> lastDumpUs;
+  if(dumpEnv && *dumpEnv!='0' && !strcmp(getprogname(),"backboardd")) {
+   static uint64_t lastDumpUs[4];
    const uint64_t now=nowUs();
-   uint64_t previous=lastDumpUs.load();
-   if(now-previous>10000000ULL && lastDumpUs.compare_exchange_strong(previous,now)) {
+   if(now-lastDumpUs[i]>40000000ULL) {
+    lastDumpUs[i]=now;
     char path[96];
     snprintf(path,sizeof path,"/var/local/display-%u-%zux%zu-%zu.raw",IOSurfaceGetID(surface),width,height,pitch);
     FILE *file=fopen(path,"wb");
