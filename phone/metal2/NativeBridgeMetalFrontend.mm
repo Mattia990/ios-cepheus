@@ -369,8 +369,13 @@ static void probeSurface(IOSurfaceRef surface,const char *what,uint32_t commit,b
   const char *dumpEnv=getenv("SWEETMTL_DUMP_DRAWABLE");
   if(dumpEnv && *dumpEnv!='0') {
    static uint64_t lastDrawableDumpUs;
+   static std::atomic<uint64_t> dumps;
    const uint64_t now=nowUs();
-   if(now-lastDrawableDumpUs>40000000ULL) {
+   const uint64_t n=dumps.load();
+   // The first eight presented frames cover the map's first live drawable; the time throttle
+   // keeps the later steady state from writing the file every frame.
+   if(n<8 || now-lastDrawableDumpUs>40000000ULL) {
+    dumps.store(n+1);
     lastDrawableDumpUs=now;
     char path[96];
     snprintf(path,sizeof path,"/var/local/drawable.raw");
@@ -739,6 +744,18 @@ static float gCompositorFragmentBytes[4]={0,0,0,0};
 static NSUInteger gCompositorFragmentBytesLength;
 static NBTexture *gCompositorDrawTextures[8];
 static void *gCompositorDrawPipeline;
+// The map draw's own quad: the last vertex buffer at one index is usually a transform, so keep
+// every vertex-buffer binding and the index buffer current at the draw. The geometry dump reads
+// them at the map draw, which is the only place the render server's placement is visible.
+static NBBuffer *gCompositorVertexBuffers[8];
+static NSUInteger gCompositorVertexOffsets[8];
+static NBBuffer *gCompositorIndexBuffer;
+static NSUInteger gCompositorIndexOffset,gCompositorIndexCount;
+static MTLIndexType gCompositorIndexType;
+static uint32_t gCompositorPassTarget;
+static float gCompositorPassClear[4];
+static NSUInteger gCompositorPassLoad,gCompositorPassStore;
+static std::atomic<uint64_t> gCompositorGeometryDumps;
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
@@ -783,6 +800,10 @@ static void waitForResource(id resource) {
   gCompositorVertexBuffer=(NBBuffer *)buffer;
   gCompositorVertexOffset=offset;
   gCompositorVertexBufferIndex=index;
+  if(index<8) {
+   gCompositorVertexBuffers[index]=(NBBuffer *)buffer;
+   gCompositorVertexOffsets[index]=offset;
+  }
  }
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
@@ -889,24 +910,102 @@ static bool sampleCompositorDraw(void) {
  if(!gCompositorSampleUs.compare_exchange_strong(last,now))return false;
  return true;
 }
-static void logCompositorMapsDraw(const char *kind,unsigned long count) {
- if(!compositorLogging() || !gCompositorMapsImported.load())return;
- NBTexture *bound=gCompositorDrawTextures[0];
- const uint32_t texture=(bound && bound.surface)?IOSurfaceGetID(bound.surface):0;
- if(!texture || gCompositorMapsDrawLogs++>=96)return;
- const MTLScissorRect r=gCompositorLastScissor;
- const MTLViewport v=gCompositorLastViewport;
- NBLOG(@"native-metal: compositor maps draw %s %lu texture %u scissor %llu,%llu %llux%llu viewport %.1f,%.1f %.1fx%.1f",
-       kind,count,texture,(unsigned long long)r.x,(unsigned long long)r.y,
-       (unsigned long long)r.width,(unsigned long long)r.height,v.originX,v.originY,v.width,v.height);
-}
-// The map draw's scissor is full-screen, so the strip has to come from the quad or from a later
-// draw. Log the vertex data the compositor feeds the shader: v0..v3 are the first four vertices,
-// eight floats each, which covers both the position+texcoord and position+color layouts. The
-// compositor uses setVertexBytes, so fall back to the captured bytes when no buffer is bound.
 static uint32_t compositorTextureID(NBTexture *texture) {
  if(!texture || !texture.surface)return 0;
  return IOSurfaceGetID(texture.surface);
+}
+// The compositor draws the gray VKMapView backdrop before the map. Only spend the geometry dump
+// budget on a warm, map-like surface: the backdrop's mean is about 47/45/43, the map's is >100
+// in red. A channel-sampled mean is enough and matches the import/probe lines.
+static bool surfaceLooksLikeMap(IOSurfaceRef surface) {
+ double mean[3]={-1,-1,-1};
+ if(!surface || !surfaceMean(surface,mean))return false;
+ return mean[0]>80.0;
+}
+// The map draw's scissor is full-screen, so the strip has to come from the quad or from a later
+// draw. Dump the index buffer and every vertex-buffer binding current at the map draw, plus the
+// sampled map surface itself: the quad, the transform and the exact frame the compositor read.
+// The files must already exist and be writable by backboardd.
+static void dumpCompositorMapGeometry(NBTexture *texture,unsigned slot) {
+ const char *env=getenv("SWEETMTL_COMPDUMP");
+ if(!env || !*env || *env=='0')return;
+ if(!texture || !texture.surface)return;
+ if(gCompositorGeometryDumps.fetch_add(1)>=4)return;
+ IOSurfaceRef surface=texture.surface;
+ const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),row=IOSurfaceGetBytesPerRow(surface);
+ const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
+ if(!base || row<width*4)return;
+ sys_dcache_flush((void *)base,IOSurfaceGetAllocSize(surface));
+ FILE *map=fopen("/var/local/compositor-map.raw","wb");
+ size_t mapWrote=0;const size_t mapBytes=row*height;
+ if(map){mapWrote=fwrite(base,1,mapBytes,map);fclose(map);}
+ // The index buffer: six indices for a quad, twelve for two quads. Log the values because the
+ // vertex buffer alone does not say which vertices the draw actually uses.
+ NSUInteger indexBytes=0,indexCount=0;
+ if(gCompositorIndexBuffer) {
+  const uint8_t *p=(const uint8_t *)[gCompositorIndexBuffer contents];
+  const NSUInteger length=[gCompositorIndexBuffer length];
+  if(p && gCompositorIndexOffset<length) {
+   indexBytes=MIN(length-gCompositorIndexOffset,(NSUInteger)4096);
+   indexCount=MIN(gCompositorIndexCount,(NSUInteger)12);
+   FILE *file=fopen("/var/local/compositor-ib.raw","wb");
+   if(file){fwrite(p+gCompositorIndexOffset,1,indexBytes,file);fclose(file);}
+   const bool wide=gCompositorIndexType==MTLIndexTypeUInt32;
+   NBLOG(@"native-metal: compositor map index type %lu count %lu off %lu bytes %lu dump %s",
+         (unsigned long)gCompositorIndexType,(unsigned long)gCompositorIndexCount,
+         (unsigned long)gCompositorIndexOffset,(unsigned long)indexBytes,
+         indexBytes?"/var/local/compositor-ib.raw":"none");
+   NSMutableString *values=[NSMutableString string];
+   for(NSUInteger i=0;i<indexCount;i++) {
+    const NSUInteger at=i*(wide?4:2);
+    if(at+(wide?4:2)>indexBytes)break;
+    const uint32_t value=wide?*(const uint32_t *)(p+gCompositorIndexOffset+at):*(const uint16_t *)(p+gCompositorIndexOffset+at);
+    [values appendFormat:@"%s%u",i?",":"",value];
+   }
+   NBLOG(@"native-metal: compositor map indices %@",values);
+  }
+ }
+ NBLOG(@"native-metal: compositor map geometry slot %u id %u pass target %u clear %.3f %.3f %.3f %.3f load %lu store %lu map %zu/%zu",
+       slot,IOSurfaceGetID(surface),gCompositorPassTarget,gCompositorPassClear[0],gCompositorPassClear[1],
+       gCompositorPassClear[2],gCompositorPassClear[3],(unsigned long)gCompositorPassLoad,
+       (unsigned long)gCompositorPassStore,mapWrote,mapBytes);
+ for(unsigned i=0;i<8;i++) {
+  NBBuffer *buffer=gCompositorVertexBuffers[i];
+  if(!buffer)continue;
+  const uint8_t *p=(const uint8_t *)[buffer contents];
+  const NSUInteger length=[buffer length],offset=gCompositorVertexOffsets[i];
+  if(!p || offset>=length)continue;
+  const NSUInteger bytes=MIN(length-offset,(NSUInteger)4096);
+  char path[64];snprintf(path,sizeof path,"/var/local/compositor-vb%u.raw",i);
+  FILE *file=fopen(path,"wb");
+  size_t wrote=0;if(file){wrote=fwrite(p+offset,1,bytes,file);fclose(file);}
+  float f[8]={0};memcpy(f,p+offset,MIN(bytes,sizeof(f)));
+  NBLOG(@"native-metal: compositor map vertex buffer %u off %lu len %lu first %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f dump %zu/%lu",
+        i,(unsigned long)offset,(unsigned long)length,f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
+        wrote,(unsigned long)bytes);
+ }
+}
+static void logCompositorMapsDraw(const char *kind,unsigned long count) {
+ if(!compositorLogging() || !gCompositorMapsImported.load())return;
+ NBTexture *bound=nil;unsigned slot=0;
+ for(unsigned i=0;i<8 && !bound;i++) {
+  NBTexture *candidate=gCompositorDrawTextures[i];
+  if(candidate && candidate.surface) {
+   IOSurfaceRef surface=candidate.surface;
+   if(IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436 &&
+      surfaceLooksLikeMap(surface)){bound=candidate;slot=i;}
+  }
+ }
+ const uint32_t texture=compositorTextureID(bound);
+ if(!texture)return;
+ if(gCompositorMapsDrawLogs++<96) {
+  const MTLScissorRect r=gCompositorLastScissor;
+  const MTLViewport v=gCompositorLastViewport;
+  NBLOG(@"native-metal: compositor maps draw %s %lu slot %u texture %u scissor %llu,%llu %llux%llu viewport %.1f,%.1f %.1fx%.1f",
+        kind,count,slot,texture,(unsigned long long)r.x,(unsigned long long)r.y,
+        (unsigned long long)r.width,(unsigned long long)r.height,v.originX,v.originY,v.width,v.height);
+ }
+ if(gCompositorGeometryDumps.load()<4)dumpCompositorMapGeometry(bound,slot);
 }
 // What the compositor's shader samples at the map draw: the app drawable if the layer's contents
 // reached it, something else if the layer tree points elsewhere. The file is pre-created.
@@ -948,6 +1047,10 @@ static void dumpCompositorSampled(void) {
        (unsigned long long)n,slot,IOSurfaceGetID(surface),sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
        center[0],center[1],center[2],wrote,bytes);
 }
+// The map draw's scissor is full-screen, so the strip has to come from the quad or from a later
+// draw. Log the vertex data the compositor feeds the shader: v0..v3 are the first four vertices,
+// eight floats each, which covers both the position+texcoord and position+color layouts. The
+// compositor uses setVertexBytes, so fall back to the captured bytes when no buffer is bound.
 static void logCompositorTrace(const char *kind,unsigned long count,long baseVertex) {
  const MTLScissorRect r=gCompositorLastScissor;
  NBBuffer *buffer=gCompositorVertexBuffer;
@@ -1103,6 +1206,12 @@ static void logCompositorTrace(const char *kind,unsigned long count,long baseVer
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(self.compositor) {
+  gCompositorIndexBuffer=(NBBuffer *)b;
+  gCompositorIndexOffset=o;
+  gCompositorIndexCount=n;
+  gCompositorIndexType=k;
+ }
  if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorDrawLogs++<16)
   NBLOG(@"native-metal: compositor draw indexed type %lu indices %lu instances %lu baseVertex %ld",(unsigned long)t,(unsigned long)n,(unsigned long)i,(long)v);
  if(self.compositor)logCompositorMapsDraw("indexed",(unsigned long)n);
@@ -1320,8 +1429,18 @@ static void scheduled(void *context);
   self.compositorWork=YES;
   gCompositorVertexBuffer=nil;gCompositorVertexOffset=0;gCompositorVertexBufferIndex=0;
   gCompositorVertexBytesLength=0;gCompositorFragmentBytesLength=0;
-  for(unsigned i=0;i<8;i++)gCompositorDrawTextures[i]=nil;
+  for(unsigned i=0;i<8;i++){gCompositorDrawTextures[i]=nil;gCompositorVertexBuffers[i]=nil;gCompositorVertexOffsets[i]=0;}
+  gCompositorIndexBuffer=nil;gCompositorIndexOffset=0;gCompositorIndexCount=0;gCompositorIndexType=MTLIndexTypeUInt16;
   gCompositorDrawPipeline=nullptr;
+  id passTarget=d.colorAttachments[0].texture;
+  gCompositorPassTarget=([passTarget isKindOfClass:[NBTexture class]] && [(NBTexture *)passTarget surface])?
+    IOSurfaceGetID([(NBTexture *)passTarget surface]):0;
+  gCompositorPassClear[0]=d.colorAttachments[0].clearColor.red;
+  gCompositorPassClear[1]=d.colorAttachments[0].clearColor.green;
+  gCompositorPassClear[2]=d.colorAttachments[0].clearColor.blue;
+  gCompositorPassClear[3]=d.colorAttachments[0].clearColor.alpha;
+  gCompositorPassLoad=(NSUInteger)d.colorAttachments[0].loadAction;
+  gCompositorPassStore=(NSUInteger)d.colorAttachments[0].storeAction;
  }
  if(compositorPass && compositorLogging() && gCompositorMapsImported.load() && gCompositorPassLogs++<8) {
   id target=d.colorAttachments[0].texture;

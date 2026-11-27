@@ -5,6 +5,55 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the drawable has the map; the compositor's map draw still yields a top strip (2026-11-27)
+
+- **Build tested.** `fd52ae9` installed over Wi-Fi with pull-back verification: `SweetMetal2`
+  `95168a5d...` (21,637,296 bytes), dylib `712a565a...` (17,294,896 bytes), `CodeResources`
+  `ffa34f9f...` (2,042 bytes), Info.plist `82f7230b...`. `backboardd` 1451, `SpringBoard` 1458.
+  Diagnostics enabled with `SWEETMTL_COMPDUMP=1`, `CLEARBG=2`, `SNAP=1`, `COMPOSITOR=1`,
+  `HOLD=0`, `KILLANIM=0`, `PRESENT=wait`, `LAYERS=1`, `INTROSPECT=1`, `DUMP_DRAWABLE=1`,
+  `DUMP_DISPLAY=1`.
+- **The app drawable is the full map.** App surfaces 51/52 are `1125x2436`, mean
+  `118.9 66.5 32.4` / `119.6 69.5 32.0`, nonblack `43005/43005`, centre `130,57,33`.
+  The compositor imports 51/52 (`compositor import ... mean 130.0 57.0 33.0` /
+  `119.1 69.6 31.7`) and traces the map draw sampling texture 52:
+  `compositor trace indexed 6 base 0 ... tex 0,0,0,52 pipe 0x102553c60 ... scissor 0,0 1125x2436`.
+  The trace's `v0..v3` are the buffer at index 3 (a transform/uniform), not the map quad.
+- **The display target has map content only briefly.** At one commit display 0/1 were
+  `mean 56.6 37.0 30.1 center 59,46,40 upper 71,33,20` (map present); later both were
+  `mean 31.5 25.8 21.7 center 0,0,0 upper 0,0,0`. `display-35.raw` shows the status bar, a
+  thin map strip at the top, a black map area and the bottom sheet. `display-35.raw` and
+  `compositor-35.raw` were byte-identical in one dump, so the target content is the
+  compositor's output, not a scanout copy.
+- **HOLD=120 does not remove the moving band.** App map surfaces 78/79 (mean `118.6 69.9 31.2`)
+  are imported; the display still shows the band. The surface handoff is not the whole bug.
+- **KILLANIM=1 changed the failure.** The user saw the map stable until tapping “Allow While
+  Using App”, then the middle went black. The app drawables in that run (83-87) were grey
+  (`mean 47.2 45.2 43.1`), so the “stable” map was not coming from those drawables; it was
+  likely the launch snapshot, and after the alert dismissed the live view was black. Display
+  35/36 went from `mean 56.9 55.0 53.0` (alert) to
+  `mean 29.7 25.2 21.6 center 56,44,37 upper 0,0,0` to `mean 31.6 25.8 21.6 center 0,0,0`.
+  Do not use KILLANIM for the map-strip test.
+- **New diagnostic build (local, not pushed).** `NativeBridgeMetalFrontend.mm` now:
+  - keeps every vertex-buffer binding (indices 0-7) and the index buffer/offset/type/count
+    current at a draw;
+  - on the first four map-like full-size draws (`mean red > 80`), dumps
+    `/var/local/compositor-map.raw` (the sampled app surface), `/var/local/compositor-ib.raw`
+    and `/var/local/compositor-vb0..7.raw`, and logs `compositor map geometry`, the index values
+    and each buffer's offset/length/first eight floats;
+  - logs `compositor maps draw ... slot ... viewport ...` for the map texture at any slot (it was
+    at slot 3, so the old slot-0-only line never fired);
+  - logs the pass target/clear/load/store with the geometry;
+  - dumps the first eight presented app drawables (`drawable.raw`) before the 40 s throttle.
+- **Test plan.** Pre-create `/var/local/compositor-map.raw`, `compositor-ib.raw` and
+  `compositor-vb0..7.raw` as 0666 (new names via `scp0` + `rename`). Install the artifact,
+  restart `backboardd`/`SpringBoard`, launch Maps (second launch), dismiss the alert, wait for
+  the map, pan. Pull `mtl2.log` and the dumps. If the map draw's vertex buffer is a
+  `1125x132` quad, the render server still has the 44 pt launch frame; if it is full-screen,
+  the strip comes from a later draw/clip or the sampled texture.
+- **Phone.** `192.168.1.100`; Maps killed for the install; display surfaces 35/36/43/46;
+  `/var/local/mtl2.log` and `mtl2-bo.log` truncated; env is the base+`COMPDUMP` config above.
+
 ### Maps: CLEARBG=2 puts the map in the drawable; the compositor still shows black except a flashing patch (2026-11-27)
 
 - **Build tested.** `b3b144b` installed over Wi-Fi with pull-back verification: `SweetMetal2`
