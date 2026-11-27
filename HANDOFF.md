@@ -5,6 +5,55 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: CLEARBG=2 puts the map in the drawable; the compositor still shows black except a flashing patch (2026-11-27)
+
+- **Build tested.** `b3b144b` installed over Wi-Fi with pull-back verification: `SweetMetal2`
+  `1d5f41dd...` (21,637,360 bytes), dylib `72f8a234...` (17,294,896 bytes), `CodeResources`
+  `44232b97...` (2,042 bytes), Info.plist `82f7230b...`. `backboardd` 59, `SpringBoard` 26.
+  Both dylib paths and bundle hashes verified; rollback copies kept.
+- **The two-phase snap now restores the geometry.** `snap phase 0` shrank `MetalLayer`,
+  `VKMapView` and `_MKMapLayerHostingLayer` to `367x804` (position `+4`); `snap phase 1` logged
+  `367x804 -> 375x812` for all three. The app's drawable sizes follow (`1125x2436`, `1101x2412`,
+  then `1125x2436`).
+- **Base run: the drawable is the VKMapView background, not the map.** `/var/local/drawable.raw`
+  id 227 is uniform `43/45/47` (BGRA first pixel `47 45 43 255`), matching `VKMapView`'s
+  background `0.0241576 0.0262412 0.028426 1`. The compositor imports it and draws it
+  full-screen (`compositor maps draw indexed 6 texture 227 scissor 0,0 1125x2436`), but the
+  display map area is near-black (`2-4`). `SWEETMTL_CLEARBG=1` (clear the background colour)
+  changed nothing; four `cleared map backdrop VKMapView mode 1` lines logged.
+- **`SWEETMTL_CLEARBG=2` (drop `VKMapView.contents`) puts real map content in the drawable.**
+  `/var/local/drawable.raw` then shows the Norwegian Sea, Svalbard, `Nordkappbanken`,
+  `Sentralbanken` and land/sea colours, rotated ~90°. The app presents later drawables (29/30/31)
+  with means `105-130 / 57-87 / 29-60`; the compositor imports texture 30 and draws it
+  full-screen. The display dump still shows black over the map area; the screen shows the sheet
+  and status bar correctly and, while panning, a **flashing map patch** just above the sheet
+  (photo IMG_0136). The patch is the map frame; the steady state is black.
+- **First launch after a boot still dies before its first drawable.** Maps 354 crashed after
+  device creation, before any drawable; no Maps crash report. The second launch (492) survived.
+  This happens every boot; use the second launch for tests.
+- **New diagnostic build (local, not pushed).** `NativeBridgeMetalFrontend.mm` now logs, after the
+  first full-size app import:
+  - per-draw `compositor trace` with the actual `setVertexBytes` quad (`v0..v3`), the bound
+    fragment textures 0-3 (surface IDs), the pipeline handle, fragment bytes and scissor; the
+    first 64 draws are logged, then one draw every 50 ms (cap 320) so later frames are sampled;
+  - `compositor sampled` + `/var/local/compositor-sampled.raw`: the full-size texture the shader
+    samples at the draw (up to 8 samples, one per second);
+  - `compositor pass ... target <id> clear r g b a load <n> store <n>`: the pass clear colour and
+    load/store actions;
+  - `compositor display probe` + `/var/local/compositor-<id>.raw`: the display targets read after
+    the command buffer's GPU completion (one round per 5 s), separating the compositor's draw from
+    the scanout/present.
+  Enable with `SWEETMTL_COMPDUMP=1` (files must be pre-created 0666).
+- **Test plan.** Install the new artifact, restart `backboardd`/`SpringBoard`, pre-create
+  `/var/local/compositor-sampled.raw` and `/var/local/compositor-<id>.raw` for the new display
+  surface IDs, launch Maps (second launch), dismiss the location alert, pan for a few seconds.
+  Then pull the log and the dumps: if `compositor display probe` has the map but the screen is
+  black, the present/scanout is the bug; if the display target is black, read the trace for the
+  map draw's quad and the draws after it (texture 0 / full-screen solid = the cover).
+- **Phone state.** Maps 492 running; `backboardd` 59, `SpringBoard` 26; display surfaces
+  2/3/10/12; `/var/local/mtl2-env` has `SWEETMTL_CLEARBG=2` (remove it after the test);
+  `/var/local/mtl2.log` and `mtl2-bo.log` still hold the CLEARBG=2 run.
+
 ### Maps: the two-phase snap ran, but the drawable is gray and the superlayer may be the cover (2026-11-27)
 
 - **Build tested.** `e9a47f9` installed over Wi-Fi with pull-back verification: `SweetMetal2`
