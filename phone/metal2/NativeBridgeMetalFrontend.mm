@@ -335,6 +335,12 @@ static std::atomic<uint64_t> gSurfaceProbes;
 static IOSurfaceRef gDisplaySurfaces[4];
 static unsigned gDisplaySurfaceCount;
 static std::mutex gDisplaySurfaceLock;
+static bool isDisplaySurface(IOSurfaceRef surface) {
+ if(!surface)return false;
+ std::lock_guard<std::mutex> lock(gDisplaySurfaceLock);
+ for(unsigned i=0;i<gDisplaySurfaceCount;i++)if(gDisplaySurfaces[i]==surface)return true;
+ return false;
+}
 static void probeSurface(IOSurfaceRef surface,const char *what,uint32_t commit,bool completed) {
  if(!surface)return;
  const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),row=IOSurfaceGetBytesPerRow(surface);
@@ -672,6 +678,8 @@ static void unregisterSurfaceCommand(IOSurfaceRef surface,NBCommandBuffer *comma
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 // This pass has a resolving store action: the probe logs its size, viewport and scissor.
 @property(nonatomic) BOOL resolves;
+// This pass renders into one of backboardd's display targets: log its geometry and sampled surfaces.
+@property(nonatomic) BOOL compositor;
 @end
 static void waitForResource(id resource) {
  const uint64_t began=nowUs();
@@ -767,6 +775,15 @@ static void waitForResource(id resource) {
 
 @interface NBRenderEncoder : NBEncoder
 @end
+// SWEETMTL_COMPOSITOR=1: the window server's own render passes, with the viewport, scissor and
+// sampled surfaces at the draws. This is the geometry the display actually gets, independent of
+// the app-side layer tree.
+static bool compositorLogging(void) {
+ static int enabled=-1;
+ if(enabled<0){const char *value=getenv("SWEETMTL_COMPOSITOR");enabled=value && *value && *value!='0';}
+ return enabled!=0;
+}
+static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCompositorTextureLogs,gCompositorDrawLogs,gCompositorPassLogs;
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
@@ -785,7 +802,16 @@ static void waitForResource(id resource) {
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:1];}
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:2];}
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+ if(self.compositor && compositorLogging() && t && [(id)t isKindOfClass:[NBTexture class]] && [(NBTexture *)t surface] && gCompositorTextureLogs++<16) {
+  IOSurfaceRef surface=[(NBTexture *)t surface];
+  double mean[3]={-1,-1,-1};surfaceMean(surface,mean);
+  NBLOG(@"native-metal: compositor texture %u %zux%zu row %zu format %lu mean %.1f %.1f %.1f",
+        IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
+        (unsigned long)[(NBTexture *)t descriptor].format,mean[0],mean[1],mean[2]);
+ }
+ [self texture:t index:i stage:2];
+}
 - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:2];
 }
@@ -799,12 +825,16 @@ static void waitForResource(id resource) {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  if(self.resolves && gViewportProbes++<3)
   NBLOG(@"native-metal: resolve pass viewport %.1f,%.1f %.1fx%.1f z %.3f..%.3f",v.originX,v.originY,v.width,v.height,v.znear,v.zfar);
+ if(self.compositor && compositorLogging() && gCompositorViewportLogs++<16)
+  NBLOG(@"native-metal: compositor viewport %.1f,%.1f %.1fx%.1f z %.3f..%.3f",v.originX,v.originY,v.width,v.height,v.znear,v.zfar);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  if(self.resolves && gScissorProbes++<3)
   NBLOG(@"native-metal: resolve pass scissor %llu,%llu %llux%llu",(unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
+ if(self.compositor && compositorLogging() && gCompositorScissorLogs++<16)
+  NBLOG(@"native-metal: compositor scissor %llu,%llu %llux%llu",(unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
@@ -844,6 +874,8 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(self.compositor && compositorLogging() && gCompositorDrawLogs++<16)
+  NBLOG(@"native-metal: compositor draw type %lu vertices %lu..%lu instances %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -857,6 +889,8 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(self.compositor && compositorLogging() && gCompositorDrawLogs++<16)
+  NBLOG(@"native-metal: compositor draw indexed type %lu indices %lu instances %lu baseVertex %ld",(unsigned long)t,(unsigned long)n,(unsigned long)i,(long)v);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -1001,10 +1035,12 @@ static void scheduled(void *context);
   }
  }
  bool resolvingPass=false;
+ bool compositorPass=false;
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  if(texture.surface && isDisplaySurface(texture.surface))compositorPass=true;
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   /* The resolving store action writes this texture at the end of the pass; without it the MSAA
@@ -1012,6 +1048,7 @@ static void scheduled(void *context);
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;if(resolve.surface)[_surfaces addObject:resolve];
+   if(resolve.surface && isDisplaySurface(resolve.surface))compositorPass=true;
    [_resourceOwners addObject:resolve];
    out.resolve=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    // The command buffer owns the surface through `_surfaces` until `finish` probes it.
@@ -1059,7 +1096,9 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.resolves=resolvingPass;
+ NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.resolves=resolvingPass;encoder.compositor=compositorPass;
+ if(compositorPass && compositorLogging() && gCompositorPassLogs++<8)
+  NBLOG(@"native-metal: compositor pass %lux%lu samples %lu",(unsigned long)pass.width,(unsigned long)pass.height,(unsigned long)pass.samples);
  return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {
@@ -2135,6 +2174,38 @@ static void killLayerAnimations(id drawable) {
   layer=[layer valueForKey:@"superlayer"];
  }
 }
+// The render server can keep the map layer at the launch frame's bounds (44 pt, the status bar)
+// while the app's model and presentation layers are 375x812. Re-setting the bounds inside a
+// transaction with actions disabled makes the render server commit the final geometry without an
+// implicit animation, which is the frozen-clock hypothesis's fix without waiting for its clock.
+static void snapLayerGeometry(id drawable) {
+ const char *value=getenv("SWEETMTL_SNAP");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ Class transaction=NSClassFromString(@"CATransaction");
+ if(transaction) {
+  ((void(*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"begin"));
+  ((void(*)(id,SEL,BOOL))objc_msgSend)(transaction,NSSelectorFromString(@"setDisableActions:"),YES);
+ }
+ for(unsigned depth=0;depth<3 && layer;depth++) {
+  id superlayer=[layer valueForKey:@"superlayer"];
+  if(!superlayer)break;
+  NSValue *boundsValue=[superlayer valueForKey:@"bounds"];
+  NSValue *positionValue=[superlayer valueForKey:@"position"];
+  if(![boundsValue isKindOfClass:[NSValue class]] || ![positionValue isKindOfClass:[NSValue class]])break;
+  CGRect bounds={0};[boundsValue getValue:&bounds];
+  CGPoint position={0};[positionValue getValue:&position];
+  if(bounds.size.width<1 || bounds.size.height<1)break;
+  const CGRect nudge=CGRectMake(bounds.origin.x,bounds.origin.y,bounds.size.width-1,bounds.size.height-1);
+  NBLOG(@"native-metal: snap %u %@ bounds %@ -> %@ position %@ -> %@",depth,NSStringFromClass([layer class]),
+        layerValue(layer,@"bounds"),boundsValue,layerValue(layer,@"position"),positionValue);
+  ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),nudge);
+  ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),bounds);
+  ((void(*)(id,SEL,CGPoint))objc_msgSend)(layer,NSSelectorFromString(@"setPosition:"),position);
+  layer=superlayer;
+ }
+ if(transaction) ((void(*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"commit"));
+}
 // A layer with presentsWithTransaction expects the present in a Core Animation transaction. The
 // app's transaction has usually committed by the time the GPU finishes, so a completion-thread
 // present can be dropped; a background transaction or the main queue gives it one. The env file
@@ -2210,6 +2281,9 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  // Launch animations can be added after the first frame; keep clearing them for the first few
  // seconds so the test does not depend on when the map view's expansion animation was installed.
  if(presentCount<300)killLayerAnimations(drawable);
+ // Push the model geometry to the render server on the first frames, before the app's own
+ // transaction can leave it at the launch frame's 44 pt.
+ if(presentCount<8)snapLayerGeometry(drawable);
  if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  const char *placement=mode==PresentWait?"waited on the app's thread":commandBuffer?"deferred to completion":"immediate";
