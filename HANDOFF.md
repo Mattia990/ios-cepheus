@@ -5,6 +5,67 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the two-phase snap ran, but the drawable is gray and the superlayer may be the cover (2026-11-27)
+
+- **Build tested.** `e9a47f9` installed over Wi-Fi with pull-back verification: `SweetMetal2`
+  `eb0cbbfe...` (21,620,832 bytes), dylib `21455593...` (17,294,896 bytes), `CodeResources`
+  `26ce522f...` (2,042 bytes). `backboardd` 3750, `SpringBoard` 3752. The `snap phase` and
+  `compositor maps draw` strings were present in the installed binary.
+- **The two-phase snap ran, but phase 1 was a no-op for the map layer.** `snap phase 0 0/1/2`
+  shrank `MetalLayer`, `VKMapView` and `_MKMapLayerHostingLayer` from `375x812` to `374x811`;
+  `snap phase 1 0/1` logged `374x811 -> 374x811` because the restore read each *superlayer's*
+  bounds, which phase 0 had already shrunk. Only `_MKMapLayerHostingLayer` returned to
+  `375x812`. The drawable size changed to `1122x2433` at present 1, so the app did commit a new
+  geometry; the display still showed the strip.
+- **The compositor's map draw is full-screen.** `compositor maps draw indexed 6 texture 198
+  scissor 0,0 1125x2436 viewport 0.0,0.0 1125.0x2436.0` repeated 10 times. The scissor is not
+  the 44 pt clip.
+- **The app drawable is a uniform gray frame, not the map.** `/var/local/drawable.raw` id 198
+  is 1125x2436, mean `47.1 45.1 43.0`; every sampled row is `43/45/47` with a faint grid. The
+  compositor imports the same mean. The app is presenting a gray frame, not the blue strip.
+- **The screen dump is the Maps UI over black, not a map strip.** `display-185.raw` shows the
+  status bar (blue scrim, rows 0-131), the location permission alert, the search bar and the
+  Favorites/My Guides sheet, with the map area near-black (rows 132-768 are 0-3; rows 816+ are
+  the sheet). The blue band is the status-bar scrim, not map content. `display-193.raw` is the
+  stale gray gradient. The permission alert ("Allow Maps to use your location?") was up in
+  every launch and is a confounder; dismiss it before judging the map.
+- **The likely cover is `VKMapView`.** Its background is near-black
+  `0.0241576 0.0262412 0.028426 1` and its contents is a full-screen `CABackingStore`
+  1125x2436 BGRA8888; the screen's black map area matches the background. The map layer is a
+  sublayer of `VKMapView`; if the compositor draws the superlayer's background/contents after
+  the sublayer, the map is hidden. `SWEETMTL_INTROSPECT=1` logged the class/desc but the
+  private accessors (`buffer`, `iosurface`, ...) did not respond, so the backing store's mean
+  is still unknown.
+- **New build (local, not pushed).** `NativeBridgeMetalFrontend.mm` changes:
+  - `snapLayerGeometry` saves each layer's own bounds/position at phase 0 and restores them at
+    phase 1; the nudge is 8 pt (`367x804`, position `+4`) so the commit is unambiguous. Phase 1
+    should now log `367x804 -> 375x812` for all three layers.
+  - `SWEETMTL_COMPOSITOR=1` also logs up to 48 per-draw `compositor trace` lines after the
+    first full-size app import: vertex buffer, offset, first 32 floats (`v0..v3`), last
+    fragment bytes and scissor. This shows the map quad and the draw order, including any later
+    full-screen solid draw.
+  - `SWEETMTL_CLEARBG=1` sets `VKMapView.backgroundColor` to clear (via
+    `UIColor.clearColor.CGColor`); `=2` also sets its `contents` to nil. `SWEETMTL_Z=1` sets
+    the map layer's `zPosition` to 100. These are env knobs; no rebuild between runs.
+- **Test plan.** Build and install the new artifact, restart `backboardd`/`SpringBoard`,
+  pre-create the dumps for the new display surface IDs, dismiss the location alert, and launch
+  Maps. Run in this order:
+  1. Base + trace: check `snap phase 1` restores `375x812`, then read the trace: the map draw's
+     `v0..v3` quad (full-screen vs 132 rows) and the draws after it (texture 0 / full-screen
+     solid = the cover).
+  2. `SWEETMTL_CLEARBG=1`: if the map fills, the superlayer background is the cover; `=2`
+     tests the backing store.
+  3. `SWEETMTL_Z=1`: if the map fills, the draw order/depth is the cover.
+- **Decision.** If the trace shows the map quad at 132 rows, the render server still has the
+  44 pt geometry; hook the render-server layer update instead of repeating app-side sets. If
+  the quad is full-screen and a later full-screen solid draw covers it, fix the compositor/
+  layer ordering (or clear the superlayer backdrop in the app as a workaround). If the drawable
+  is gray because the map has not rendered, check the map tiles/network and the permission
+  alert before treating the strip as a geometry bug.
+- **Phone state.** Maps killed; `backboardd` 3750, `SpringBoard` 3752; display surfaces
+  185/186/193/196; `/var/local/mtl2.log` and `mtl2-bo.log` truncated; `/var/local/mtl2-env`
+  now includes `SWEETMTL_INTROSPECT=1`; the rest is the wait+snap+compositor config.
+
 ### Maps: the single-transaction snap did nothing; force two commits and log the map draw (2026-11-27)
 
 - **Build tested.** `5210fcf` (the `CGRectMake` fix) installed over Wi-Fi with pull-back

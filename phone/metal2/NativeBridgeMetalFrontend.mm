@@ -673,6 +673,13 @@ static void unregisterSurfaceCommand(IOSurfaceRef surface,NBCommandBuffer *comma
  NSNumber *key=@(IOSurfaceGetID(surface));
  if([gSurfaceCommands objectForKey:key]==commandBuffer)[gSurfaceCommands removeObjectForKey:key];
 }
+// The compositor's draw trace: the vertex buffer and fragment constants current at the draw. The
+// compositor's own pipeline state is Apple's; the quad it feeds the shader is the only place the
+// layer's placement is visible when the layer tree and the app disagree.
+static NBBuffer *gCompositorVertexBuffer;
+static NSUInteger gCompositorVertexOffset;
+static float gCompositorFragmentBytes[4]={0,0,0,0};
+static NSUInteger gCompositorFragmentBytesLength;
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
@@ -713,6 +720,10 @@ static void waitForResource(id resource) {
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ if(self.compositor && stage==1 && index==0 && [buffer isKindOfClass:[NBBuffer class]]) {
+  gCompositorVertexBuffer=(NBBuffer *)buffer;
+  gCompositorVertexOffset=offset;
+ }
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
@@ -726,6 +737,11 @@ static void waitForResource(id resource) {
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
+ if(self.compositor && stage==2) {
+  gCompositorFragmentBytesLength=length;
+  memset(gCompositorFragmentBytes,0,sizeof(gCompositorFragmentBytes));
+  if(bytes)memcpy(gCompositorFragmentBytes,bytes,MIN(length,sizeof(gCompositorFragmentBytes)));
+ }
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
@@ -783,7 +799,7 @@ static bool compositorLogging(void) {
  if(enabled<0){const char *value=getenv("SWEETMTL_COMPOSITOR");enabled=value && *value && *value!='0';}
  return enabled!=0;
 }
-static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCompositorTextureLogs,gCompositorDrawLogs,gCompositorPassLogs;
+static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCompositorTextureLogs,gCompositorDrawLogs,gCompositorPassLogs,gCompositorTraceLogs;
 // The generic counters above are spent by SpringBoard's first frames. These wait for the first
 // full-size app drawable import, then log the compositor work that actually samples the map.
 static std::atomic<bool> gCompositorMapsImported;
@@ -800,6 +816,35 @@ static void logCompositorMapsDraw(const char *kind,unsigned long count) {
  NBLOG(@"native-metal: compositor maps draw %s %lu texture %u scissor %llu,%llu %llux%llu viewport %.1f,%.1f %.1fx%.1f",
        kind,count,texture,(unsigned long long)r.x,(unsigned long long)r.y,
        (unsigned long long)r.width,(unsigned long long)r.height,v.originX,v.originY,v.width,v.height);
+}
+// The map draw's scissor is full-screen, so the strip has to come from the quad or from a later
+// draw. Log the vertex buffer the compositor feeds the shader: v0..v3 are the first four vertices,
+// eight floats each, which covers both the position+texcoord and position+color layouts.
+static void logCompositorTrace(const char *kind,unsigned long count,long baseVertex) {
+ const MTLScissorRect r=gCompositorLastScissor;
+ NBBuffer *buffer=gCompositorVertexBuffer;
+ const NSUInteger offset=gCompositorVertexOffset;
+ float f[32];memset(f,0,sizeof(f));
+ NSUInteger have=0;
+ if(buffer) {
+  const uint8_t *p=(const uint8_t *)[buffer contents];
+  const NSUInteger length=[buffer length];
+  if(p && offset<length) {
+   NSUInteger bytes=length-offset;
+   if(bytes>sizeof(f))bytes=sizeof(f);
+   memcpy(f,p+offset,bytes);
+   have=bytes/sizeof(float);
+  }
+ }
+ NBLOG(@"native-metal: compositor trace %s %lu base %ld vbo %p off %lu have %lu frag %.3f %.3f %.3f %.3f scissor %llu,%llu %llux%llu",
+       kind,count,baseVertex,(void *)buffer,(unsigned long)offset,(unsigned long)have,
+       gCompositorFragmentBytes[0],gCompositorFragmentBytes[1],gCompositorFragmentBytes[2],gCompositorFragmentBytes[3],
+       (unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
+ NBLOG(@"native-metal: compositor trace verts v0 %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f v1 %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f v2 %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f v3 %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f",
+       f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],
+       f[8],f[9],f[10],f[11],f[12],f[13],f[14],f[15],
+       f[16],f[17],f[18],f[19],f[20],f[21],f[22],f[23],
+       f[24],f[25],f[26],f[27],f[28],f[29],f[30],f[31]);
 }
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
@@ -906,6 +951,8 @@ static void logCompositorMapsDraw(const char *kind,unsigned long count) {
  if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorDrawLogs++<16)
   NBLOG(@"native-metal: compositor draw type %lu vertices %lu..%lu instances %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i);
  if(self.compositor)logCompositorMapsDraw("primitives",(unsigned long)n);
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorTraceLogs++<48)
+  logCompositorTrace("primitives",(unsigned long)n,0);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -922,6 +969,8 @@ static void logCompositorMapsDraw(const char *kind,unsigned long count) {
  if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorDrawLogs++<16)
   NBLOG(@"native-metal: compositor draw indexed type %lu indices %lu instances %lu baseVertex %ld",(unsigned long)t,(unsigned long)n,(unsigned long)i,(long)v);
  if(self.compositor)logCompositorMapsDraw("indexed",(unsigned long)n);
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorTraceLogs++<48)
+  logCompositorTrace("indexed",(unsigned long)n,(long)v);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -2212,7 +2261,12 @@ static void killLayerAnimations(id drawable) {
 // The render server can keep the map layer at the launch frame's bounds (44 pt, the status bar)
 // while the app's model and presentation layers are 375x812. Setting a different value and then
 // restoring it in one transaction is coalesced to a no-op, so the change has to span two presents:
-// the first commit carries 374x811, the second carries the final 375x812.
+// the first commit carries 367x804, the second carries the saved 375x812. The first version read
+// each superlayer's bounds for the restore, which phase 0 had already shrunk, so layers 0 and 1
+// stayed at 374x811; save the layer's own geometry instead.
+static CGRect gSnapBounds[3];
+static CGPoint gSnapPositions[3];
+static bool gSnapSaved[3];
 static void snapLayerGeometry(id drawable,uint64_t presentCount) {
  const char *value=getenv("SWEETMTL_SNAP");
  if(!value || !*value || *value=='0')return;
@@ -2225,10 +2279,8 @@ static void snapLayerGeometry(id drawable,uint64_t presentCount) {
   ((void(*)(id,SEL,BOOL))objc_msgSend)(transaction,NSSelectorFromString(@"setDisableActions:"),YES);
  }
  for(unsigned depth=0;depth<3 && layer;depth++) {
-  id superlayer=[layer valueForKey:@"superlayer"];
-  if(!superlayer)break;
-  NSValue *boundsValue=[superlayer valueForKey:@"bounds"];
-  NSValue *positionValue=[superlayer valueForKey:@"position"];
+  NSValue *boundsValue=[layer valueForKey:@"bounds"];
+  NSValue *positionValue=[layer valueForKey:@"position"];
   if(![boundsValue isKindOfClass:[NSValue class]] || ![positionValue isKindOfClass:[NSValue class]])break;
   CGRect bounds={{0,0},{0,0}};[boundsValue getValue:&bounds];
   CGPoint position={0,0};[positionValue getValue:&position];
@@ -2236,10 +2288,16 @@ static void snapLayerGeometry(id drawable,uint64_t presentCount) {
   CGRect target=bounds;
   CGPoint targetPosition=position;
   if(!restore) {
-   target.size.width-=1;
-   target.size.height-=1;
-   targetPosition.x+=0.5;
-   targetPosition.y+=0.5;
+   gSnapBounds[depth]=bounds;
+   gSnapPositions[depth]=position;
+   gSnapSaved[depth]=true;
+   target.size.width-=8;
+   target.size.height-=8;
+   targetPosition.x+=4;
+   targetPosition.y+=4;
+  } else if(gSnapSaved[depth]) {
+   target=gSnapBounds[depth];
+   targetPosition=gSnapPositions[depth];
   }
   NSString *targetBoundsText=[NSString stringWithFormat:@"{{%g, %g}, {%g, %g}}",target.origin.x,target.origin.y,target.size.width,target.size.height];
   NSString *targetPositionText=[NSString stringWithFormat:@"{%g, %g}",targetPosition.x,targetPosition.y];
@@ -2247,9 +2305,35 @@ static void snapLayerGeometry(id drawable,uint64_t presentCount) {
         layerValue(layer,@"bounds"),targetBoundsText,layerValue(layer,@"position"),targetPositionText);
   ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),target);
   ((void(*)(id,SEL,CGPoint))objc_msgSend)(layer,NSSelectorFromString(@"setPosition:"),targetPosition);
-  layer=superlayer;
+  layer=[layer valueForKey:@"superlayer"];
  }
  if(transaction) ((void(*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"commit"));
+}
+// The map's MetalLayer sits in a VKMapView with a near-black background and a full-screen
+// CABackingStore. SWEETMTL_CLEARBG=1 clears the background (2 also drops the contents) so the
+// drawable is not hidden behind its own superlayer; SWEETMTL_Z=1 lifts the map layer instead.
+static void clearMapBackdrop(id drawable) {
+ const char *value=getenv("SWEETMTL_CLEARBG");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ id superlayer=[layer valueForKey:@"superlayer"];
+ if(!superlayer)return;
+ Class colorClass=NSClassFromString(@"UIColor");
+ id clearColor=colorClass?((id(*)(id,SEL))objc_msgSend)(colorClass,NSSelectorFromString(@"clearColor")):nil;
+ id clearCGColor=clearColor?((id(*)(id,SEL))objc_msgSend)(clearColor,NSSelectorFromString(@"CGColor")):nil;
+ if(clearCGColor) ((void(*)(id,SEL,id))objc_msgSend)(superlayer,NSSelectorFromString(@"setBackgroundColor:"),clearCGColor);
+ if(value[0]>='2') ((void(*)(id,SEL,id))objc_msgSend)(superlayer,NSSelectorFromString(@"setContents:"),nil);
+ static std::atomic<uint64_t> logs;
+ if(logs++<4) NBLOG(@"native-metal: cleared map backdrop %@ mode %s",NSStringFromClass([superlayer class]),value);
+}
+static void raiseMapLayer(id drawable) {
+ const char *value=getenv("SWEETMTL_Z");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ if(!layer)return;
+ ((void(*)(id,SEL,CGFloat))objc_msgSend)(layer,NSSelectorFromString(@"setZPosition:"),(CGFloat)100);
+ static std::atomic<uint64_t> logs;
+ if(logs++<4) NBLOG(@"native-metal: raised map layer zPosition 100");
 }
 // A layer with presentsWithTransaction expects the present in a Core Animation transaction. The
 // app's transaction has usually committed by the time the GPU finishes, so a completion-thread
@@ -2326,6 +2410,10 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  // Launch animations can be added after the first frame; keep clearing them for the first few
  // seconds so the test does not depend on when the map view's expansion animation was installed.
  if(presentCount<300)killLayerAnimations(drawable);
+ if(presentCount<4) {
+  clearMapBackdrop(drawable);
+  raiseMapLayer(drawable);
+ }
  // Push the model geometry to the render server on the first two frames, before the app's own
  // transaction can leave it at the launch frame's 44 pt. The change has to span two presents so
  // Core Animation does not coalesce it back to the value the render server already has.
