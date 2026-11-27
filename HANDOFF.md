@@ -5,6 +5,73 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the drawable holds the map; backboardd's output freezes on the first grey frame (2026-11-27)
+
+- **Build tested.** `4a486b9` + `6c4f00f` (the presented-drawable, layer-chain and
+  display-surface probes) over `7519952`. Installed over Wi-Fi with pull-back
+  verification: `SweetMetal2` `c8e257aa...` (21,586,832 bytes), dylib
+  `39641ef7...` (17,294,896 bytes), `CodeResources` `5517eced...` (2,042
+  bytes). `backboardd` 2922, `SpringBoard` 2925. Maps launched under
+  debugserver (`rsp-launch-capture.py`, 180 s); the user panned and zoomed and
+  the screen stayed grey.
+- **App side: the map is in the presented drawable.** Drawable probes at
+  commits 2 and 5 read the grey clear (`mean 47.4 45.3 43.2`); commits 488,
+  776, 1016, 1277, 1796 read map content (`mean 106.1 99.9 60.4` through
+  `122.8 78.7 45.4`, `nonblack 43005/43005`, `center 130,57,33`). At every
+  logged direct present the drawable surface equals the last resolve surface;
+  there are no `presented surface ... differs`, no `has no presentation`, and
+  no late-handler lines.
+- **The layer is visible and full-screen.** `MetalLayer` bounds
+  `{{0,0},{375,812}}`, position `{187.5,406}`, `hidden 0`, `opacity 1`,
+  superlayer `VKMapView`, `presentsWithTransaction 1`, `displaySyncEnabled 0`,
+  `maximumDrawableCount 3`, drawableSize `1125x2436`, pixelFormat 81,
+  `framebufferOnly 0`, opaque 1. Chain: MetalLayer -> VKMapView ->
+  _MKMapLayerHosting. All 10 logged direct presents were `callerMain 1`,
+  `(deferred to completion)`; the four `presenting` lines say
+  `on the completion thread`.
+- **Compositor side: one grey frame, then frozen.** In `backboardd`'s
+  telemetry (`MTL2[2922 backboardd]`), the live display surfaces 859/860
+  change once when Maps launches (mean `52.2 51.5 51.4` -> `60.9 58.8 57.1`)
+  and then stay byte-identical for the rest of the capture: `center 60,58,56`,
+  `upper 60,58,56`, a uniform grey that matches neither the map drawable nor
+  a status bar. Surfaces 867/870 hold older, unchanged content (`mean 38.6`,
+  `center 26,26,25`, `upper 79,78,79`) from before Maps launched; do not read
+  those as the current frame.
+- **Interpretation.** The app renders and presents the map into the drawable,
+  but backboardd composites the layer from the first grey clear and never
+  updates it. The prime suspect is `presentsWithTransaction 1` plus the
+  deferred present: the drawable is presented on a completion thread with no
+  Core Animation transaction, so the layer's contents change may never commit
+  to the render server. The previous reason for deferring (the window server
+  sampling the cleared surface) still holds for a present issued before the
+  GPU finishes, so the fix must keep the completion ordering *and* give the
+  present a transaction.
+- **Fix prepared (local, not pushed).** `NativeBridgeMetalFrontend.mm` now
+  selects a present mode per drawable: `transaction` (default when the layer
+  has `presentsWithTransaction`), `deferred`, `immediate` or `main`.
+  `SWEETMTL_PRESENT` in `/var/local/mtl2-env` overrides it for one build; the
+  file is read once per process, so relaunch Maps after changing it.
+  `transaction` wraps the deferred present in
+  `CATransaction begin`/`setDisableActions:YES`/`commit`; `main` dispatches it
+  to the main queue; `immediate` presents on the app's thread. The build also
+  logs the layer's `contents` after the first eight presents, logs
+  `compositor drawable surface ... mean ...` in `backboardd` when it imports a
+  1125x2436 sRGB surface (first 8 and every 60th), and invalidates the dcache
+  before the `D display` probe so a stale CPU read cannot fake a grey
+  compositor.
+- **Next.** Build and install this frontend, then launch Maps and watch the
+  default `transaction` mode. If it is still grey, relaunch Maps with
+  `SWEETMTL_PRESENT=main`, then `immediate`, then `deferred`, and compare.
+  Read `compositor drawable surface` in backboardd: absent means the present
+  never reaches the compositor; present with a map mean but a grey
+  `D display` means the compositor samples the right surface but writes the
+  wrong output; present with a grey mean means the compositor receives the
+  wrong surface or the wrong moment. Also read `present N layer contents
+  after ...` in Maps to see whether the layer's contents changes at all.
+- **Phone state.** Maps, debugserver and the local forward are off;
+  `/var/local/mtl2.log`, `mtl2-bo.log` and `ds.log` were truncated.
+  Battery was 50% and charging; keep it cool.
+
 ### Maps: `0103` removes the 45.3 MB BOs; the map is still grey (2026-11-26)
 
 - **Build tested.** The `7084089` build (`0103` after `0102`, plus the BO

@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -196,6 +197,24 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
   [gSurfaceImports setObject:buffer forKey:key];
  }
  return buffer;
+}
+// Channel-sampled mean of a surface: the compositor's view of a drawable in the same units as
+// the display probe, so a grey sample can be attributed to the surface or to the composition.
+static bool surfaceMean(IOSurfaceRef surface,double mean[3]) {
+ if(!surface)return false;
+ const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),pitch=IOSurfaceGetBytesPerRow(surface);
+ const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
+ if(!base || !width || !height || pitch<width*4)return false;
+ // The GPU wrote this surface; without touching the cache the CPU may read stale texels.
+ sys_dcache_flush((void *)base,IOSurfaceGetAllocSize(surface));
+ uint64_t sum[3]={0,0,0},samples=0;
+ for(size_t y=0;y<height;y+=32)for(size_t x=0;x<width;x+=32){
+  const uint8_t *p=base+y*pitch+x*4;
+  sum[0]+=p[0];sum[1]+=p[1];sum[2]+=p[2];samples++;
+ }
+ if(!samples)return false;
+ mean[0]=sum[0]/(double)samples;mean[1]=sum[1]/(double)samples;mean[2]=sum[2]/(double)samples;
+ return true;
 }
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
@@ -1702,6 +1721,24 @@ static char sweetMemoryOwnerKey;
          IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface));
   }
  }
+ // The app presents an sRGB 1125x2436 drawable; backboardd importing that surface is the
+ // compositor receiving the frame, so this line separates a lost handoff from a lost sample.
+ if(d.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB &&
+    IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436) {
+  static std::atomic<uint64_t> drawableImports;
+  const uint64_t imports=drawableImports.fetch_add(1);
+  // Sampling a surface the app is still rendering into perturbs it, so only the compositor
+  // (backboardd) gets the periodic mean; the app's first imports are still identified.
+  const bool compositor=!strcmp(getprogname(),"backboardd");
+  if(imports<8 || (compositor && imports%60==59)) {
+   double mean[3]={-1,-1,-1};
+   if(imports<8 || compositor)surfaceMean(surface,mean);
+   NBLOG(@"native-metal: compositor drawable surface %u %zux%zu row %zu usage %llu storage %lu mean %.1f %.1f %.1f",
+         IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
+         IOSurfaceGetBytesPerRow(surface),(unsigned long long)d.usage,(unsigned long)d.storageMode,
+         mean[0],mean[1],mean[2]);
+  }
+ }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);
@@ -1881,14 +1918,23 @@ static id layerValue(id layer,NSString *key) {
  return [layer respondsToSelector:NSSelectorFromString(key)]?[layer valueForKey:key]:@"?";
 }
 // The layer's contents after a present is the surface the compositor samples; the class and
-// IOSurface ID say whether it is the drawable this command buffer just presented.
+// IOSurface ID say whether it is the drawable this command buffer just presented. A private
+// CAIOSurface is identified by CoreFoundation's type name and its own description.
 static NSString *layerContents(id layer) {
  id contents=[layer respondsToSelector:NSSelectorFromString(@"contents")]?[layer valueForKey:@"contents"]:nil;
  if(!contents)return @"none";
- const CFTypeID type=CFGetTypeID((__bridge CFTypeRef)contents);
+ const CFTypeRef ref=(__bridge CFTypeRef)contents;
+ const CFTypeID type=CFGetTypeID(ref);
  if(type==IOSurfaceGetTypeID())
   return [NSString stringWithFormat:@"IOSurface %u",IOSurfaceGetID((__bridge IOSurfaceRef)contents)];
- return [NSString stringWithFormat:@"CFType %lu",(unsigned long)type];
+ CFStringRef typeName=CFCopyTypeIDDescription(type),description=CFCopyDescription(ref);
+ NSString *text=[NSString stringWithFormat:@"%@(%lu) %@",
+   typeName?(__bridge NSString *)typeName:@"?",(unsigned long)type,
+   description?(__bridge NSString *)description:@"?"];
+ if(typeName)CFRelease(typeName);
+ if(description)CFRelease(description);
+ text=[text stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+ return text.length>300?[text substringToIndex:300]:text;
 }
 // A layer's background colour is what shows where the layer has no contents: a grey map view
 // background behind an empty MetalLayer is the grey screen.
@@ -1937,19 +1983,68 @@ static void logLayerChain(id drawable) {
   layer=[layer valueForKey:@"superlayer"];
  }
 }
+// A layer with presentsWithTransaction expects the present in a Core Animation transaction. The
+// app's transaction has usually committed by the time the GPU finishes, so a completion-thread
+// present can be dropped; a background transaction or the main queue gives it one. The env file
+// selects a mode so one build can test all of them: immediate, deferred, transaction or main.
+enum PresentMode { PresentImmediate,PresentDeferred,PresentTransaction,PresentMain };
+static BOOL drawablePresentsWithTransaction(id drawable) {
+ id layer=[drawable valueForKey:@"layer"];
+ if(![layer respondsToSelector:NSSelectorFromString(@"presentsWithTransaction")])return NO;
+ return [[layer valueForKey:@"presentsWithTransaction"] boolValue];
+}
+static PresentMode presentModeForDrawable(id drawable) {
+ const char *value=getenv("SWEETMTL_PRESENT");
+ if(value) {
+  if(!strcmp(value,"immediate"))return PresentImmediate;
+  if(!strcmp(value,"deferred"))return PresentDeferred;
+  if(!strcmp(value,"transaction"))return PresentTransaction;
+  if(!strcmp(value,"main"))return PresentMain;
+ }
+ return drawablePresentsWithTransaction(drawable)?PresentTransaction:PresentDeferred;
+}
+static const char *presentModeName(PresentMode mode) {
+ return mode==PresentImmediate?"immediate":mode==PresentTransaction?"transaction":mode==PresentMain?"main":"deferred";
+}
+// Core Animation transactions are per-thread; a completion thread has no run loop to commit an
+// implicit one, so an explicit begin/commit is what lets a presentsWithTransaction layer update.
+static void presentInTransaction(void (^present)(void)) {
+ Class transaction=NSClassFromString(@"CATransaction");
+ if(!transaction){present();return;}
+ ((void (*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"begin"));
+ ((void (*)(id,SEL,BOOL))objc_msgSend)(transaction,NSSelectorFromString(@"setDisableActions:"),YES);
+ present();
+ ((void (*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"commit"));
+}
 static void presentDrawableDirect(id drawable,const char *kind,void (^present)(void)) {
  const uint32_t surface=drawableSurfaceID(drawable);
  const uint64_t presentCount=gDirectPresents++;
  const uint32_t resolved=gLastResolveSurface.load();
  const BOOL main=[NSThread isMainThread];
+ const PresentMode mode=presentModeForDrawable(drawable);
  if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);}
  else if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  if(presentCount<8 || presentCount%300==299)
-  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,commandBuffer?"deferred to completion":"immediate");
+  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d mode %s (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,presentModeName(mode),commandBuffer?"deferred to completion":"immediate");
  if(surface!=resolved && gPresentSurfaceMismatches++<8)
   NBLOG(@"native-metal: presented surface %u differs from the last resolve surface %u",surface,resolved);
- if(commandBuffer){[commandBuffer addDrawable:drawable];[commandBuffer queuePresentation:present];}else present();
+ void (^afterPresent)(void)=^{
+  present();
+  if(presentCount<8) {
+   id layer=[drawable valueForKey:@"layer"];
+   NBLOG(@"native-metal: present %llu layer contents after %@",presentCount,layerContents(layer));
+  }
+ };
+ void (^show)(void)=afterPresent;
+ if(mode==PresentTransaction)show=^{presentInTransaction(afterPresent);};
+ else if(mode==PresentMain)show=^{
+  if([NSThread isMainThread])afterPresent();
+  else dispatch_async(dispatch_get_main_queue(),afterPresent);
+ };
+ if(commandBuffer)[commandBuffer addDrawable:drawable];
+ if(mode==PresentImmediate){afterPresent();return;}
+ if(commandBuffer)[commandBuffer queuePresentation:show];else show();
 }
 // The layer's nextDrawable says whether the app still gets a drawable from CoreAnimation's
 // three-deep pool; a nil after the first frames means a deferred present never returned one.
@@ -2152,6 +2247,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface),pitch=IOSurfaceGetBytesPerRow(surface);
   const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
   if(!base || !width || !height || pitch<width*4)continue;
+  // The compositor's GPU writes this surface; without invalidating the CPU's cache the probe
+  // can read the stale pre-composite contents forever.
+  sys_dcache_flush((void *)base,IOSurfaceGetAllocSize(surface));
   uint64_t sum[4]={0},samples=0;
   for(size_t y=0;y<height;y+=32)for(size_t x=0;x<width;x+=32){
    const uint8_t *p=base+y*pitch+x*4;
