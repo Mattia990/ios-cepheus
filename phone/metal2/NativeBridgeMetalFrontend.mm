@@ -784,6 +784,23 @@ static bool compositorLogging(void) {
  return enabled!=0;
 }
 static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCompositorTextureLogs,gCompositorDrawLogs,gCompositorPassLogs;
+// The generic counters above are spent by SpringBoard's first frames. These wait for the first
+// full-size app drawable import, then log the compositor work that actually samples the map.
+static std::atomic<bool> gCompositorMapsImported;
+static std::atomic<uint64_t> gCompositorMapsDrawLogs;
+static std::atomic<uint32_t> gCompositorMapsTexture;
+static MTLScissorRect gCompositorLastScissor;
+static MTLViewport gCompositorLastViewport;
+static void logCompositorMapsDraw(const char *kind,unsigned long count) {
+ if(!compositorLogging() || !gCompositorMapsImported.load())return;
+ const uint32_t texture=gCompositorMapsTexture.load();
+ if(!texture || gCompositorMapsDrawLogs++>=32)return;
+ const MTLScissorRect r=gCompositorLastScissor;
+ const MTLViewport v=gCompositorLastViewport;
+ NBLOG(@"native-metal: compositor maps draw %s %lu texture %u scissor %llu,%llu %llux%llu viewport %.1f,%.1f %.1fx%.1f",
+       kind,count,texture,(unsigned long long)r.x,(unsigned long long)r.y,
+       (unsigned long long)r.width,(unsigned long long)r.height,v.originX,v.originY,v.width,v.height);
+}
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
@@ -803,12 +820,22 @@ static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCom
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
- if(self.compositor && compositorLogging() && t && [(id)t isKindOfClass:[NBTexture class]] && [(NBTexture *)t surface] && gCompositorTextureLogs++<16) {
-  IOSurfaceRef surface=[(NBTexture *)t surface];
-  double mean[3]={-1,-1,-1};surfaceMean(surface,mean);
-  NBLOG(@"native-metal: compositor texture %u %zux%zu row %zu format %lu mean %.1f %.1f %.1f",
-        IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),
-        (unsigned long)[(NBTexture *)t descriptor].format,mean[0],mean[1],mean[2]);
+ if(self.compositor) {
+  uint32_t mapsTexture=0;
+  if(t && [(id)t isKindOfClass:[NBTexture class]] && [(NBTexture *)t surface]) {
+   IOSurfaceRef surface=[(NBTexture *)t surface];
+   const size_t width=IOSurfaceGetWidth(surface),height=IOSurfaceGetHeight(surface);
+   const MTLPixelFormat format=(MTLPixelFormat)[(NBTexture *)t descriptor].format;
+   if(width==1125 && height==2436 && (format==MTLPixelFormatBGRA8Unorm || format==MTLPixelFormatBGRA8Unorm_sRGB))
+    mapsTexture=IOSurfaceGetID(surface);
+   if(compositorLogging() && gCompositorMapsImported.load() && gCompositorTextureLogs++<16) {
+    double mean[3]={-1,-1,-1};surfaceMean(surface,mean);
+    NBLOG(@"native-metal: compositor texture %u %zux%zu row %zu format %lu mean %.1f %.1f %.1f",
+          IOSurfaceGetID(surface),width,height,IOSurfaceGetBytesPerRow(surface),
+          (unsigned long)format,mean[0],mean[1],mean[2]);
+   }
+  }
+  gCompositorMapsTexture.store(mapsTexture);
  }
  [self texture:t index:i stage:2];
 }
@@ -825,7 +852,8 @@ static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCom
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  if(self.resolves && gViewportProbes++<3)
   NBLOG(@"native-metal: resolve pass viewport %.1f,%.1f %.1fx%.1f z %.3f..%.3f",v.originX,v.originY,v.width,v.height,v.znear,v.zfar);
- if(self.compositor && compositorLogging() && gCompositorViewportLogs++<16)
+ if(self.compositor) gCompositorLastViewport=v;
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorViewportLogs++<16)
   NBLOG(@"native-metal: compositor viewport %.1f,%.1f %.1fx%.1f z %.3f..%.3f",v.originX,v.originY,v.width,v.height,v.znear,v.zfar);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
@@ -833,7 +861,8 @@ static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCom
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  if(self.resolves && gScissorProbes++<3)
   NBLOG(@"native-metal: resolve pass scissor %llu,%llu %llux%llu",(unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
- if(self.compositor && compositorLogging() && gCompositorScissorLogs++<16)
+ if(self.compositor) gCompositorLastScissor=r;
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorScissorLogs++<16)
   NBLOG(@"native-metal: compositor scissor %llu,%llu %llux%llu",(unsigned long long)r.x,(unsigned long long)r.y,(unsigned long long)r.width,(unsigned long long)r.height);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
@@ -874,8 +903,9 @@ static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCom
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
- if(self.compositor && compositorLogging() && gCompositorDrawLogs++<16)
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorDrawLogs++<16)
   NBLOG(@"native-metal: compositor draw type %lu vertices %lu..%lu instances %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,(unsigned long)i);
+ if(self.compositor)logCompositorMapsDraw("primitives",(unsigned long)n);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -889,8 +919,9 @@ static std::atomic<uint64_t> gCompositorViewportLogs,gCompositorScissorLogs,gCom
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
- if(self.compositor && compositorLogging() && gCompositorDrawLogs++<16)
+ if(self.compositor && compositorLogging() && gCompositorMapsImported.load() && gCompositorDrawLogs++<16)
   NBLOG(@"native-metal: compositor draw indexed type %lu indices %lu instances %lu baseVertex %ld",(unsigned long)t,(unsigned long)n,(unsigned long)i,(long)v);
+ if(self.compositor)logCompositorMapsDraw("indexed",(unsigned long)n);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -1097,7 +1128,7 @@ static void scheduled(void *context);
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NBRenderEncoder *encoder=[NBRenderEncoder new];encoder.resolves=resolvingPass;encoder.compositor=compositorPass;
- if(compositorPass && compositorLogging() && gCompositorPassLogs++<8)
+ if(compositorPass && compositorLogging() && gCompositorMapsImported.load() && gCompositorPassLogs++<8)
   NBLOG(@"native-metal: compositor pass %lux%lu samples %lu",(unsigned long)pass.width,(unsigned long)pass.height,(unsigned long)pass.samples);
  return [self encoder:encoder handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
 }
@@ -1813,6 +1844,9 @@ static char sweetMemoryOwnerKey;
          IOSurfaceGetBytesPerRow(surface),(unsigned long)d.pixelFormat,(unsigned long long)d.usage,
          (unsigned long)d.storageMode,mean[0],mean[1],mean[2]);
   }
+  // This is the first full-size frame the compositor has received: start the targeted pass and
+  // draw logs now instead of spending their budget on SpringBoard's startup frames.
+  gCompositorMapsImported.store(true);
  }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
@@ -2167,20 +2201,23 @@ static void killLayerAnimations(id drawable) {
  id layer=[drawable valueForKey:@"layer"];
  for(unsigned depth=0;depth<8 && layer;depth++) {
   NSArray *keys=[layer respondsToSelector:NSSelectorFromString(@"animationKeys")]?[layer valueForKey:@"animationKeys"]:nil;
-  if(keys.count) {
+  if(keys.count)
    NBLOG(@"native-metal: removing %lu animation(s) %@ from %@ at depth %u",(unsigned long)keys.count,keys,NSStringFromClass([layer class]),depth);
-   ((void(*)(id,SEL))objc_msgSend)(layer,NSSelectorFromString(@"removeAllAnimations"));
-  }
+  // Call it even when the app sees no keys: the render server can hold an animation that the
+  // app's copy has already dropped, and the removal is what makes it fall back to the model.
+  ((void(*)(id,SEL))objc_msgSend)(layer,NSSelectorFromString(@"removeAllAnimations"));
   layer=[layer valueForKey:@"superlayer"];
  }
 }
 // The render server can keep the map layer at the launch frame's bounds (44 pt, the status bar)
-// while the app's model and presentation layers are 375x812. Re-setting the bounds inside a
-// transaction with actions disabled makes the render server commit the final geometry without an
-// implicit animation, which is the frozen-clock hypothesis's fix without waiting for its clock.
-static void snapLayerGeometry(id drawable) {
+// while the app's model and presentation layers are 375x812. Setting a different value and then
+// restoring it in one transaction is coalesced to a no-op, so the change has to span two presents:
+// the first commit carries 374x811, the second carries the final 375x812.
+static void snapLayerGeometry(id drawable,uint64_t presentCount) {
  const char *value=getenv("SWEETMTL_SNAP");
  if(!value || !*value || *value=='0')return;
+ if(presentCount>1)return;
+ const bool restore=presentCount==1;
  id layer=[drawable valueForKey:@"layer"];
  Class transaction=NSClassFromString(@"CATransaction");
  if(transaction) {
@@ -2196,12 +2233,20 @@ static void snapLayerGeometry(id drawable) {
   CGRect bounds={{0,0},{0,0}};[boundsValue getValue:&bounds];
   CGPoint position={0,0};[positionValue getValue:&position];
   if(bounds.size.width<1 || bounds.size.height<1)break;
-  const CGRect nudge={{bounds.origin.x,bounds.origin.y},{bounds.size.width-1,bounds.size.height-1}};
-  NBLOG(@"native-metal: snap %u %@ bounds %@ -> %@ position %@ -> %@",depth,NSStringFromClass([layer class]),
-        layerValue(layer,@"bounds"),boundsValue,layerValue(layer,@"position"),positionValue);
-  ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),nudge);
-  ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),bounds);
-  ((void(*)(id,SEL,CGPoint))objc_msgSend)(layer,NSSelectorFromString(@"setPosition:"),position);
+  CGRect target=bounds;
+  CGPoint targetPosition=position;
+  if(!restore) {
+   target.size.width-=1;
+   target.size.height-=1;
+   targetPosition.x+=0.5;
+   targetPosition.y+=0.5;
+  }
+  NSString *targetBoundsText=[NSString stringWithFormat:@"{{%g, %g}, {%g, %g}}",target.origin.x,target.origin.y,target.size.width,target.size.height];
+  NSString *targetPositionText=[NSString stringWithFormat:@"{%g, %g}",targetPosition.x,targetPosition.y];
+  NBLOG(@"native-metal: snap phase %llu %u %@ bounds %@ -> %@ position %@ -> %@",(unsigned long long)presentCount,depth,NSStringFromClass([layer class]),
+        layerValue(layer,@"bounds"),targetBoundsText,layerValue(layer,@"position"),targetPositionText);
+  ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),target);
+  ((void(*)(id,SEL,CGPoint))objc_msgSend)(layer,NSSelectorFromString(@"setPosition:"),targetPosition);
   layer=superlayer;
  }
  if(transaction) ((void(*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"commit"));
@@ -2281,9 +2326,10 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  // Launch animations can be added after the first frame; keep clearing them for the first few
  // seconds so the test does not depend on when the map view's expansion animation was installed.
  if(presentCount<300)killLayerAnimations(drawable);
- // Push the model geometry to the render server on the first frames, before the app's own
- // transaction can leave it at the launch frame's 44 pt.
- if(presentCount<8)snapLayerGeometry(drawable);
+ // Push the model geometry to the render server on the first two frames, before the app's own
+ // transaction can leave it at the launch frame's 44 pt. The change has to span two presents so
+ // Core Animation does not coalesce it back to the value the render server already has.
+ if(presentCount<2)snapLayerGeometry(drawable,presentCount);
  if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  const char *placement=mode==PresentWait?"waited on the app's thread":commandBuffer?"deferred to completion":"immediate";

@@ -5,60 +5,54 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Maps: the compositor imports the map frame but draws nothing; snap the layer and log its scissor (2026-11-27)
+### Maps: the single-transaction snap did nothing; force two commits and log the map draw (2026-11-27)
 
-- **Build tested.** `3322ff8` installed over Wi-Fi with pull-back verification:
-  `SweetMetal2` `b4441822...` (21,620,832 bytes), dylib `b190e772...` (17,294,896 bytes),
-  `CodeResources` `0204bea0...` (2,042 bytes). `backboardd` 559, `SpringBoard` 564.
-- **App-side geometry is correct.** At present 0, `layer presentation 0 MetalLayer` and
-  `layer presentation 1 VKMapView` both read model bounds `375x812`, position `187.5,406`,
-  presentation bounds `375x812`, position `187.5,406`, `animations none`. The window is
-  `EventSourceWindow` `375x812`. So the frozen app-side animation is not the cause.
-- **The present completes.** Wait mode logged `present N waited for command buffer
-  completion` for all 8 presents; transaction mode also presented all 8. `presentDrawableDirect`
-  found the surface command each time.
-- **The drawable contains map pixels.** Commits 2/5 are the grey clear
-  (`mean 47.1 45.1 43.0`); a later frame imported by the compositor reads
-  `mean 130.0 57.0 33.0` (map content). `SWEETMTL_DUMP_DRAWABLE=1` wrote the first frame to
-  `/var/local/drawable.raw` (11,225,088 bytes; uniform grey).
-- **The compositor receives it but the display does not show it.** `backboardd` logs
-  `compositor import ... id 43 ... mean 130.0 57.0 33.0`; the live Maps display surface
-  (22/23) still shows the UI with a black map area (`mean 30.9 24.0 21.4`, map rows all
-  black). The CAImageQueue stays empty (`displayed 0 ... unconsumed 0`) after every present,
-  so the compositor is using the direct surface import, not the queue. The 30/32 pair is a
-  stale gradient (`mean 38.6 37.9 37.8`, `upper 79,78,79`).
-- **Interpretation.** The render server's copy of the `MetalLayer` is still the launch
-  frame's 44 pt (the status-bar height): the map is drawn only in that band at the top, and
-  the rest of the map area is `VKMapView`'s black backing store. This is the same 132-row
-  centre strip seen in `immediate-88.raw`; the app's layer is full-screen, so the stale copy
-  is on the render-server side.
-- **Build prepared (local, not pushed).** `NativeBridgeMetalFrontend.mm` adds:
-  - `SWEETMTL_SNAP=1`: on the first 8 presents, re-set the `MetalLayer`, `VKMapView` and
-    `_MKMapLayerHostingLayer` bounds/position to their superlayers' values inside a
-    `CATransaction` with actions disabled. The bounds are nudged by 1 pt and restored so CA
-    commits a change; the final value is 375x812. Logs `snap <depth> <class> bounds ...`.
-  - `SWEETMTL_COMPOSITOR=1`: in `backboardd`, log each render pass whose color/resolve
-    attachment is a registered display target (`compositor pass WxH samples N`), plus the
-    first 16 viewport/scissor sets, sampled fragment textures (surface id, size, row, format,
-    mean) and draw calls. The scissor at the map draw is the direct test for the 44 pt layer.
-- **Test.** Install the new artifact, set `/var/local/mtl2-env` to
-  `SWEETMTL_DUMP_DISPLAY=1`, `SWEETMTL_DUMP_DRAWABLE=1`, `SWEETMTL_PRESENT=wait`,
-  `SWEETMTL_LAYERS=1`, `SWEETMTL_SNAP=1`, `SWEETMTL_COMPOSITOR=1`, `SWEETMTL_KILLANIM=0`,
-  `SWEETMTL_HOLD=0` (leave `SWEETMTL_TX` unset, so `presentsWithTransaction` stays 1).
-  The new binary and `SWEETMTL_COMPOSITOR` are read when `backboardd` starts, so restart
-  `backboardd`/`SpringBoard` after the install, read the new live display-surface IDs from
-  `/var/local/mtl2.log`, and pre-create `/var/local/drawable.raw` and the live display dumps
-  as 0666 via `scp0` + `rename` (the scp sink is masked by umask 022; `scp-put.py --mode 666`
-  on an existing file leaves 0644). Then kill Maps, truncate `/var/local/mtl2.log`, launch
-  Maps, wait ~30 s, and pull the log, `drawable.raw` and the display dumps.
-- **Decision.** If `SNAP` makes the map fill the screen, make it permanent by disabling
-  actions on the map layer's bounds commit (or dropping the launch animation before the
-  first transaction commit). If the compositor scissor is `1125x132` (or `0,0 1125x132`),
-  the 44 pt render-server layer is confirmed even if the snap does not stick; then hook the
-  render-server layer update rather than the app-side animation.
-- **Phone state.** Maps was killed after the transaction test; `backboardd` 559,
-  `SpringBoard` 564; `/var/local/mtl2.log` and `mtl2-bo.log` are truncated; battery 88% and
-  charging. `/var/local/mtl2-env` already holds the wait+snap+compositor test config.
+- **Build tested.** `5210fcf` (the `CGRectMake` fix) installed over Wi-Fi with pull-back
+  verification: `SweetMetal2` `5d4cafbc...` (21,620,832 bytes), dylib `633ab9f2...`
+  (17,294,896 bytes), `CodeResources` `247e1e3b...` (2,042 bytes). `backboardd` 2311,
+  `SpringBoard` 2313. The env was live: `env SWEETMTL_SNAP=1`, `env SWEETMTL_COMPOSITOR=1`,
+  `images: SweetMetal2 0x108ca0000`.
+- **App-side geometry is still correct.** `snap 0/1/2` logged `MetalLayer`, `VKMapView` and
+  `_MKMapLayerHostingLayer` all at bounds `375x812`, position `187.5,406`, and
+  `layer presentation` showed model and presentation `375x812`, `animations none`.
+- **The single-transaction snap did nothing.** Display surfaces 139/140 still show the Maps UI
+  with map content only in rows 0-131 and black from row 132 down (`display-139 mean
+  20.9 23.5 30.7`, row 131 `33,57,130`, row 132 `0,0,0`); 147/150 remain the stale gradient
+  (`mean 38.0 37.8 37.9`). Setting bounds to 374x811 and back to 375x812 in one
+  `CATransaction` is coalesced to the final value, which equals the model value, so CA had
+  nothing to commit.
+- **Background/foreground does not rebuild it.** Launching Preferences and then reopening Maps
+  kept PID 2375 and the strip; the live pair read a transient row 132-200 band in 139 but 140
+  was still black at 132.
+- **The compositor log budget was spent too early.** The 16 texture/scissor and 8 pass caps
+  were exhausted by SpringBoard's startup frames. The Maps imports were logged (152/153 grey
+  `mean 47.0 45.0 43.0`, 154 map `mean 130.0 57.0 33.0`) but not the scissor of the pass that
+  samples them.
+- **New build (local, not pushed).** `NativeBridgeMetalFrontend.mm` changes:
+  - `SWEETMTL_SNAP=1` now spans two presents: present 0 commits `374x811` at position
+    `+0.5,+0.5`, present 1 commits `375x812` at the exact superlayer position, each in its
+    own actions-disabled `CATransaction`. `killLayerAnimations` also calls
+    `removeAllAnimations` even when the app sees no keys.
+  - `SWEETMTL_COMPOSITOR=1` now arms only when `backboardd` imports the first full-size
+    (1125x2436) non-display surface, i.e. the app's drawable. From then on it logs 8 passes,
+    16 viewport/scissor/texture calls and 16 draws, plus up to 32
+    `compositor maps draw <kind> ... texture <id> scissor X,Y WxH viewport ...` lines that
+    name the scissor in effect at a draw sampling the map drawable. That is the direct 44 pt
+    test.
+- **Test.** Install the new artifact, restart `backboardd`/`SpringBoard`, read the new display
+  surface IDs, pre-create the dumps 0666, launch Maps, wait ~60 s (the dump gate is 40 s per
+  surface), pull the log and dumps. Check `snap phase 0/1`, `compositor maps draw ...
+  scissor`, and whether the map fills.
+- **Decision.** If the two-phase snap fills the map, make it permanent (commit the
+  nudge/restore pair on the first two frames, or disable the launch animation before the first
+  commit). If the scissor at the map draw is `0,0 1125x132`, the render-server layer is
+  confirmed at 44 pt even though the app is 375x812; then hook the render-server layer update
+  (window/layer rehost or a render-server-side geometry setter) rather than repeating
+  app-side sets.
+- **Phone state.** Maps and Preferences were killed after the test; `backboardd` 2311,
+  `SpringBoard` 2313; display surfaces 139/140/147/150; `/var/local/mtl2.log` and
+  `mtl2-bo.log` are truncated; battery 88% and charging at the last check.
+  `/var/local/mtl2-env` still holds the wait+snap+compositor test config.
 
 ### Maps: the visible strip is the centre of the map, so the render server has the layer at 44 pt (2026-11-27)
 
