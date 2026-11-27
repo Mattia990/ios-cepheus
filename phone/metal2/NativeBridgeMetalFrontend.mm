@@ -2193,10 +2193,10 @@ static void snapLayerGeometry(id drawable) {
   NSValue *boundsValue=[superlayer valueForKey:@"bounds"];
   NSValue *positionValue=[superlayer valueForKey:@"position"];
   if(![boundsValue isKindOfClass:[NSValue class]] || ![positionValue isKindOfClass:[NSValue class]])break;
-  CGRect bounds={0};[boundsValue getValue:&bounds];
-  CGPoint position={0};[positionValue getValue:&position];
+  CGRect bounds={{0,0},{0,0}};[boundsValue getValue:&bounds];
+  CGPoint position={0,0};[positionValue getValue:&position];
   if(bounds.size.width<1 || bounds.size.height<1)break;
-  const CGRect nudge=CGRectMake(bounds.origin.x,bounds.origin.y,bounds.size.width-1,bounds.size.height-1);
+  const CGRect nudge={{bounds.origin.x,bounds.origin.y},{bounds.size.width-1,bounds.size.height-1}};
   NBLOG(@"native-metal: snap %u %@ bounds %@ -> %@ position %@ -> %@",depth,NSStringFromClass([layer class]),
         layerValue(layer,@"bounds"),boundsValue,layerValue(layer,@"position"),positionValue);
   ((void(*)(id,SEL,CGRect))objc_msgSend)(layer,NSSelectorFromString(@"setBounds:"),nudge);
