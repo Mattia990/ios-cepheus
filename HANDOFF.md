@@ -5,6 +5,62 @@ Last updated **2026-11-26** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
+### Maps: the transaction unfreezes the queue, but the drawable is reused before the present (2026-11-27)
+
+- **Build tested.** `6dbd66d` (default `transaction` present mode) installed
+  over Wi-Fi with pull-back verification: `SweetMetal2` `63396132...`
+  (21,603,888 bytes), dylib `a2e2039f...` (17,294,896 bytes),
+  `CodeResources` `f25a8683...` (2,042 bytes). `backboardd` 885,
+  `SpringBoard` 894. A 180 s debugserver capture
+  (`/tmp/maps-console-txn.log`, 10,282 bytes; app log
+  `/tmp/mtl2-txn-final.log`, 470,129 bytes) with the user panning and
+  zooming.
+- **Not grey any more, but partial.** The user saw black with a small piece
+  of map above; panning flashed a piece of map in the center, never a stable
+  frame. The live display surfaces 16/17 confirm it: the first sample after
+  launch is `mean 49.3 41.3 29.8`, `center 51,50,47`, `upper 54,56,0` (the
+  grey clear plus a map band), then every later sample is
+  `mean ~15.4`, `center 0,0,0`, `upper 0,0,0` (black plus a small fragment).
+  Surfaces 24/26 are the old stale pair (`38.6`).
+- **The drawables are complete.** Probes at commits 620, 809, 1133 and 1781
+  read the full map: `mean 104.3 108.9 45.8` through `107.2 102.0 41.7`,
+  `nonblack 43005/43005`, `center 96,120,64` or `103,107,0`. The first two
+  frames are the grey clear (`47.4 45.3 43.2`). The layer's `contents` is now
+  `CAImageQueue(97) <CAImageQueue 0x104e52ac0>` and stays that object across
+  presents; all presents are `mode transaction (deferred to completion)` from
+  `callerMain 1`.
+- **The compositor path is the queue, not a texture import.** No
+  `compositor drawable surface` line appears in `backboardd`; the app's own
+  drawable imports are the only ones (and were logged from `Maps`). The
+  window server consumes the `CAImageQueue` directly, so that diagnostic
+  cannot see the handoff. The `D display` probe remains the compositor-side
+  truth.
+- **Interpretation.** The transaction fixed the frozen handoff — the queue
+  now updates and the screen changes. But our shim queues the real `present`
+  to GPU completion and returns to Maps immediately; Maps then calls
+  `nextDrawable` and can get the same drawable back before the window server
+  has sampled it, clearing it for the next frame. The display then shows the
+  cleared surface with whatever fragment had already been drawn. Waiting on
+  the app's thread keeps the drawable out of the pool until the real present
+  has run.
+- **Fix prepared (local, not pushed).** A fifth mode, `wait`: if the
+  resolving command buffer exists, `waitUntilCompleted`, then call the real
+  present on the app's thread (no completion deferral, no extra
+  transaction). It is the default for `presentsWithTransaction` layers;
+  `SWEETMTL_PRESENT=transaction|main|immediate|deferred` still selects the
+  others. The `compositor drawable surface` log is now emitted only by
+  `backboardd` so the app's pre-render imports do not look like compositor
+  samples.
+- **Next.** Build, install, and launch Maps in the default `wait` mode. If
+  the map is stable, the present lifecycle is fixed. If it is still partial,
+  compare `transaction` and `main`; if `wait` stalls the UI, the GPU wait is
+  too long and the next step is a bounded wait or a drawable-retain scheme.
+  The display should change from the `~15.4` black fragment to the map mean
+  (`~105`) in the `D display` rows.
+- **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log` and
+  `mtl2-bo.log` are truncated. `backboardd` 885, `SpringBoard` 894. The
+  phone was rebooted before this install (surface IDs restarted at 2).
+
 ### Maps: the drawable holds the map; backboardd's output freezes on the first grey frame (2026-11-27)
 
 - **Build tested.** `4a486b9` + `6c4f00f` (the presented-drawable, layer-chain and

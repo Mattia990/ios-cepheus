@@ -1723,16 +1723,16 @@ static char sweetMemoryOwnerKey;
  }
  // The app presents an sRGB 1125x2436 drawable; backboardd importing that surface is the
  // compositor receiving the frame, so this line separates a lost handoff from a lost sample.
- if(d.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB &&
+ // Only the compositor gets the line: in the app this is the drawable's own import, before any
+ // render, and sampling it there would perturb the frame.
+ const bool compositor=!strcmp(getprogname(),"backboardd");
+ if(compositor && d.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB &&
     IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436) {
   static std::atomic<uint64_t> drawableImports;
   const uint64_t imports=drawableImports.fetch_add(1);
-  // Sampling a surface the app is still rendering into perturbs it, so only the compositor
-  // (backboardd) gets the periodic mean; the app's first imports are still identified.
-  const bool compositor=!strcmp(getprogname(),"backboardd");
-  if(imports<8 || (compositor && imports%60==59)) {
+  if(imports<8 || imports%60==59) {
    double mean[3]={-1,-1,-1};
-   if(imports<8 || compositor)surfaceMean(surface,mean);
+   surfaceMean(surface,mean);
    NBLOG(@"native-metal: compositor drawable surface %u %zux%zu row %zu usage %llu storage %lu mean %.1f %.1f %.1f",
          IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
          IOSurfaceGetBytesPerRow(surface),(unsigned long long)d.usage,(unsigned long)d.storageMode,
@@ -1987,7 +1987,7 @@ static void logLayerChain(id drawable) {
 // app's transaction has usually committed by the time the GPU finishes, so a completion-thread
 // present can be dropped; a background transaction or the main queue gives it one. The env file
 // selects a mode so one build can test all of them: immediate, deferred, transaction or main.
-enum PresentMode { PresentImmediate,PresentDeferred,PresentTransaction,PresentMain };
+enum PresentMode { PresentImmediate,PresentDeferred,PresentTransaction,PresentMain,PresentWait };
 static BOOL drawablePresentsWithTransaction(id drawable) {
  id layer=[drawable valueForKey:@"layer"];
  if(![layer respondsToSelector:NSSelectorFromString(@"presentsWithTransaction")])return NO;
@@ -2000,11 +2000,12 @@ static PresentMode presentModeForDrawable(id drawable) {
   if(!strcmp(value,"deferred"))return PresentDeferred;
   if(!strcmp(value,"transaction"))return PresentTransaction;
   if(!strcmp(value,"main"))return PresentMain;
+  if(!strcmp(value,"wait"))return PresentWait;
  }
- return drawablePresentsWithTransaction(drawable)?PresentTransaction:PresentDeferred;
+ return drawablePresentsWithTransaction(drawable)?PresentWait:PresentDeferred;
 }
 static const char *presentModeName(PresentMode mode) {
- return mode==PresentImmediate?"immediate":mode==PresentTransaction?"transaction":mode==PresentMain?"main":"deferred";
+ return mode==PresentImmediate?"immediate":mode==PresentTransaction?"transaction":mode==PresentMain?"main":mode==PresentWait?"wait":"deferred";
 }
 // Core Animation transactions are per-thread; a completion thread has no run loop to commit an
 // implicit one, so an explicit begin/commit is what lets a presentsWithTransaction layer update.
@@ -2025,8 +2026,9 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);}
  else if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
+ const char *placement=mode==PresentWait?"waited on the app's thread":commandBuffer?"deferred to completion":"immediate";
  if(presentCount<8 || presentCount%300==299)
-  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d mode %s (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,presentModeName(mode),commandBuffer?"deferred to completion":"immediate");
+  NBLOG(@"native-metal: drawable direct %s %@ surface %u last resolve %u callerMain %d mode %s (%s)",kind,NSStringFromClass([drawable class]),surface,resolved,main?1:0,presentModeName(mode),placement);
  if(surface!=resolved && gPresentSurfaceMismatches++<8)
   NBLOG(@"native-metal: presented surface %u differs from the last resolve surface %u",surface,resolved);
  void (^afterPresent)(void)=^{
@@ -2043,6 +2045,14 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
   else dispatch_async(dispatch_get_main_queue(),afterPresent);
  };
  if(commandBuffer)[commandBuffer addDrawable:drawable];
+ // Waiting on the app's own thread keeps the drawable out of the pool until the real present has
+ // run: otherwise the app can get the same surface from nextDrawable and clear it while the window
+ // server still samples the frame, which shows up as black frames with a moving fragment.
+ if(mode==PresentWait) {
+  if(commandBuffer)[commandBuffer waitUntilCompleted];
+  afterPresent();
+  return;
+ }
  if(mode==PresentImmediate){afterPresent();return;}
  if(commandBuffer)[commandBuffer queuePresentation:show];else show();
 }
