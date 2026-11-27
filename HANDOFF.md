@@ -1,9 +1,49 @@
 # Handoff: iOS on Xiaomi Mi 9 (cepheus)
 
-Last updated **2026-11-26** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
+Last updated **2026-11-27** (newest work first under "Start here"). Read this first, then [NOTES.md](NOTES.md)
 (hardware facts, test loop, bootloader rules).
 
 ## Start here (next session)
+
+### Maps: wait mode still leaves a black display surface; the drawable is full (2026-11-27)
+
+- **Build tested.** `bac5d7c` (default `wait` present mode) installed over Wi-Fi with
+  pull-back verification: `SweetMetal2` `39511256...` (21,603,888 bytes), dylib
+  `52fa493f...` (17,294,896 bytes), `CodeResources` `00bac33f...` (2,042 bytes).
+  `backboardd` 1497, `SpringBoard` 1503.
+- **Wait result.** Maps logged `mode wait (waited on the app's thread)` for every
+  present. The drawable probes still read the full map: `mean 106.5 109.0 105.6`,
+  `nonblack 43005/43005`. The user saw no difference from `transaction`: black with a
+  small map fragment.
+- **Display probe.** Surfaces 54/55 briefly read `mean 28.6` after launch, then stayed
+  black (`mean 15.0/15.1`, center and upper `0,0,0`). Surfaces 62/65 read `mean
+  38.6/37.9`, center `26,26,25`, upper `79,78,79`; they are map-like but may be the
+  stale pair. Which pair the compositor is writing is still not established.
+- **Wait may not have waited.** `J completed wait` stayed 0 while the presents logged
+  `wait`: `surfaceCommand(surface)` is unregistered when its command buffer completes,
+  so the wait is skipped after the fact. The wait test therefore did not truly hold the
+  drawable; do not treat it as a clean test of drawable reuse.
+- **No texture import.** `backboardd` never logged `compositor drawable surface`; only
+  the app imported its own drawables. The window server consumes the `CAImageQueue`
+  directly, so the Metal import probe cannot see the handoff.
+- **Diagnostics prepared (local, not pushed).** `SWEETMTL_DUMP_DISPLAY=1` makes
+  `backboardd` write the display surface to
+  `/var/local/display-<id>-<w>x<h>-<pitch>.raw` from its 10 s telemetry thread. The
+  telemetry now also has a `G display` 4x4 luminance grid, the layer's `frame`,
+  `anchorPoint`, `contentsScale`, `contentsRect`, `contentsGravity`, `transform` and
+  `masksToBounds`, the `CAImageQueue` size/displayed surface, a log of every other
+  1125x2436 surface `backboardd` imports, and `SWEETMTL_TX=0` to clear
+  `presentsWithTransaction` for a normal-path A/B. `NativeBridgeMetalFrontend.mm`
+  passes a local `clang -fsyntax-only` against the macOS SDK.
+- **Next.** Push, run the GitHub `userland` workflow, install the artifact, create
+  `/var/local/mtl2-env` with `SWEETMTL_DUMP_DISPLAY=1`, restart
+  `backboardd`/`SpringBoard`, launch Maps, then pull `/var/local/display-*.raw` and
+  `/var/local/mtl2.log`. Measure the grid and the piece; if the dump is a 1/3-size
+  top-left map, fix the compositor's queue geometry/scale. If the dump is the full map,
+  the panel/scanout path is next.
+- **Phone state.** Maps and debugserver are off; `/var/local/mtl2.log`,
+  `mtl2-bo.log` and `ds.log` are truncated; `backboardd` 1497, `SpringBoard` 1503;
+  battery ~50% and charging.
 
 ### Maps: the transaction unfreezes the queue, but the drawable is reused before the present (2026-11-27)
 

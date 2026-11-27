@@ -1739,6 +1739,21 @@ static char sweetMemoryOwnerKey;
          mean[0],mean[1],mean[2]);
   }
  }
+ // Any other 1125x2436 import is still the compositor receiving a full-size frame; a different
+ // format or usage (e.g. the drawable at format 81, usage 0) would otherwise be invisible here.
+ if(compositor && IOSurfaceGetWidth(surface)==1125 && IOSurfaceGetHeight(surface)==2436 &&
+    !(d.pixelFormat==MTLPixelFormatBGRA8Unorm && d.usage==(MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget))) {
+  static std::atomic<uint64_t> otherImports;
+  const uint64_t imports=otherImports.fetch_add(1);
+  if(imports<16 || imports%120==119) {
+   double mean[3]={-1,-1,-1};
+   surfaceMean(surface,mean);
+   NBLOG(@"native-metal: compositor import %llu id %u %zux%zu row %zu format %lu usage %llu storage %lu mean %.1f %.1f %.1f",
+         (unsigned long long)imports,IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
+         IOSurfaceGetBytesPerRow(surface),(unsigned long)d.pixelFormat,(unsigned long long)d.usage,
+         (unsigned long)d.storageMode,mean[0],mean[1],mean[2]);
+  }
+ }
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
  const size_t bytes=(allocation+page-1)&~(page-1);
@@ -1920,8 +1935,11 @@ static id layerValue(id layer,NSString *key) {
 // The layer's contents after a present is the surface the compositor samples; the class and
 // IOSurface ID say whether it is the drawable this command buffer just presented. A private
 // CAIOSurface is identified by CoreFoundation's type name and its own description.
+static id layerContentsValue(id layer) {
+ return [layer respondsToSelector:NSSelectorFromString(@"contents")]?[layer valueForKey:@"contents"]:nil;
+}
 static NSString *layerContents(id layer) {
- id contents=[layer respondsToSelector:NSSelectorFromString(@"contents")]?[layer valueForKey:@"contents"]:nil;
+ id contents=layerContentsValue(layer);
  if(!contents)return @"none";
  const CFTypeRef ref=(__bridge CFTypeRef)contents;
  const CFTypeID type=CFGetTypeID(ref);
@@ -1935,6 +1953,40 @@ static NSString *layerContents(id layer) {
  if(description)CFRelease(description);
  text=[text stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
  return text.length>300?[text substringToIndex:300]:text;
+}
+// QuartzCore's CAImageQueue is private; resolve its accessors at runtime. The queue's own size and
+// the surface it says is displayed are what the window server should sample, independently of the
+// layer geometry: a 375x812 queue in a 1125x2436 layer is the 1/3-scale frame, and a displayed
+// surface that is not the drawable we presented is a lost handoff.
+static bool isImageQueue(id contents) {
+ if(!contents)return false;
+ CFStringRef name=CFCopyTypeIDDescription(CFGetTypeID((__bridge CFTypeRef)contents));
+ const bool yes=name && CFStringCompare(name,CFSTR("CAImageQueue"),0)==kCFCompareEqualTo;
+ if(name)CFRelease(name);
+ return yes;
+}
+static void logImageQueue(id contents,const char *when) {
+ if(!isImageQueue(contents))return;
+ static std::once_flag once;
+ static size_t (*width)(id),(*height)(id),(*rowBytes)(id);
+ static uint32_t (*pixelFormat)(id);
+ static IOSurfaceRef (*displayed)(id);
+ static uint64_t (*unconsumed)(id);
+ std::call_once(once,[]{
+  width=(size_t(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetWidth");
+  height=(size_t(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetHeight");
+  rowBytes=(size_t(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetBytesPerRow");
+  pixelFormat=(uint32_t(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetPixelFormat");
+  displayed=(IOSurfaceRef(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetDisplayedSurface");
+  unconsumed=(uint64_t(*)(id))dlsym(RTLD_DEFAULT,"CAImageQueueGetUnconsumedCount");
+ });
+ if(!width || !height)return;
+ IOSurfaceRef surface=displayed?(IOSurfaceRef)displayed(contents):NULL;
+ double mean[3]={-1,-1,-1};
+ if(surface)surfaceMean(surface,mean);
+ NBLOG(@"native-metal: image queue %s %zux%zu row %zu format %u displayed %u mean %.1f %.1f %.1f unconsumed %llu",
+       when,width(contents),height(contents),rowBytes?rowBytes(contents):0,pixelFormat?pixelFormat(contents):0,
+       surface?IOSurfaceGetID(surface):0,mean[0],mean[1],mean[2],unconsumed?unconsumed(contents):0);
 }
 // A layer's background colour is what shows where the layer has no contents: a grey map view
 // background behind an empty MetalLayer is the grey screen.
@@ -1955,14 +2007,22 @@ static void logDrawableLayer(id drawable) {
        layerValue(layer,@"maximumDrawableCount"),layerValue(layer,@"drawableSize"),
        layerValue(layer,@"pixelFormat"),layerValue(layer,@"framebufferOnly"),layerValue(layer,@"opaque"),
        layerContents(layer),layerColor(layer));
+ // The geometry the compositor uses to place the layer: a contentsScale of 1 (or a contentsRect of
+ // 1/3) shrinks or crops a full-size drawable independently of the surface the app presented.
+ NBLOG(@"native-metal: drawable geometry frame %@ anchor %@ contentsScale %@ contentsRect %@ contentsGravity %@ transform %@ masksToBounds %@",
+       layerValue(layer,@"frame"),layerValue(layer,@"anchorPoint"),layerValue(layer,@"contentsScale"),
+       layerValue(layer,@"contentsRect"),layerValue(layer,@"contentsGravity"),
+       layerValue(layer,@"transform"),layerValue(layer,@"masksToBounds"));
+ logImageQueue(layerContentsValue(layer),"drawable layer");
 }
 // Walk from the drawable's MetalLayer up to the window: a hidden or masked superlayer, or a
 // sibling drawn over it, hides a surface that presented correctly.
 static void logLayerChain(id drawable) {
  id layer=[drawable valueForKey:@"layer"];
  for(unsigned depth=0;depth<5 && layer;depth++) {
-  NBLOG(@"native-metal: layer chain %u %@ bounds %@ position %@ hidden %@ opacity %@ bg %@ contents %@",
-        depth,NSStringFromClass([layer class]),layerValue(layer,@"bounds"),layerValue(layer,@"position"),
+  NBLOG(@"native-metal: layer chain %u %@ frame %@ contentsScale %@ bounds %@ position %@ hidden %@ opacity %@ bg %@ contents %@",
+        depth,NSStringFromClass([layer class]),layerValue(layer,@"frame"),layerValue(layer,@"contentsScale"),
+        layerValue(layer,@"bounds"),layerValue(layer,@"position"),
         layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),layerColor(layer),layerContents(layer));
   // Siblings drawn after the MetalLayer hide it even when its own surface is correct.
   if(depth==0) {
@@ -2017,8 +2077,26 @@ static void presentInTransaction(void (^present)(void)) {
  present();
  ((void (*)(id,SEL))objc_msgSend)(transaction,NSSelectorFromString(@"commit"));
 }
+// The layer asks Core Animation to present inside the app's transaction. Clearing the flag makes
+// CA sample the drawable on its own schedule; SWEETMTL_TX=0 A/Bs the transaction handoff without
+// changing the app's present calls.
+static void maybeClearPresentsWithTransaction(id drawable) {
+ const char *value=getenv("SWEETMTL_TX");
+ if(!value || strcmp(value,"0"))return;
+ id layer=[drawable valueForKey:@"layer"];
+ if(!layer)return;
+ static std::once_flag once;
+ std::call_once(once,[layer]{
+  SEL setter=NSSelectorFromString(@"setPresentsWithTransaction:");
+  if([layer respondsToSelector:setter]) {
+   ((void(*)(id,SEL,BOOL))objc_msgSend)(layer,setter,NO);
+   NBLOG(@"native-metal: cleared presentsWithTransaction on %@",NSStringFromClass([layer class]));
+  }
+ });
+}
 static void presentDrawableDirect(id drawable,const char *kind,void (^present)(void)) {
  const uint32_t surface=drawableSurfaceID(drawable);
+ maybeClearPresentsWithTransaction(drawable);
  const uint64_t presentCount=gDirectPresents++;
  const uint32_t resolved=gLastResolveSurface.load();
  const BOOL main=[NSThread isMainThread];
@@ -2270,6 +2348,38 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   row("D display %u id %u mean %.1f %.1f %.1f center %u,%u,%u upper %u,%u,%u",i,IOSurfaceGetID(surface),
       sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,
       center[0],center[1],center[2],top[0],top[1],top[2]);
+  // 4x4 luminance grid: a map piece at 1/3 scale lights one cell, a full map lights every cell.
+  uint32_t grid[16]={0};
+  for(unsigned gy=0;gy<4;gy++)for(unsigned gx=0;gx<4;gx++) {
+   const size_t x0=width*gx/4,x1=width*(gx+1)/4,y0=height*gy/4,y1=height*(gy+1)/4;
+   uint64_t cell=0,cellSamples=0;
+   for(size_t y=y0;y<y1;y+=16)for(size_t x=x0;x<x1;x+=16) {
+    const uint8_t *p=base+y*pitch+x*4;
+    cell+=(uint32_t)p[0]+p[1]+p[2];cellSamples+=3;
+   }
+   grid[gy*4+gx]=cellSamples?(uint32_t)(cell/cellSamples):0;
+  }
+  row("G display %u grid %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",i,
+      grid[0],grid[1],grid[2],grid[3],grid[4],grid[5],grid[6],grid[7],
+      grid[8],grid[9],grid[10],grid[11],grid[12],grid[13],grid[14],grid[15]);
+  // The exact pixels, for measuring the piece offline instead of inferring it from three samples.
+  // Once per 10 s is enough; the file is overwritten so a pull after the map renders is current.
+  const char *dumpEnv=getenv("SWEETMTL_DUMP_DISPLAY");
+  if(dumpEnv && *dumpEnv!='0' && !strcmp(getprogname(),"backboardd") && sum[0]/(double)samples>20.0) {
+   static std::atomic<uint64_t> lastDumpUs;
+   const uint64_t now=nowUs();
+   uint64_t previous=lastDumpUs.load();
+   if(now-previous>10000000ULL && lastDumpUs.compare_exchange_strong(previous,now)) {
+    char path[96];
+    snprintf(path,sizeof path,"/var/local/display-%u-%zux%zu-%zu.raw",IOSurfaceGetID(surface),width,height,pitch);
+    FILE *file=fopen(path,"wb");
+    if(file) {
+     const size_t bytes=pitch*height,wrote=fwrite(base,1,bytes,file);
+     fclose(file);
+     NBLOG(@"native-metal: display dump %s %zu/%zu bytes",path,wrote,bytes);
+    }
+   }
+  }
  }
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
