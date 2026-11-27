@@ -5,32 +5,47 @@ Last updated **2026-11-27** (newest work first under "Start here"). Read this fi
 
 ## Start here (next session)
 
-### Maps: the compositor imports the map surface, but the display drops back to black (2026-11-27)
+### Maps: the visible strip is the centre of the map, so the render server has the layer at 44 pt (2026-11-27)
 
-- **Live evidence.** Build `ff53254` (TX=0 deferred) on the phone. The app's drawable 121
-  at commit 2891 reads `mean 130.0 57.1 33.0`, `nonblack 43005/43005`; `backboardd`
-  imports the same frame (`compositor import 12 id 139 ... mean 130.0 57.0 33.0`, also
-  137/138/157). Display surface 88 then shows the map once (`mean 82.3 51.2 40.6`,
-  `upper 130,57,33`, grid `49494949 424b4e34 2c323227 2c2b2c27`) and falls back to the
-  black-middle frame (`mean 32.5 24.4 21.5`, grid row 1 `00000000`). The map is in the
-  drawable and in the compositor's import; only the display surface loses it.
-- **Hypothesis.** The present runs after GPU completion but returns to Maps immediately;
-  Maps calls `nextDrawable` and clears the same surface before the compositor samples it.
-  The map appears only when the compositor wins the race. Wait mode closes the GPU window
-  but not the compositor's read window.
+- **Observation.** In `immediate-88.raw` (immediate present, launch with the location alert)
+  and `zoom-88.raw` (TX=0 deferred), the map appears only in the top 132 rows. The strip is
+  not the top of the map: the city/country label ("Nuremberg", "SWEDEN") sits in the middle
+  of the strip, i.e. it is the *centre* 132 rows of the 1125x2436 drawable. 132 rows = 44 pt
+  at 3x.
+- **What that means.** A `CAMetalLayer` with `contentsGravity: center` and a 1125x2436
+  drawable draws the image 1:1 centred in the layer and clips to the layer bounds. A 44 pt
+  layer therefore shows exactly the centre 132 rows. The app-side model layer is 375x812
+  (`MetalLayer` and `VKMapView`, logged at present 0), so the render server's copy of the
+  geometry is 44 pt while the app's is 812 pt.
+- **Candidates.** (a) A launch layout animation (map view expanding from the 44 pt status-bar
+  height to full screen) that never advances in the render server, leaving the presentation
+  layer at its start value; (b) a layer-tree commit that never reached the render server, so
+  its copy stayed at the initial 44 pt geometry. The app's drawable is full map in both cases.
 - **Build prepared (local, not pushed).** `NativeBridgeMetalFrontend.mm` adds:
-  - `SWEETMTL_HOLD=<ms>`: in wait mode, sleep on the app's thread after the real present,
-    so the drawable cannot return from `nextDrawable` during the hold.
-  - `SWEETMTL_INTROSPECT=1`: log the `VKMapView` `CABackingStore` class and its private
-    `buffer`/`iosurface`/`surface` accessors once, plus the IOSurface mean if found.
-  - After-present `CAImageQueue` state (`displayed` surface, `unconsumed`) at the first
-    eight presents and every 60th, plus `after hold`.
-  - Wait-mode logging that says whether the command buffer was found and waited on.
-- **Test.** Install the artifact, set `/var/local/mtl2-env` to
-  `SWEETMTL_DUMP_DISPLAY=1`, `SWEETMTL_PRESENT=wait`, `SWEETMTL_HOLD=50`,
-  `SWEETMTL_INTROSPECT=1` (no `SWEETMTL_TX=0`), restart `backboardd`/`SpringBoard`, launch
-  Maps, and zoom. If the map stays, try hold 20 and 100; if not, the backing-store log
-  and the after-present queue state say whether the compositor is sampling the drawable.
+  - `SWEETMTL_LAYERS=1`: at present 0 and every 600th present, log the window frame/bounds and,
+    for the drawable's layer chain, the model bounds/position vs the `presentationLayer`
+    bounds/position and the `animationKeys`.
+  - `SWEETMTL_KILLANIM=1`: for the first 300 presents, `removeAllAnimations` on every layer in
+    the chain, snapping the render server to the model geometry. Logs what it removed.
+  - `SWEETMTL_DUMP_DRAWABLE=1`: write the latest presented drawable to `/var/local/drawable.raw`
+    (one fixed path; the file must be pre-created 0666) so the display strip can be compared
+    with the drawable's top vs centre rows.
+  - `SWEETMTL_HOLD=<ms>`, `SWEETMTL_INTROSPECT=1`, after-present `CAImageQueue` state and the
+    wait-mode command-buffer log from the previous build (kept; off unless set).
+- **Test.** Install the artifact, set `/var/local/mtl2-env` to `SWEETMTL_DUMP_DISPLAY=1`,
+  `SWEETMTL_DUMP_DRAWABLE=1`, `SWEETMTL_PRESENT=deferred`, `SWEETMTL_TX=0`,
+  `SWEETMTL_LAYERS=1`, `SWEETMTL_KILLANIM=1`, restart `backboardd`/`SpringBoard`,
+  launch Maps. The deferred
+  present runs after GPU completion, so the geometry test is not confounded by a mid-render
+  sample. If the map fills, the frozen animation is the cause; the `layer presentation`
+  lines show which layer/animation. If the strip stays, the after-present queue state
+  (`displayed`/`unconsumed`) says whether the compositor consumes the drawable; if it does,
+  the compositor's draw of the layer is next (log its scissor/viewport for the map draw).
+- **Cold boot (same `ff53254` build, `PRESENT=immediate`).** After a power-off boot the map
+  never appeared: home screen (`mean 87.4`), then the Maps UI with a black map area
+  (`mean 32.6`, grid `1110101b 00000000 1d1d1c1c 3537332a`). The app presented only 8
+  frames, then stopped. The 44 pt strip is therefore a transient of the map-to-black
+  transition, not a stable layout; the render-server geometry log still tells the two apart.
 - **Phone state.** Maps 3727, `backboardd` 3283, `SpringBoard` 3285; `/var/local/mtl2.log`
   is the live log. Maps and the test logs should be cleared before the next install.
 

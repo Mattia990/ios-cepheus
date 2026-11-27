@@ -356,6 +356,27 @@ static void probeSurface(IOSurfaceRef surface,const char *what,uint32_t commit,b
        sum[0]/(double)samples,sum[1]/(double)samples,sum[2]/(double)samples,sum[3]/(double)samples,
        (unsigned long long)nonblack,(unsigned long long)samples,
        center[0],center[1],center[2],center[3],top[0],top[1],top[2],top[3]);
+ // SWEETMTL_DUMP_DRAWABLE=1 writes the presented drawable itself, so the display strip can be
+ // matched against the top or the centre rows of the exact frame the compositor was given.
+ // Like the display dumps, the file must already exist and be writable by the app's uid.
+ if(!strcmp(what,"drawable")) {
+  const char *dumpEnv=getenv("SWEETMTL_DUMP_DRAWABLE");
+  if(dumpEnv && *dumpEnv!='0') {
+   static uint64_t lastDrawableDumpUs;
+   const uint64_t now=nowUs();
+   if(now-lastDrawableDumpUs>40000000ULL) {
+    lastDrawableDumpUs=now;
+    char path[96];
+    snprintf(path,sizeof path,"/var/local/drawable.raw");
+    FILE *file=fopen(path,"wb");
+    if(file) {
+     const size_t bytes=row*height,wrote=fwrite(base,1,bytes,file);
+     fclose(file);
+     NBLOG(@"native-metal: drawable dump %s id %u %zux%zu %zu/%zu bytes",path,IOSurfaceGetID(surface),width,height,wrote,bytes);
+    }
+   }
+  }
+ }
  char bo[256];sm2_bo_cache_stats(bo,sizeof(bo));if(bo[0])NBLOG(@"native-metal: %s",bo);
 }
 static void probeResolvedSurface(IOSurfaceRef surface,uint32_t commit,bool completed) {
@@ -2020,10 +2041,11 @@ static void logDrawableLayer(id drawable) {
 static void logLayerChain(id drawable) {
  id layer=[drawable valueForKey:@"layer"];
  for(unsigned depth=0;depth<5 && layer;depth++) {
-  NBLOG(@"native-metal: layer chain %u %@ frame %@ contentsScale %@ bounds %@ position %@ hidden %@ opacity %@ bg %@ contents %@",
+  NBLOG(@"native-metal: layer chain %u %@ frame %@ contentsScale %@ bounds %@ position %@ hidden %@ opacity %@ masksToBounds %@ bg %@ contents %@",
         depth,NSStringFromClass([layer class]),layerValue(layer,@"frame"),layerValue(layer,@"contentsScale"),
         layerValue(layer,@"bounds"),layerValue(layer,@"position"),
-        layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),layerColor(layer),layerContents(layer));
+        layerValue(layer,@"hidden"),layerValue(layer,@"opacity"),layerValue(layer,@"masksToBounds"),
+        layerColor(layer),layerContents(layer));
   // Siblings drawn after the MetalLayer hide it even when its own surface is correct.
   if(depth==0) {
    id superlayer=[layer valueForKey:@"superlayer"];
@@ -2072,6 +2094,46 @@ static void logBackingStore(id drawable) {
    }
   }
  });
+}
+// The model layer can be full-screen while the render server still draws an older geometry: an
+// implicit bounds animation that never advances (a compositor animation clock that does not tick)
+// leaves the presentation layer at its start value. SWEETMTL_LAYERS=1 logs the presentation layer
+// and the animation keys; SWEETMTL_KILLANIM=1 removes the animations on the drawable's layer chain
+// for the first 300 presents, snapping the render server to the model values.
+static void logLayerPresentation(id drawable) {
+ const char *value=getenv("SWEETMTL_LAYERS");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ id lastWindow=nil;
+ for(unsigned depth=0;depth<6 && layer;depth++) {
+  // CALayer has no window property; the layer's delegate is usually the UIView that owns it.
+  id delegate=[layer valueForKey:@"delegate"];
+  id window=[delegate respondsToSelector:NSSelectorFromString(@"window")]?[delegate valueForKey:@"window"]:nil;
+  if(window && window!=lastWindow) {
+   NBLOG(@"native-metal: layer window %u %@ frame %@ bounds %@",depth,NSStringFromClass([window class]),layerValue(window,@"frame"),layerValue(window,@"bounds"));
+   lastWindow=window;
+  }
+  id presentation=[layer respondsToSelector:NSSelectorFromString(@"presentationLayer")]?[layer valueForKey:@"presentationLayer"]:nil;
+  NSArray *keys=[layer respondsToSelector:NSSelectorFromString(@"animationKeys")]?[layer valueForKey:@"animationKeys"]:nil;
+  NBLOG(@"native-metal: layer presentation %u %@ model bounds %@ position %@ presentation bounds %@ position %@ animations %@",
+        depth,NSStringFromClass([layer class]),layerValue(layer,@"bounds"),layerValue(layer,@"position"),
+        presentation?layerValue(presentation,@"bounds"):@"nil",presentation?layerValue(presentation,@"position"):@"nil",
+        keys.count?keys:@"none");
+  layer=[layer valueForKey:@"superlayer"];
+ }
+}
+static void killLayerAnimations(id drawable) {
+ const char *value=getenv("SWEETMTL_KILLANIM");
+ if(!value || !*value || *value=='0')return;
+ id layer=[drawable valueForKey:@"layer"];
+ for(unsigned depth=0;depth<8 && layer;depth++) {
+  NSArray *keys=[layer respondsToSelector:NSSelectorFromString(@"animationKeys")]?[layer valueForKey:@"animationKeys"]:nil;
+  if(keys.count) {
+   NBLOG(@"native-metal: removing %lu animation(s) %@ from %@ at depth %u",(unsigned long)keys.count,keys,NSStringFromClass([layer class]),depth);
+   ((void(*)(id,SEL))objc_msgSend)(layer,NSSelectorFromString(@"removeAllAnimations"));
+  }
+  layer=[layer valueForKey:@"superlayer"];
+ }
 }
 // A layer with presentsWithTransaction expects the present in a Core Animation transaction. The
 // app's transaction has usually committed by the time the GPU finishes, so a completion-thread
@@ -2143,8 +2205,12 @@ static void presentDrawableDirect(id drawable,const char *kind,void (^present)(v
  const uint32_t resolved=gLastResolveSurface.load();
  const BOOL main=[NSThread isMainThread];
  const PresentMode mode=presentModeForDrawable(drawable);
- if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);logBackingStore(drawable);}
- else if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
+ if(presentCount==0){logDrawableLayer(drawable);logLayerChain(drawable);logBackingStore(drawable);logLayerPresentation(drawable);}
+ else if(presentCount%600==599)logLayerPresentation(drawable);
+ // Launch animations can be added after the first frame; keep clearing them for the first few
+ // seconds so the test does not depend on when the map view's expansion animation was installed.
+ if(presentCount<300)killLayerAnimations(drawable);
+ if(presentCount<5 || presentCount%300==299)logDrawableLayer(drawable);
  NBCommandBuffer *commandBuffer=surface?surfaceCommand(surface):nil;
  const char *placement=mode==PresentWait?"waited on the app's thread":commandBuffer?"deferred to completion":"immediate";
  if(presentCount<8 || presentCount%300==299)
